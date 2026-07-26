@@ -42,6 +42,7 @@ from .structural import (
     oneline,
     signature,
 )
+from .validation import validate_generated_response
 
 if TYPE_CHECKING:
     from pathlib import Path as _Path  # noqa: F401
@@ -362,6 +363,7 @@ class PageGenerator(PerTypeGenerationMixin, StructuralRenderMixin):
             reasoning=self._config.reasoning,
             cache_hints=cache_hints,
         )
+        validate_generated_response(response)
 
         if self._config.cache_enabled:
             self._cache[key] = response
@@ -445,6 +447,14 @@ class PageGenerator(PerTypeGenerationMixin, StructuralRenderMixin):
         # styles, so default ("comprehensive") pages keep byte-identical metadata.
         if self._style.is_active:
             page.metadata["style"] = self._style.name
+        # Keep the completion boundary visible after persistence. A successful
+        # page normally ends with ``end_turn``; retaining both forms makes an
+        # adapter-specific termination diagnosable without changing the shared
+        # page schema.
+        if response.stop_reason is not None:
+            page.metadata["stop_reason"] = response.stop_reason
+        if response.provider_stop_reason is not None:
+            page.metadata["provider_stop_reason"] = response.provider_stop_reason
         # Content came back verbatim from the prior run's persisted page:
         # downstream (embedding) uses this to skip work whose output already
         # exists byte-identically.
