@@ -14,11 +14,17 @@ from repowise.cli.helpers import (
     run_async,
     silence_logs_for_machine_output,
 )
+from repowise.core.analysis.dead_code.risk_factors import RISK_CAP_CONFIDENCE
 
 
 @click.command("dead-code")
 @click.argument("path", required=False, type=click.Path(exists=True))
-@click.option("--min-confidence", default=0.5, type=float, help="Minimum confidence threshold.")
+@click.option(
+    "--min-confidence",
+    default=RISK_CAP_CONFIDENCE,
+    type=float,
+    help="Minimum confidence threshold.",
+)
 @click.option(
     "--safe-only",
     is_flag=True,
@@ -117,9 +123,7 @@ def dead_code_command(
             if primary is None:
                 raise click.ClickException("Workspace has no primary repo configured.")
             repo_path = primary
-            console.print(
-                "[dim]  (Tip: pass --repo <alias> to analyze a different repo.)[/dim]"
-            )
+            console.print("[dim]  (Tip: pass --repo <alias> to analyze a different repo.)[/dim]")
     else:
         assert target.repo_path is not None
         repo_path = target.repo_path
