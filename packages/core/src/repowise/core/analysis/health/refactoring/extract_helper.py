@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ....test_paths import is_test_related_path
 from .models import RefactoringContext, RefactoringSuggestion
 from .registry import RefactoringDetector, effort_bucket, register
 
@@ -67,33 +68,6 @@ _REGION_SLACK = 1
 _MAX_SNIPPET_LINES = 40
 
 
-def _is_test_path(path: str) -> bool:
-    """Conservative test-file check (mirrors the engine's ``_is_test_file``).
-
-    Kept local so the detector stays self-contained — duplication among test
-    fixtures is common and low value, so test occurrences are dropped before
-    a suggestion is formed.
-    """
-    p = path.lower().replace("\\", "/")
-    return (
-        "/test/" in p
-        or "/tests/" in p
-        or "/__tests__/" in p
-        or p.rsplit("/", 1)[-1].startswith("test_")
-        or p.endswith("_test.py")
-        or p.endswith("_test.go")
-        or p.endswith(".test.ts")
-        or p.endswith(".test.tsx")
-        or p.endswith(".test.js")
-        or p.endswith(".test.mts")
-        or p.endswith(".test.cts")
-        or p.endswith(".spec.ts")
-        or p.endswith(".spec.js")
-        or p.endswith(".spec.mts")
-        or p.endswith(".spec.cts")
-    )
-
-
 def _is_generated_path(path: str) -> bool:
     """Non-refactorable generated/append-only code (DB migrations, vendored
     bundles). Their boilerplate duplicates heavily but extracting a shared
@@ -112,8 +86,14 @@ def _is_generated_path(path: str) -> bool:
     )
 
 
-def _is_skippable_occurrence(path: str) -> bool:
-    return _is_test_path(path) or _is_generated_path(path)
+def _is_skippable_occurrence(path: str, language: str | None = None) -> bool:
+    """Duplication among test fixtures is common and low value, and a migration
+    must stay self-contained, so both are dropped before a suggestion is formed.
+
+    Test support counts as test material here: sharing a helper out of
+    ``conftest.py`` is the same bad advice as sharing one out of a test.
+    """
+    return is_test_related_path(path, language) or _is_generated_path(path)
 
 
 class _Block:
@@ -222,7 +202,11 @@ class ExtractHelperDetector(RefactoringDetector):
         # then coalesce the overlapping windows the clone detector emits for one
         # physical block into a single site per region (without merging, the
         # same import/parse block reads as "5 sites" when it is really one).
-        kept = [o for o in block.occurrences if not _is_skippable_occurrence(o[0])]
+        # Clones are detected within a language, so every occurrence in a block
+        # shares ``ctx.language`` — which the ambiguous ``spec/`` rule needs.
+        kept = [
+            o for o in block.occurrences if not _is_skippable_occurrence(o[0], ctx.language)
+        ]
         occurrences = _merge_ranges_per_file(kept)
         if len(occurrences) < 2:
             return None
