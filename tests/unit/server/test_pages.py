@@ -54,6 +54,111 @@ async def test_list_pages_with_data(client: AsyncClient, app) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_pages_defaults_to_full_rows(client: AsyncClient, app) -> None:
+    """No `fields` means what it always meant — content and metadata included."""
+    repo_id, _ = await _create_page(client, app.state.session_factory)
+    resp = await client.get("/api/pages", params={"repo_id": repo_id})
+    assert resp.status_code == 200
+    row = resp.json()[0]
+    assert row["content"] == "# Main module\n\nEntry point."
+    assert "metadata" in row
+
+
+@pytest.mark.asyncio
+async def test_list_pages_summary_drops_the_heavy_fields(
+    client: AsyncClient, app
+) -> None:
+    repo_id, page_id = await _create_page(client, app.state.session_factory)
+    resp = await client.get(
+        "/api/pages", params={"repo_id": repo_id, "fields": "summary"}
+    )
+    assert resp.status_code == 200
+    row = resp.json()[0]
+    assert "content" not in row
+    assert "metadata" not in row
+    # Everything a list actually renders is still there.
+    assert row["id"] == page_id
+    assert row["title"] == "main.py"
+    assert row["target_path"] == "src/main.py"
+    assert row["content_chars"] == len("# Main module\n\nEntry point.")
+
+
+@pytest.mark.asyncio
+async def test_list_pages_rejects_unknown_fields(client: AsyncClient, app) -> None:
+    repo_id, _ = await _create_page(client, app.state.session_factory)
+    resp = await client.get(
+        "/api/pages", params={"repo_id": repo_id, "fields": "titles"}
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_lookup_accepts_repo_id(client: AsyncClient, app) -> None:
+    """The session is routed by repo_id, so a lookup that knows the repo says
+    so — without it a workspace server searches the wrong store."""
+    repo_id, page_id = await _create_page(client, app.state.session_factory)
+    resp = await client.get(
+        "/api/pages/lookup", params={"page_id": page_id, "repo_id": repo_id}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["id"] == page_id
+
+
+@pytest.mark.asyncio
+async def test_lookup_reaches_a_second_workspace_store(client: AsyncClient, app) -> None:
+    """In workspace mode each repo has its own database and the primary one
+    cannot see the others' rows. A page there is reachable only when the
+    request carries the repo_id the session is routed by."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    from repowise.core.persistence.database import init_db
+
+    other_engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    await init_db(other_engine)
+    other_factory = async_sessionmaker(
+        other_engine, expire_on_commit=False, class_=AsyncSession
+    )
+    other_repo_id = "b" * 32
+    app.state.workspace_sessions = {other_repo_id: other_factory}
+
+    async with get_session(other_factory) as session:
+        await crud.upsert_repository(
+            session, name="other", local_path="/tmp/other", repo_id=other_repo_id
+        )
+        await crud.upsert_page(
+            session,
+            page_id="file_page:src/only_over_here.py",
+            repository_id=other_repo_id,
+            page_type="file_page",
+            title="only_over_here.py",
+            content="Lives in the second store.",
+            target_path="src/only_over_here.py",
+            source_hash="h",
+            model_name="mock",
+            provider_name="mock",
+        )
+
+    try:
+        params = {"page_id": "file_page:src/only_over_here.py"}
+        # Without repo_id the request lands on the primary store, which has
+        # never heard of this page.
+        assert (await client.get("/api/pages/lookup", params=params)).status_code == 404
+
+        scoped = await client.get(
+            "/api/pages/lookup", params={**params, "repo_id": other_repo_id}
+        )
+        assert scoped.status_code == 200
+        assert scoped.json()["content"] == "Lives in the second store."
+    finally:
+        await other_engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_get_page_by_path(client: AsyncClient, app) -> None:
     _, page_id = await _create_page(client, app.state.session_factory)
     resp = await client.get(f"/api/pages/{page_id}")

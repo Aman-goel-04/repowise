@@ -14,7 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from repowise.core.persistence import crud
 from repowise.core.persistence.models import _now_utc
 from repowise.server.deps import get_db_session, verify_api_key
-from repowise.server.schemas import PageResponse, PageVersionResponse
+from repowise.server.schemas import (
+    PageResponse,
+    PageSummaryResponse,
+    PageVersionResponse,
+)
 
 router = APIRouter(
     prefix="/api/pages",
@@ -23,7 +27,7 @@ router = APIRouter(
 )
 
 
-@router.get("", response_model=list[PageResponse])
+@router.get("", response_model=None)
 async def list_pages(
     repo_id: str = Query(..., description="Repository ID"),
     page_type: str | None = Query(None, description="Filter by page type"),
@@ -39,9 +43,21 @@ async def list_pages(
     order: str = Query("desc", description="Sort order: asc or desc"),
     limit: int = Query(100, ge=1, le=5000),
     offset: int = Query(0, ge=0),
+    fields: str = Query(
+        "full",
+        description="How much of each page to return. 'full' (the default) is "
+        "every field. 'summary' drops 'content' and 'metadata' — together 95% "
+        "of a listing's bytes, and read by nothing that renders a list of "
+        "pages — and adds 'content_chars' in their place.",
+    ),
     session: AsyncSession = Depends(get_db_session),  # noqa: B008
-) -> list[PageResponse]:
+) -> list[PageResponse] | list[PageSummaryResponse]:
     """List wiki pages for a repository."""
+    if fields not in ("full", "summary"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown fields '{fields}'. Valid: full, summary.",
+        )
     pages = await crud.list_pages(
         session,
         repo_id,
@@ -52,18 +68,33 @@ async def list_pages(
         sort_by=sort_by,
         order=order,
     )
+    # response_model is off on this route: the two shapes are serialized by the
+    # models themselves, so FastAPI can't coerce a summary back into a full row.
+    if fields == "summary":
+        return [PageSummaryResponse.from_orm(p) for p in pages]
     return [PageResponse.from_orm(p) for p in pages]
 
 
 @router.get("/lookup", response_model=PageResponse)
 async def get_page_by_query(
     page_id: str = Query(..., description="Page ID (e.g. file_page:src/main.py)"),
+    repo_id: str | None = Query(
+        None,
+        description="Repository the page belongs to. Optional, but required to "
+        "reach a page outside the default store in workspace mode, where the "
+        "session is routed by this value.",
+    ),
     session: AsyncSession = Depends(get_db_session),  # noqa: B008
 ) -> PageResponse:
     """Get a single wiki page by ID passed as query parameter.
 
     Use this endpoint when the page_id contains characters that are
     difficult to encode in a URL path.
+
+    ``repo_id`` is what routes the session to the right database. Without it a
+    workspace server looks the page up in whichever store is the default, and a
+    page id that exists in another repo comes back as a 404 — so any caller
+    that knows the repo should say so.
     """
     page = await crud.get_page(session, page_id)
     if page is None:
