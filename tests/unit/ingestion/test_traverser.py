@@ -7,7 +7,44 @@ from pathlib import Path
 import pytest
 
 from repowise.core.ingestion import traverser as traverser_mod
-from repowise.core.ingestion.traverser import FileTraverser, _detect_language
+from repowise.core.ingestion.traverser import (
+    FileTraverser,
+    _compile_gitignore,
+    _detect_language,
+)
+
+
+class TestCompileGitignore:
+    def test_malformed_line_is_not_fatal_and_keeps_valid(self) -> None:
+        spec = _compile_gitignore([".godot\\", "build/", "*.log", "", "# note"])
+        assert spec.match_file("build/x")
+        assert spec.match_file("a.log")
+        # A malformed line never takes down its neighbours.
+        assert not spec.match_file("src/main.py")
+
+    def test_trailing_backslash_matches_nothing(self) -> None:
+        # Git parity: git treats a dangling trailing backslash (e.g. `.godot\`)
+        # as an escape of nothing, so the pattern matches nothing — no error, no
+        # fallback to the bare path. Dropping the line reproduces that exactly.
+        # Do NOT re-add a salvage that rewrites `.godot\` -> `.godot`: that would
+        # diverge from git (it would start ignoring `.godot/` that git tracks).
+        spec = _compile_gitignore([".godot\\"])
+        assert not spec.match_file(".godot")
+        assert not spec.match_file(".godot/imported/x.res")
+        assert not spec.match_file("godot.py")
+
+    def test_unrecoverable_line_is_dropped(self) -> None:
+        # A lone backslash is unparseable and empty once stripped -> drop it,
+        # do not raise, and keep the valid neighbour.
+        spec = _compile_gitignore(["\\", "keep-me/"])
+        assert spec.match_file("keep-me/x")
+
+    def test_all_valid_lines_preserved(self) -> None:
+        spec = _compile_gitignore(["dist/", "*.tmp"])
+        assert spec.match_file("dist/a")
+        assert spec.match_file("x.tmp")
+        assert not spec.match_file("keep.py")
+
 
 # ---------------------------------------------------------------------------
 # Language detection
@@ -172,6 +209,21 @@ class TestFileTraverser:
         assert any("app.py" in p for p in paths)
         assert not any("local-stash" in p for p in paths)
         assert not any("notes.scratch" in p for p in paths)
+
+    def test_malformed_gitignore_line_does_not_abort(self, tmp_path: Path) -> None:
+        # Git tolerates patterns that pathspec rejects (e.g. a trailing
+        # backslash like ``.godot\``). One such line must not crash the whole
+        # traversal; the remaining valid patterns must still apply.
+        (tmp_path / ".gitignore").write_text(".godot\\\n*.log\napp_ok.py\n")
+        (tmp_path / "app.py").write_text("pass")
+        (tmp_path / "app_ok.py").write_text("pass")
+        (tmp_path / "debug.log").write_text("logs")
+        traverser = FileTraverser(tmp_path)
+        paths = [f.path for f in traverser.traverse()]
+        # Did not raise, and the well-formed patterns after the bad line held.
+        assert any("app.py" in p for p in paths)
+        assert not any("app_ok.py" in p for p in paths)
+        assert not any("debug.log" in p for p in paths)
 
     def test_skips_oversized_files(self, tmp_path: Path) -> None:
         big = tmp_path / "big.py"
