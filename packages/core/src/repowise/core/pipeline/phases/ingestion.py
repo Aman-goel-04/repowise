@@ -57,6 +57,61 @@ async def _timed_step(
     return result
 
 
+# Traversal skip counters, in report order: (stat attribute, how to describe it).
+# A table rather than eleven near-identical ``if`` blocks, so adding a skip
+# reason to the traverser is one line here.
+_SKIP_REASONS: tuple[tuple[str, str], ...] = (
+    ("skipped_gitignore", "by .gitignore"),
+    ("skipped_blocked_extension", "by extension"),
+    ("skipped_blocked_pattern", "by filename pattern"),
+    ("skipped_oversized", "oversized"),
+    ("skipped_binary", "binary"),
+    ("skipped_generated", "generated"),
+    ("skipped_extra_exclude", "by --exclude"),
+    ("skipped_extra_ignore", "by .repowiseIgnore"),
+    ("skipped_submodule", "submodule dirs"),
+    ("skipped_nested_repo", "nested git repos"),
+    ("skipped_unknown_language", "unknown type"),
+)
+
+_TOP_LANGUAGES_SHOWN = 6
+
+# Files at or above which the graph build is slow enough to be worth warning
+# about. Below it the build finishes in around a second, so the Ctrl-C
+# reassurance would be noise on a run that never gets a chance to be
+# interrupted. Measured against a 157-file repo (0.8s) and the calibration
+# behind the pre-scan estimate, roughly 2 min per 1k source files end to end.
+_SLOW_GRAPH_BUILD_FILES = 2000
+
+
+def _emit_traversal_summary(
+    progress: ProgressCallback | None,
+    stats: Any,
+    included: int,
+) -> None:
+    """Report what the walk found and what it left out."""
+    if progress is None:
+        return
+
+    progress.on_message(
+        "info", f"Scanned {stats.total_paths_walked:,} files, {included:,} included"
+    )
+
+    skipped = [
+        f"{count:,} {label}" for attr, label in _SKIP_REASONS if (count := getattr(stats, attr, 0))
+    ]
+    if skipped:
+        progress.on_message("info", f"  Excluded: {', '.join(skipped)}")
+
+    if stats.lang_counts:
+        ranked = sorted(stats.lang_counts.items(), key=lambda item: -item[1])
+        lang_str = ", ".join(f"{lang} {count:,}" for lang, count in ranked[:_TOP_LANGUAGES_SHOWN])
+        rest = sum(count for _, count in ranked[_TOP_LANGUAGES_SHOWN:])
+        if rest:
+            lang_str += f", other {rest:,}"
+        progress.on_message("info", f"  Languages: {lang_str}")
+
+
 # ---------------------------------------------------------------------------
 # Process-pool worker (module-level — must be picklable)
 # ---------------------------------------------------------------------------
@@ -248,6 +303,12 @@ async def _run_ingestion(
             if fi.language not in ("dockerfile", "makefile", "terraform", "shell")
         ]
 
+    # Report the traversal here, not at the end of the phase: the graph build,
+    # dynamic hints, PageRank and community detection all run below, and on a
+    # large repo "Scanned N files" used to land several minutes after the
+    # traverse bar had finished and the user had moved on.
+    _emit_traversal_summary(progress, traverser.stats, len(file_infos))
+
     # ---- Parse phase: CPU-bound, run in ProcessPoolExecutor ----------------
     if progress:
         progress.on_phase_start("parse", len(file_infos))
@@ -364,11 +425,16 @@ async def _run_ingestion(
     # from inside GraphBuilder.build(); the orchestrator drives metrics/
     # communities/flows below so the longest-running step is no longer an
     # opaque "graph 0/1" spinner.
-    if progress:
+    if progress and len(file_infos) >= _SLOW_GRAPH_BUILD_FILES:
+        # Reassurance before the longest silent stretch of the run, so it is
+        # warning-weight rather than another dim stat — which is also why it is
+        # gated: on a small repo the build is over in under a second, and a
+        # yellow "this may take several minutes" there is a false alarm made
+        # louder.
         progress.on_message(
-            "info",
-            "  (graph build can take several minutes on first run — safe to "
-            "Ctrl-C, then run 'repowise init --resume' to continue)",
+            "warning",
+            "Graph build can take several minutes on a first run. Safe to Ctrl-C — "
+            "re-run 'repowise init --resume' to continue where it stopped.",
         )
     await asyncio.to_thread(graph_builder.build, progress)
 
@@ -436,53 +502,15 @@ async def _run_ingestion(
     )
     _phase_done(progress, "graph.communities")
 
-    # Emit filtering summary so users can see what was included/excluded
-    stats = traverser.stats
-    if progress:
-        parts: list[str] = []
-        if stats.skipped_gitignore:
-            parts.append(f"{stats.skipped_gitignore:,} by .gitignore")
-        if stats.skipped_blocked_extension:
-            parts.append(f"{stats.skipped_blocked_extension:,} by extension")
-        if stats.skipped_blocked_pattern:
-            parts.append(f"{stats.skipped_blocked_pattern:,} by filename pattern")
-        if stats.skipped_oversized:
-            parts.append(f"{stats.skipped_oversized:,} oversized")
-        if stats.skipped_binary:
-            parts.append(f"{stats.skipped_binary:,} binary")
-        if stats.skipped_generated:
-            parts.append(f"{stats.skipped_generated:,} generated")
-        if stats.skipped_extra_exclude:
-            parts.append(f"{stats.skipped_extra_exclude:,} by --exclude")
-        if stats.skipped_extra_ignore:
-            parts.append(f"{stats.skipped_extra_ignore:,} by .repowiseIgnore")
-        if stats.skipped_submodule:
-            parts.append(f"{stats.skipped_submodule:,} submodule dirs")
-        if stats.skipped_nested_repo:
-            parts.append(f"{stats.skipped_nested_repo:,} nested git repos")
-        if stats.skipped_unknown_language:
-            parts.append(f"{stats.skipped_unknown_language:,} unknown type")
-
-        excluded_str = ", ".join(parts) if parts else "none"
-        progress.on_message(
-            "info",
-            f"Scanned {stats.total_paths_walked:,} files, {len(file_infos):,} included",
-        )
-        if parts:
-            progress.on_message("info", f"  Excluded: {excluded_str}")
-
-        # Language breakdown
-        if stats.lang_counts:
-            top_langs = sorted(stats.lang_counts.items(), key=lambda x: -x[1])[:6]
-            lang_str = ", ".join(f"{lang} {count:,}" for lang, count in top_langs)
-            rest_count = sum(
-                c for _, c in sorted(stats.lang_counts.items(), key=lambda x: -x[1])[6:]
-            )
-            if rest_count:
-                lang_str += f", other {rest_count:,}"
-            progress.on_message("info", f"  Languages: {lang_str}")
-
-    return parsed_files, file_infos, repo_structure, source_map, graph_builder, stats, tech_items
+    return (
+        parsed_files,
+        file_infos,
+        repo_structure,
+        source_map,
+        graph_builder,
+        traverser.stats,
+        tech_items,
+    )
 
 
 async def reparse_for_resume(
