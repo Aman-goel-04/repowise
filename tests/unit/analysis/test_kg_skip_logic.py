@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
+
+import pytest
 
 from repowise.core.analysis.knowledge_graph import (
+    _KG_SCHEMA_VERSION,
     KnowledgeGraphResult,
     compute_kg_fingerprint,
     should_skip_kg_rebuild,
 )
-
 
 # ---------------------------------------------------------------------------
 # KnowledgeGraphResult.from_file
@@ -61,6 +64,64 @@ class TestKGResultFromFile:
         assert loaded is not None
         assert loaded.fingerprint == ""
 
+    def test_to_dict_carries_the_schema_version(self):
+        assert KnowledgeGraphResult().to_dict()["schema_version"] == _KG_SCHEMA_VERSION
+
+    def test_rejects_an_older_schema(self, tmp_path, caplog):
+        p = tmp_path / "kg.json"
+        p.write_text(
+            json.dumps({"schema_version": _KG_SCHEMA_VERSION - 1, "nodes": [{"id": "file:a.py"}]}),
+            encoding="utf-8",
+        )
+        with caplog.at_level(logging.INFO):
+            assert KnowledgeGraphResult.from_file(p) is None
+        assert "schema_version" in caplog.text
+
+    def test_rejects_a_non_integer_schema_version(self, tmp_path):
+        p = tmp_path / "kg.json"
+        p.write_text(json.dumps({"schema_version": "1.0.0", "nodes": []}), encoding="utf-8")
+        assert KnowledgeGraphResult.from_file(p) is None
+
+    def test_rejects_a_boolean_schema_version(self, tmp_path):
+        """``True`` is an int in Python, and ``True < 1`` is False, so it loaded."""
+        p = tmp_path / "kg.json"
+        p.write_text(json.dumps({"schema_version": True, "nodes": []}), encoding="utf-8")
+        assert KnowledgeGraphResult.from_file(p) is None
+
+    @pytest.mark.parametrize("payload", ["[]", '"x"', "5", "null", "true"])
+    def test_rejects_valid_json_that_is_not_an_object(self, tmp_path, payload):
+        """All five are valid JSON and all five are reachable from a hand edit.
+
+        The loader called ``.get`` on whatever came back, so these raised
+        AttributeError — which the orchestrator's except tuple does not name,
+        so it escaped and killed the run. That is the failure the guard around
+        this loader exists to stop.
+        """
+        p = tmp_path / "kg.json"
+        p.write_text(payload, encoding="utf-8")
+        assert KnowledgeGraphResult.from_file(p) is None
+
+    def test_accepts_a_file_written_before_the_field_existed(self, tmp_path):
+        """Unversioned files have the current shape, so they still load.
+
+        The gate only bites on a future bump; rejecting today's artifacts
+        would throw away curated layer names for no reason.
+        """
+        p = tmp_path / "kg.json"
+        p.write_text(json.dumps({"nodes": [{"id": "file:a.py"}], "layers": []}), encoding="utf-8")
+        loaded = KnowledgeGraphResult.from_file(p)
+        assert loaded is not None
+        assert len(loaded.nodes) == 1
+
+    def test_accepts_a_newer_schema(self, tmp_path):
+        """Forward compatibility is the writer's problem, not the reader's."""
+        p = tmp_path / "kg.json"
+        p.write_text(
+            json.dumps({"schema_version": _KG_SCHEMA_VERSION + 1, "nodes": []}),
+            encoding="utf-8",
+        )
+        assert KnowledgeGraphResult.from_file(p) is not None
+
 
 # ---------------------------------------------------------------------------
 # Fingerprint determinism
@@ -70,6 +131,7 @@ class TestKGResultFromFile:
 class TestFingerprintDeterminism:
     def _make_graph_builder(self, nodes, edges, communities):
         from unittest.mock import MagicMock
+
         import networkx as nx
 
         g = nx.DiGraph()
