@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from fastapi import APIRouter, Depends, Query
 from repowise.core.persistence import crud
@@ -127,8 +128,35 @@ async def export_graph(
     view. ``dead_total``/``hot_total`` vs ``*_in_view`` let clients say
     "showing 12 of 37" instead of rendering silently-empty overlays.
     """
+    # Load only the columns this endpoint actually serializes. The row carries
+    # several large text columns (signature, qualified_name, file_path,
+    # community_meta_json) that nothing here reads, and this query hydrates
+    # EVERY node in the repo before capping — on a 31k-node repo that is several
+    # MB of text fetched and discarded per request. The list below must stay a
+    # superset of what `node_to_response` reads plus `node_id`: a deferred
+    # column accessed under asyncio raises MissingGreenlet rather than lazily
+    # loading, so adding a field there means adding it here.
+    #
+    # Caveat worth knowing before trusting the saving: on the truncated path
+    # `crud.get_top_entry_points` runs its own unnarrowed query over every
+    # symbol node to read `community_meta_json`. Those rows are already in the
+    # identity map, so SQLAlchemy back-fills their deferred columns and the
+    # saving applies only to file nodes there. Correctness is unaffected.
     node_result = await session.execute(
         select(GraphNode)
+        .options(
+            load_only(
+                GraphNode.node_id,
+                GraphNode.node_type,
+                GraphNode.language,
+                GraphNode.symbol_count,
+                GraphNode.is_test,
+                GraphNode.is_entry_point,
+                GraphNode.pagerank,
+                GraphNode.betweenness,
+                GraphNode.community_id,
+            )
+        )
         .where(GraphNode.repository_id == repo_id)
         .order_by(GraphNode.pagerank.desc())
     )
