@@ -15,18 +15,26 @@ The shape follows what the readers were already doing:
 
     repo overview
       onboarding pages          (canonical reading order)
-      architecture diagram
-      layer pages               (dependency order from the layer spine)
-        module pages            (grouped under their dominant layer)
-          file pages            (under the nearest module, by member or path)
-          api contracts, infra pages
-            symbol spotlights   (under the file they document)
-        cycle pages
+      module pages              (stamped with the layer they belong to)
+        file pages              (under the nearest module, by member or path)
+        api contracts, infra pages
+          symbol spotlights     (under the file they document)
+      cycle pages               (stamped with the layer they belong to)
       anything unplaced
 
-A rung only appears when the pages for it exist. A repo indexed without a
-curated knowledge graph has no layer pages, so its modules sit directly under
-the overview and the tree is two levels shallower.
+A rung only appears when the pages for it exist.
+
+Layers are the one grouping that is *not* a rung here. They used to be: a
+module said it belonged to the Analysis layer by being parented onto the
+Analysis layer page, which forced eleven near-identical pages to exist purely
+to hold the structure. Those pages retired, so the layer is recorded on each
+module and cycle page instead (``layer_id`` for joining, ``layer_name`` for
+display) and a reader-facing tree builds the layer rows from that — the same
+way the Onboarding folder is built from a slot stamped on its members.
+
+Indexes written before the retirement still hold layer pages. Those are placed
+under the overview like any other page, so an old store rebuilds without
+losing rows.
 
 Everything is ordered by a total sort key, never by dict insertion, because a
 tree that reshuffles between two runs of the same commit is the same defect as
@@ -76,6 +84,65 @@ _TYPE_RANK: dict[str, int] = {
 }
 
 _UNRANKED = len(_TYPE_RANK)
+
+
+# Page types a reader-facing tree groups into layer rows. Their layer comes
+# from the provenance :func:`assign_page_tree` stamps on them, not from a
+# parent page, so nothing fails when it is missing — the page just falls out
+# of its group. :func:`measure_layer_grouping` is what makes that visible.
+GROUPED_PAGE_TYPES: frozenset[str] = frozenset({"module_page", "scc_page"})
+
+
+@dataclass(frozen=True)
+class LayerGroupingReport:
+    """How far layer provenance reached across one run's pages.
+
+    ``grouped`` and ``ungrouped`` are counted over :data:`GROUPED_PAGE_TYPES`
+    only. Read ``measured`` before reading ``grouped``: a run that produced no
+    groupable page at all has a zero that says nothing, which is the opposite
+    fact from "every groupable page was left ungrouped".
+    """
+
+    grouped: int = 0
+    ungrouped: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.grouped + self.ungrouped
+
+    @property
+    def measured(self) -> bool:
+        return self.total > 0
+
+    def summary_line(self) -> str:
+        """One line fit for a report table, honest about the not-run case."""
+        if not self.measured:
+            return "not computed (no groupable pages)"
+        if not self.ungrouped:
+            return f"all {self.total} pages carry a layer"
+        return f"{self.ungrouped} of {self.total} pages carry no layer"
+
+
+def measure_layer_grouping(
+    pages: Iterable[GeneratedPage] | Iterable[TreeNode],
+) -> LayerGroupingReport:
+    """Count how many groupable pages carry a resolved layer id.
+
+    Call after :func:`assign_page_tree`, which is what stamps them. An empty
+    string counts as ungrouped: the stamper writes nothing when the layer could
+    not be resolved, so a blank id means something else wrote it.
+    """
+    grouped = 0
+    ungrouped = 0
+    for page in pages:
+        if page.page_type not in GROUPED_PAGE_TYPES:
+            continue
+        layer_id = page.metadata.get("layer_id")
+        if isinstance(layer_id, str) and layer_id:
+            grouped += 1
+        else:
+            ungrouped += 1
+    return LayerGroupingReport(grouped=grouped, ungrouped=ungrouped)
 
 
 def _onboarding_rank(page: GeneratedPage) -> int:
