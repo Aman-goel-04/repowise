@@ -22,6 +22,7 @@ import {
   type OnboardingSlot,
 } from "../lib/page-types";
 import { RAW_GRAPH_ID, displayLabel, treeLabel } from "./page-labels";
+import { groupPagesByLayer, readLayerOrder, readLayerStamp } from "../lib/layers";
 import { cn } from "../lib/cn";
 import { statusBadgeClasses, type FreshnessStatus } from "../lib/confidence";
 import type { DocPageSummary } from "@repowise-dev/types/docs";
@@ -30,6 +31,10 @@ import type { DocPageSummary } from "@repowise-dev/types/docs";
 // real target_path (which never starts with "@") so directory lookups don't
 // collide with module paths.
 const ONBOARDING_DIR_KEY = "@onboarding";
+// Same idea for a layer's grouping row. A layer has no page behind it, so the
+// row needs a key of its own and it must not look like a page id.
+const LAYER_DIR_PREFIX = "@layer:";
+const layerDirKey = (layerId: string) => `${LAYER_DIR_PREFIX}${layerId}`;
 // Tree expansion survives reloads (per-browser, not per-repo — paths rarely
 // collide across repos and the fallback is just the default expansion).
 const EXPANDED_DIRS_KEY = "repowise:docs-tree-expanded";
@@ -46,6 +51,10 @@ interface TreeNode {
   children: TreeNode[];
   /** Dotted outline number from the stored tree ("2.4.1"), when the page has one. */
   section?: string;
+  /** Where the row's "see the picture" link goes, for rows that have one. */
+  href?: string;
+  /** What that link is for, read out to a screen reader. */
+  hrefLabel?: string;
 }
 
 interface DocsTreeProps {
@@ -53,6 +62,15 @@ interface DocsTreeProps {
   selectedPageId: string | null;
   onSelectPage: (page: DocPageSummary) => void;
   className?: string;
+  /**
+   * The host's knowledge-graph route, linked from every layer row.
+   *
+   * A layer is a grouping of the knowledge graph, and the graph is where its
+   * diagram is drawn and explorable — the tree only lists what is in the layer.
+   * Optional because the route is the host's to name, and a host that has no
+   * such view simply gets a row with no link rather than a dead one.
+   */
+  knowledgeGraphHref?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,7 +366,45 @@ function compareSiblings(a: DocPageSummary, b: DocPageSummary): number {
   );
 }
 
-function buildStoredTree(pages: DocPageSummary[]): TreeNode[] {
+/**
+ * Say out loud when the layer grouping and the repository disagree.
+ *
+ * A tree with no layer rows has two very different causes: a repository that
+ * genuinely has no layers, and a page listing that stopped carrying the stamp
+ * the grouping reads. They render identically, so the difference has to be
+ * reported rather than looked at. The overview naming a spine while not one
+ * page carries a stamp is the signal that it is the second one.
+ */
+function reportLayerGrouping(
+  grouping: ReturnType<typeof groupPagesByLayer>,
+  spine: readonly string[],
+): void {
+  if (spine.length > 0 && grouping.stamped === 0) {
+    console.warn(
+      `[docs-tree] the repository overview names ${spine.length} layers, but not one page ` +
+        "carries a layer stamp, so the outline is flat. Check that the page listing still " +
+        "serves layer_id.",
+    );
+  }
+  if (spine.length === 0 && grouping.stamped > 0) {
+    console.warn(
+      `[docs-tree] ${grouping.stamped} pages name a layer, but the repository overview ` +
+        "records no layer order. Grouping by name, which says nothing about which layer " +
+        "depends on which.",
+    );
+  }
+  if (spine.length > 0 && grouping.offSpine.length > 0) {
+    console.warn(
+      `[docs-tree] ${grouping.offSpine.length} layers are stamped on pages but absent from ` +
+        `the overview's spine, so they sort last: ${grouping.offSpine.join(", ")}`,
+    );
+  }
+}
+
+function buildStoredTree(
+  pages: DocPageSummary[],
+  knowledgeGraphHref?: string,
+): TreeNode[] {
   // A tombstoned page documents a file that no longer exists. It keeps its row
   // and its content, but the tree deliberately has no place for it, so it must
   // be excluded here rather than treated as an unplaced page.
@@ -408,12 +464,36 @@ function buildStoredTree(pages: DocPageSummary[]): TreeNode[] {
       page: root,
       children: [],
     });
-    top.push(
-      ...(childrenOf.get(root.id) ?? [])
-        .slice()
-        .sort(compareSiblings)
-        .map((child) => toNode(child, root)),
-    );
+    // The layers are the top rung of the outline, and they are grouping rows
+    // rather than pages: the layer a module belongs to is stamped on the module
+    // itself, so the grouping holds whether or not the wiki describes the layer
+    // anywhere. On a wiki that does parent modules onto a layer page, no child
+    // of the root carries a stamp and this is a no-op.
+    const children = (childrenOf.get(root.id) ?? []).slice().sort(compareSiblings);
+    const spine = readLayerOrder(root);
+    const grouping = groupPagesByLayer(children, spine);
+    reportLayerGrouping(grouping, spine);
+    // Unclaimed children keep their place ahead of the layers: onboarding
+    // chapters and the architecture diagram sort before any module, and that
+    // is the order a reader should meet them in.
+    top.push(...grouping.ungrouped.map((child) => toNode(child, root)));
+    for (const group of grouping.groups) {
+      top.push({
+        name: group.label,
+        path: layerDirKey(group.id),
+        isDir: true,
+        children: group.pages.map((child) => toNode(child, root)),
+        // The tree can only list what a layer holds. The picture of it — which
+        // layer sits on which, and what crosses between them — is the
+        // knowledge graph, so the row carries a way there.
+        ...(knowledgeGraphHref
+          ? {
+              href: knowledgeGraphHref,
+              hrefLabel: `Show ${group.label} in the knowledge graph`,
+            }
+          : {}),
+      });
+    }
   }
 
   // Concept pages the walk never reached. Grouped by type rather than dropped:
@@ -547,69 +627,90 @@ function TreeItem({
   const hasChildren = node.children.length > 0;
 
   if (node.isDir) {
+    const row = (
+      <button
+        onClick={() => {
+          toggleDir(node.path);
+          if (node.page) onSelectPage(node.page);
+        }}
+        {...(node.page && node.page.title !== node.name ? { title: node.page.title } : {})}
+        className={cn(
+          "flex w-full min-w-0 flex-1 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs transition-colors hover:bg-[var(--color-bg-elevated)]",
+          // Top-level sections (layers, the Onboarding folder, the bottom
+          // Auto-documented folder) get air above them so each group reads as
+          // a distinct block rather than one long list.
+          depth === 0 && "mt-2 first:mt-0",
+          isSelected
+            ? "bg-[var(--color-accent-muted)] text-[var(--color-accent-primary)]"
+            : "text-[var(--color-text-secondary)]",
+        )}
+        style={{ paddingLeft: `${depth * 16 + 8}px` }}
+      >
+        {hasChildren ? (
+          isExpanded ? (
+            <ChevronDown className="h-3 w-3 shrink-0 opacity-50" />
+          ) : (
+            <ChevronRight className="h-3 w-3 shrink-0 opacity-50" />
+          )
+        ) : (
+          <span className="w-3 shrink-0" />
+        )}
+        <SectionNumber depth={depth} section={node.section} />
+        {node.path === ONBOARDING_DIR_KEY ? (
+          <Compass className="h-3.5 w-3.5 shrink-0 text-[var(--color-accent-primary)]" />
+        ) : hidesTreeIcon(node.page) ? null : node.page ? (
+          // A layer keeps its section icon as the anchor for its group; a
+          // concept content dir (a module with children) drops its folder
+          // glyph so the outline is not a column of identical icons. The
+          // chevron already marks it as expandable.
+          <PageIcon
+            pageType={node.page.page_type}
+            className="h-3.5 w-3.5 shrink-0 text-[var(--color-accent-primary)]"
+          />
+        ) : isExpanded ? (
+          <FolderOpen className="h-3.5 w-3.5 shrink-0 text-[var(--color-accent-primary)] opacity-70" />
+        ) : (
+          <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-tertiary)]" />
+        )}
+        <span
+          className={cn(
+            // Wraps rather than truncates. A section title cut to
+            // "Documentation Generation Engi…" names nothing, and the tree
+            // has the vertical room — it is a list of a few dozen concept
+            // rows, not a viewport-bound table.
+            "min-w-0 text-left font-medium [overflow-wrap:anywhere]",
+            // A top-level section is the parent of everything indented under
+            // it, so it carries the strongest weight in the tree.
+            (node.path === ONBOARDING_DIR_KEY || depth === 0) &&
+              "font-semibold text-[var(--color-text-primary)]",
+          )}
+        >
+          {node.name}
+        </span>
+        <RowMarkers page={node.page} showFreshness={showFreshness} />
+      </button>
+    );
+
     return (
       <div>
-        <button
-          onClick={() => {
-            toggleDir(node.path);
-            if (node.page) onSelectPage(node.page);
-          }}
-          {...(node.page && node.page.title !== node.name ? { title: node.page.title } : {})}
-          className={cn(
-            "flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs transition-colors hover:bg-[var(--color-bg-elevated)]",
-            // Top-level sections (layers, the Onboarding folder, the bottom
-            // Auto-documented folder) get air above them so each group reads as
-            // a distinct block rather than one long list.
-            depth === 0 && "mt-2 first:mt-0",
-            isSelected
-              ? "bg-[var(--color-accent-muted)] text-[var(--color-accent-primary)]"
-              : "text-[var(--color-text-secondary)]",
-          )}
-          style={{ paddingLeft: `${depth * 16 + 8}px` }}
-        >
-          {hasChildren ? (
-            isExpanded ? (
-              <ChevronDown className="h-3 w-3 shrink-0 opacity-50" />
-            ) : (
-              <ChevronRight className="h-3 w-3 shrink-0 opacity-50" />
-            )
-          ) : (
-            <span className="w-3 shrink-0" />
-          )}
-          <SectionNumber depth={depth} section={node.section} />
-          {node.path === ONBOARDING_DIR_KEY ? (
-            <Compass className="h-3.5 w-3.5 shrink-0 text-[var(--color-accent-primary)]" />
-          ) : hidesTreeIcon(node.page) ? null : node.page ? (
-            // A layer keeps its section icon as the anchor for its group; a
-            // concept content dir (a module with children) drops its folder
-            // glyph so the outline is not a column of identical icons. The
-            // chevron already marks it as expandable.
-            <PageIcon
-              pageType={node.page.page_type}
-              className="h-3.5 w-3.5 shrink-0 text-[var(--color-accent-primary)]"
-            />
-          ) : isExpanded ? (
-            <FolderOpen className="h-3.5 w-3.5 shrink-0 text-[var(--color-accent-primary)] opacity-70" />
-          ) : (
-            <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-tertiary)]" />
-          )}
-          <span
-            className={cn(
-              // Wraps rather than truncates. A section title cut to
-              // "Documentation Generation Engi…" names nothing, and the tree
-              // has the vertical room — it is a list of a few dozen concept
-              // rows, not a viewport-bound table.
-              "min-w-0 text-left font-medium [overflow-wrap:anywhere]",
-              // A top-level section is the parent of everything indented under
-              // it, so it carries the strongest weight in the tree.
-              (node.path === ONBOARDING_DIR_KEY || depth === 0) &&
-                "font-semibold text-[var(--color-text-primary)]",
-            )}
-          >
-            {node.name}
-          </span>
-          <RowMarkers page={node.page} showFreshness={showFreshness} />
-        </button>
+        {node.href ? (
+          // The row itself expands; the trailing link leaves for the graph.
+          // Two separate targets rather than one that guesses which was meant,
+          // and an anchor rather than a button so it can be opened in a tab.
+          <div className="flex items-center">
+            {row}
+            <a
+              href={node.href}
+              aria-label={node.hrefLabel}
+              title={node.hrefLabel}
+              className="shrink-0 rounded-md p-1.5 text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-accent-primary)]"
+            >
+              <Network className="h-3.5 w-3.5" />
+            </a>
+          </div>
+        ) : (
+          row
+        )}
 
         {isExpanded && hasChildren && (
           <div>
@@ -731,7 +832,13 @@ function RowMarkers({
 
 type ViewMode = "domain" | "folder";
 
-export function DocsTree({ pages, selectedPageId, onSelectPage, className }: DocsTreeProps) {
+export function DocsTree({
+  pages,
+  selectedPageId,
+  onSelectPage,
+  className,
+  knowledgeGraphHref,
+}: DocsTreeProps) {
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
   const [freshnessFilter, setFreshnessFilter] = useState<FreshnessFilter>("all");
@@ -761,6 +868,11 @@ export function DocsTree({ pages, selectedPageId, onSelectPage, className }: Doc
     );
     for (const page of pages) {
       if (hasSpineChild.has(page.id) && SPINE_TYPES.has(page.page_type)) dirs.add(page.id);
+      // A layer's grouping row has no page behind it, so the rule above cannot
+      // reach it. It opens for the same reason a layer page did: the layers are
+      // the top rung, and a shut one hides the whole outline under it.
+      const layer = readLayerStamp(page);
+      if (layer) dirs.add(layerDirKey(layer.id));
     }
     if (typeof window !== "undefined") {
       try {
@@ -790,8 +902,11 @@ export function DocsTree({ pages, selectedPageId, onSelectPage, className }: Doc
   const [showFreshness, setShowFreshness] = useState(false);
 
   const tree = useMemo(
-    () => (viewMode === "domain" ? buildStoredTree(pages) : buildTree(pages)),
-    [pages, viewMode],
+    () =>
+      viewMode === "domain"
+        ? buildStoredTree(pages, knowledgeGraphHref)
+        : buildTree(pages),
+    [pages, viewMode, knowledgeGraphHref],
   );
   const filteredTree = useMemo(
     () => filterTree(tree, search, typeFilter, freshnessFilter),
