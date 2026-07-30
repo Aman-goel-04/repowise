@@ -11,6 +11,14 @@ from dataclasses import dataclass, field
 from .models import GeneratedPage
 from .page_overlap import OverlapReport, measure_orientation_overlap
 from .page_tree import LayerGroupingReport, measure_layer_grouping
+from .prose import prose_word_count
+
+# How much prose the repository overview may ask a reader to get through.
+# The page is the first thing anyone reads and it had grown past nine hundred
+# words while saying what four hundred and fifty say.  The prompt asks for the
+# same number; the check below reports whether the run honoured it.  Warn-only
+# on purpose — a long overview is worth seeing, never worth failing a run over.
+ORIENTATION_PROSE_WORD_BUDGET = 450
 
 
 @dataclass
@@ -37,6 +45,14 @@ class GenerationReport:
     # raises when it is missing — the wiki just comes out flat.  Read
     # ``measured`` before reading the counts.
     layer_grouping: LayerGroupingReport = field(default_factory=LayerGroupingReport)
+    # Tally of the generation-artifact checks run over provider responses this
+    # process.  Carries its own denominator so "checked nothing" and "found
+    # nothing" stay separate facts.
+    artifact_checks: dict[str, int] = field(default_factory=dict)
+    # Prose length of the repository overview this run produced, or ``None``
+    # when the run produced no overview.  ``None`` and ``0`` are different
+    # facts: nothing was measured, versus an overview with nothing in it.
+    overview_prose_words: int | None = None
 
     @classmethod
     def from_pages(
@@ -48,6 +64,10 @@ class GenerationReport:
         decisions_count: int = 0,
         elapsed: float = 0.0,
     ) -> GenerationReport:
+        # Deferred: the page generator pulls in the provider stack, and the
+        # report is importable on its own (the CLI renders it lazily).
+        from .page_generator.validation import artifact_check_counts
+
         by_type = dict(Counter(p.page_type for p in pages))
         hal_count = sum(1 for p in pages if p.metadata.get("hallucination_warnings"))
         repair_count = sum(1 for p in pages if p.metadata.get("self_repair"))
@@ -64,11 +84,41 @@ class GenerationReport:
             self_repaired_page_count=repair_count,
             orientation_overlap=measure_orientation_overlap(pages),
             layer_grouping=measure_layer_grouping(pages),
+            artifact_checks=artifact_check_counts(),
+            overview_prose_words=next(
+                (
+                    prose_word_count(p.content or "")
+                    for p in pages
+                    if p.page_type == "repo_overview"
+                ),
+                None,
+            ),
         )
 
     @property
     def total_pages(self) -> int:
         return sum(self.pages_by_type.values())
+
+    @property
+    def overview_over_budget(self) -> bool:
+        """Whether the overview asks for more prose than the budget allows."""
+        if self.overview_prose_words is None:
+            return False
+        return self.overview_prose_words > ORIENTATION_PROSE_WORD_BUDGET
+
+    def overview_length_summary(self) -> str:
+        """One line naming the overview's length against its budget."""
+        if self.overview_prose_words is None:
+            return "no overview in this run"
+        line = f"{self.overview_prose_words} / {ORIENTATION_PROSE_WORD_BUDGET} words"
+        return f"{line} — over budget" if self.overview_over_budget else line
+
+    def artifact_check_summary(self) -> str:
+        """One line saying whether the artifact checks ran, and what they found."""
+        checked = self.artifact_checks.get("responses_checked", 0)
+        if not checked:
+            return "not run (0 responses checked)"
+        return f"{checked} checked, {self.artifact_checks.get('rejected', 0)} rejected"
 
     def estimated_cost_usd(
         self,
@@ -127,6 +177,20 @@ def render_report(report: GenerationReport, console: object) -> None:
     if grouping.ungrouped:
         grouping_text = f"[yellow]{grouping_text}[/yellow]"
     table.add_row("Layer grouping", grouping_text)
+
+    # Same reasoning as the overlap row: shown even at zero, because a check
+    # that never ran must not look like a check that passed.
+    artifact_text = report.artifact_check_summary()
+    if report.artifact_checks.get("rejected"):
+        artifact_text = f"[yellow]{artifact_text}[/yellow]"
+    table.add_row("Artifact checks", artifact_text)
+
+    # Always shown for the same reason as the two rows above: a budget nobody
+    # sees the reading of is a budget nobody keeps.
+    length_text = report.overview_length_summary()
+    if report.overview_over_budget:
+        length_text = f"[yellow]{length_text}[/yellow]"
+    table.add_row("Overview length", length_text)
 
     console.print(table)  # type: ignore[union-attr]
 
