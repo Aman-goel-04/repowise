@@ -291,6 +291,17 @@ _RST_DIRECTIVE = re.compile(r"^\s*\.\.\s")
 #: The cost of guessing wrong is bounded: a ``.txt`` that is not reST has no
 #: title underlines, so the reST scan returns no sections rather than bad ones.
 _RST_SUFFIXES = frozenset({".rst", ".txt"})
+#: A line that is reStructuredText markup rather than a sentence: bullet and
+#: enumerated list items, grid- and simple-table rules and rows, line blocks,
+#: and field lists or bare roles.
+#:
+#: The markdown scan has always refused these shapes — see ``_NOT_PROSE`` — and
+#: the reST scan reading them as prose is how a table of contents supplied a
+#: subsystem's definition. Mined from django, whose "Models" section opens with
+#: a grid of ``:doc:`` links, the sentence taken was
+#: ``:doc:`Introduction to models <topics/db/models>` |`` — markup, a wrong
+#: definition, and a stray pipe that would break any table it is rendered into.
+_RST_MARKUP_LINE = re.compile(r"^\s*(?:[*+\-|>:=~^#]|\d+[.)]\s)")
 
 
 def _is_rst_underline(line: str, title: str) -> bool:
@@ -355,11 +366,41 @@ def _definition_after_rst_section(lines: list[str], underline: int) -> str | Non
         # A line that is itself underlined is the next section's title.
         if offset + 1 < len(lines) and _is_rst_underline(lines[offset + 1], stripped):
             return None
-        sentence = _first_sentence(_strip_rst_roles(stripped))
+        if _RST_MARKUP_LINE.match(stripped):
+            # Markup, not a sentence. Skipped rather than taken, exactly as the
+            # markdown scan skips a table row or a badge line above the prose.
+            continue
+        paragraph = _join_wrapped(lines, offset, stop)
+        sentence = _first_sentence(_strip_rst_roles(paragraph))
         if _MIN_DEFINITION_CHARS <= len(sentence) <= _MAX_DEFINITION_CHARS:
             return sentence
         return None
     return None
+
+
+def _join_wrapped(lines: list[str], start: int, stop: int) -> str:
+    """The paragraph beginning at ``start``, rejoined into one string.
+
+    reStructuredText hard-wraps prose at the column, so a line is a line and
+    not a sentence. Reading one line was how django's Forms section defined
+    itself as "Django provides a rich framework to facilitate the creation of
+    forms and the" — the author's sentence, cut where the editor wrapped it.
+
+    Stops at the paragraph break, at markup, and at the next section title,
+    which are the same boundaries the caller respects; the caller's scan
+    window bounds it.
+    """
+    parts = [lines[start].strip()]
+    for offset in range(start + 1, stop):
+        if _SENTENCE_END.search(" ".join(parts)):
+            break
+        nxt = lines[offset].strip()
+        if not nxt or _RST_MARKUP_LINE.match(nxt) or _RST_DIRECTIVE.match(lines[offset]):
+            break
+        if offset + 1 < len(lines) and _is_rst_underline(lines[offset + 1], nxt):
+            break
+        parts.append(nxt)
+    return " ".join(parts)
 
 
 #: ``:doc:`quickstart``` and ``:class:`Flask``` are cross-references. The text
@@ -389,7 +430,18 @@ _DEFINITION_SCAN_LINES = 5
 _SENTENCE_END = re.compile(r"(?<=[.!?])(?:\s|$)")
 
 # A bolded lead-in that carries its own definition: "**Blast radius** — ...".
-_BOLD_DEFINITION = re.compile(r"\*\*([A-Z][^*\n]{2,40})\*\*\s*[—–:-]\s*([^\n]{10,300})")
+#
+# The gap around the separator is horizontal whitespace, not ``\s``: a lead-in
+# and the sentence that defines it are on one line, and that is the whole shape
+# this pattern is for. Letting the gap cross a newline turned a bolded label
+# standing alone on its line into a claim on whatever the next line held. On
+# django's contents page, "**Models:**" followed by a row of links produced
+#
+#     Models -> "doc:`Introduction to models <topics/db/models>` |"
+#
+# where the separator matched the colon of ``:doc:`` — markup, a wrong
+# definition, and a stray pipe that breaks any table it is rendered into.
+_BOLD_DEFINITION = re.compile(r"\*\*([A-Z][^*\n]{2,40})\*\*[ \t]*[—–:-][ \t]*([^\n]{10,300})")
 
 
 def _first_sentence(line: str) -> str:
@@ -554,6 +606,8 @@ def _harvest(
     unreadable = 0
     skipped: list[str] = []
     sectionless: list[str] = []
+    rst_sections_seen = 0
+    rst_sections_undefined = 0
 
     patterns = ("*.md", "*.rst", "*.txt") if read_rst else ("*.md",)
     for path in _doc_paths(repo_root, patterns=patterns):
@@ -598,6 +652,8 @@ def _harvest(
                 (title, _definition_after_rst_section(lines, underline))
                 for title, underline in sections
             ]
+            rst_sections_seen += len(entries)
+            rst_sections_undefined += sum(1 for _t, d in entries if d is None)
         else:
             entries = [
                 (m.group(1), _definition_after_heading(text, m.end()))
@@ -651,6 +707,16 @@ def _harvest(
             "titles and contributed no terms: %s",
             len(sectionless),
             ", ".join(sorted(sectionless)[:10]),
+        )
+    if rst_sections_seen:
+        # A term with no sentence is a supported outcome, but a document whose
+        # every section is markup is usually a table of contents rather than
+        # prose — worth being able to see rather than inferring from an
+        # unexplained absence of definitions.
+        logger.info(
+            "vocabulary: %d of %d reStructuredText sections carried no defining sentence",
+            rst_sections_undefined,
+            rst_sections_seen,
         )
     return [candidates[k] for k in order]
 
