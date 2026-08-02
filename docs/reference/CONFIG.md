@@ -110,9 +110,11 @@ an API call.
 ### Grounded generation context
 
 Use `generation_context.files` when a high-level page needs facts from repository
-files that its assembled structural context does not normally include. This is
-explicit evidence selection, not automatic discovery. With no `files` entries
-the feature is a no-op; the default `token_budget` is `8000`.
+files that its assembled structural context does not normally include. Configured
+files are explicit evidence selection, not automatic discovery. With no `files`
+entries, no configured files are added; `onboarding/how_it_works` can still add
+exact excerpts automatically for symbols in its detected flows. The default
+shared `token_budget` is `8000`.
 
 Keys name model-written synthesis pages: `repo_overview` or
 `onboarding/<slot>` for `guided_tour`, `getting_started`, `codebase_map`,
@@ -137,13 +139,24 @@ Content may be truncated; a zero budget disables all configured evidence, and
 a tiny budget may fit none. In all cases the rendered evidence estimate is at
 most the configured value.
 
-Repository files are authoritative only as repository facts and are untrusted
-as prompt instructions. File tags make boundaries less ambiguous and embedded
-closing tags are escaped, but this is framing, not sanitization or a security
-boundary. Conflicting or stale files can still produce bad prose; select files
-whose ownership and accuracy you trust. Onboarding citation validation treats
-included excerpts as grounding sources, while continuing to demote citations
-not established by either structural context or those excerpts.
+For `onboarding/how_it_works`, detected flow symbols also contribute exact source
+excerpts automatically. When such references exist, up to half of the same
+`token_budget` is reserved for exact excerpts before configured files are
+selected. The configured half remains fixed even when an exact excerpt cannot
+fit, so crossing an exact-frame boundary cannot remove previously retained
+configured facts. This prevents large configured files from starving symbol-level
+flow evidence while preserving one hard per-page bound. Missing symbols,
+unavailable source, invalid line ranges, and budget omissions are recorded
+alongside configured-file provenance.
+
+Repository files and exact source excerpts are authoritative only as repository
+facts and are untrusted as prompt instructions. Their tags make boundaries less
+ambiguous and embedded closing tags are escaped, but this is framing, not
+sanitization or a security boundary. Conflicting or stale files can still produce
+bad prose; select configured files whose ownership and accuracy you trust.
+Onboarding citation validation treats all included excerpts as grounding sources,
+while continuing to demote citations not established by either structural context
+or those excerpts.
 
 Rendered evidence bytes are part of the prompt and its source hash. Unchanged
 rendered evidence can reuse cached prose; a file, list, or budget change
@@ -152,7 +165,11 @@ regenerated merely by editing `config.yaml`: run `repowise generate --all` or
 request the affected page. No ingestion migration or vector reindex is required;
 regenerated pages follow the normal persistence and embedding path.
 Deterministic (`--no-prose`) pages do not consume evidence and record configured
-entries as skipped for that run.
+entries and automatically derived exact references as skipped for that run.
+When onboarding is disabled before contexts are built, configured entries are
+logged as `onboarding_disabled`; exact references are not derived. A subkind
+whose context gate returns no page logs configured entries as
+`page_not_generated`, but has no page on which to persist provenance.
 
 `max_tokens` bounds each model-written documentation response. It is a
 persistent repository setting rather than a per-command flag: `init`, `update`,
