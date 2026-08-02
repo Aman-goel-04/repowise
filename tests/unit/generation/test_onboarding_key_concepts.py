@@ -416,6 +416,286 @@ def test_grounding_catches_fabricated_path_and_symbol() -> None:
     assert "SecretOrchestrator" in cleaned
 
 
+def test_qualified_symbol_cannot_borrow_an_unrelated_member() -> None:
+    ctx = {"known": "Real.run"}
+
+    cleaned, ungrounded = check_grounding("`Ghost.run` is fabricated.", ctx)
+
+    assert ungrounded == ["Ghost.run"]
+    assert "`Ghost.run`" not in cleaned
+
+
+def test_qualified_symbol_cannot_borrow_a_known_owner() -> None:
+    cleaned, ungrounded = check_grounding("`Real.fabricated` is absent.", {"known": "Real.run"})
+
+    assert ungrounded == ["Real.fabricated"]
+    assert "`Real.fabricated`" not in cleaned
+
+
+def test_grounding_accepts_citations_established_only_by_added_evidence() -> None:
+    ctx = _ctx_for_grounding()
+    content = (
+        "The `EvidenceRouter.dispatch` in `docs/runtime_flow.py` selects the worker, "
+        "while `FabricatedWorker` is not established."
+    )
+    evidence = {
+        "docs/runtime_flow.py": (
+            "EvidenceRouter.dispatch validates the request before selecting a worker."
+        )
+    }
+
+    cleaned, ungrounded = check_grounding(content, ctx, evidence)
+
+    assert "`EvidenceRouter.dispatch`" in cleaned
+    assert "`docs/runtime_flow.py`" in cleaned
+    assert "FabricatedWorker" in ungrounded
+    assert "`FabricatedWorker`" not in cleaned
+
+
+def test_evidence_grounding_requires_complete_identifier_and_path() -> None:
+    ctx = _ctx_for_grounding()
+    evidence = {"src/foo.py": "Existing.run"}
+    content = "`Existing.run` is real; `FabricatedType.run` and `other/place/foo.py` are not."
+
+    cleaned, ungrounded = check_grounding(content, ctx, evidence)
+
+    assert "`Existing.run`" in cleaned
+    assert ungrounded == ["FabricatedType.run", "other/place/foo.py"]
+    assert "`FabricatedType.run`" not in cleaned
+    assert "`other/place/foo.py`" not in cleaned
+
+
+def test_evidence_grounding_requires_qualified_path_member_to_occur() -> None:
+    ctx = _ctx_for_grounding()
+    evidence = {"src/foo.py": "ExistingWorker handles requests."}
+    content = (
+        "`src/foo.py` is included, but `src/foo.py::FabricatedWorker` and "
+        "`src/foo.py#FabricatedWorker` are not established."
+    )
+
+    cleaned, ungrounded = check_grounding(content, ctx, evidence)
+
+    assert "`src/foo.py`" in cleaned
+    assert ungrounded == ["src/foo.py::FabricatedWorker", "src/foo.py#FabricatedWorker"]
+    assert "`src/foo.py::FabricatedWorker`" not in cleaned
+    assert "`src/foo.py#FabricatedWorker`" not in cleaned
+
+
+def test_evidence_grounding_validates_configured_documentation_paths() -> None:
+    ctx = _ctx_for_grounding()
+    evidence = {
+        "README.md": "Project purpose.",
+        "docs/ARCHITECTURE.md": "System boundaries.",
+    }
+    content = (
+        "Read `README.md` and `docs/ARCHITECTURE.md`, not "
+        "`docs/FABRICATED.md` or `other/guide.rst`."
+    )
+
+    cleaned, ungrounded = check_grounding(content, ctx, evidence)
+
+    assert "`README.md`" in cleaned
+    assert "`docs/ARCHITECTURE.md`" in cleaned
+    assert ungrounded == ["docs/FABRICATED.md", "other/guide.rst"]
+    assert "`docs/FABRICATED.md`" not in cleaned
+    assert "`other/guide.rst`" not in cleaned
+
+
+def test_evidence_grounding_validates_arbitrary_sibling_repository_paths() -> None:
+    evidence = {
+        "schemas/order.proto": "message Order {}",
+        "services/real.py": "def real(): pass",
+    }
+    content = "Do not cite `schemas/fabricated.proto` or `services/fabricated.py`."
+
+    cleaned, ungrounded = check_grounding(content, _ctx_for_grounding(), evidence)
+
+    assert ungrounded == ["schemas/fabricated.proto", "services/fabricated.py"]
+    assert "`schemas/fabricated.proto`" not in cleaned
+    assert "`services/fabricated.py`" not in cleaned
+
+
+def test_evidence_grounding_validates_extensionless_repository_paths() -> None:
+    ctx = _ctx_for_grounding()
+    evidence = {"deploy/Dockerfile": "Build instructions."}
+
+    cleaned, ungrounded = check_grounding(
+        "Use `deploy/Dockerfile`, not `docs/LICENSE` or `deploy/Fakefile`.",
+        ctx,
+        evidence,
+    )
+
+    assert "`deploy/Dockerfile`" in cleaned
+    assert ungrounded == ["docs/LICENSE", "deploy/Fakefile"]
+    assert "`docs/LICENSE`" not in cleaned
+    assert "`deploy/Fakefile`" not in cleaned
+
+
+def test_grounding_does_not_treat_urls_routes_or_commands_as_repository_paths() -> None:
+    content = (
+        "Call `https://example.com/docs`, `github.com/org/repo`, `api/v1/users`, "
+        "`api/V1/users`, `localhost:3000/api`, `v2/users`, `V2/users`, "
+        "`service/v1/users`, `service/v2/schema.yaml`, `api/v1/openapi.json`, "
+        "`localhost/openapi.json`, `users/V2/profile`, `users/profile`, "
+        "`v1/openapi.json`, `accounts/v1/users.json`, `GET/api`, "
+        "`npm:test`, `NPM:test`, `example.com`, `EXAMPLE.COM`, "
+        "`example.xyz/path`, `EXAMPLE.XYZ/path`, `Github.COM/org/repo`, "
+        "`API/v1/users`, `Service/v1/users`, `GET /health`, or `/health`."
+    )
+
+    cleaned, ungrounded = check_grounding(content, _ctx_for_grounding())
+
+    assert cleaned == content
+    assert ungrounded == []
+
+
+def test_grounding_validates_paths_in_versioned_repository_directories() -> None:
+    content = (
+        "Do not cite `docs/v2/fake.md`, `src/v1/missing.py`, `v1/src/handler`, or `V1/Src/handler`."
+    )
+
+    cleaned, ungrounded = check_grounding(content, _ctx_for_grounding())
+
+    assert ungrounded == [
+        "docs/v2/fake.md",
+        "src/v1/missing.py",
+        "v1/src/handler",
+        "V1/Src/handler",
+    ]
+    assert "`docs/v2/fake.md`" not in cleaned
+    assert "`src/v1/missing.py`" not in cleaned
+    assert "`v1/src/handler`" not in cleaned
+    assert "`V1/Src/handler`" not in cleaned
+
+
+def test_grounding_validates_structured_paths_under_api_directory() -> None:
+    cleaned, ungrounded = check_grounding("Do not cite `api/openapi.yaml`.", _ctx_for_grounding())
+
+    assert ungrounded == ["api/openapi.yaml"]
+    assert "`api/openapi.yaml`" not in cleaned
+
+
+def test_qualified_evidence_paths_cannot_borrow_a_structured_bare_path() -> None:
+    ctx = {"known_files": ["src/foo.py", "README.md"]}
+    evidence = {
+        "src/foo.py": "RealWorker handles requests.",
+        "README.md": "Documented setup.",
+    }
+    content = "`src/foo.py::FabricatedWorker` and `README.md#fabricated` are not established."
+
+    cleaned, ungrounded = check_grounding(content, ctx, evidence)
+
+    assert ungrounded == ["src/foo.py::FabricatedWorker", "README.md#fabricated"]
+    assert "`src/foo.py::FabricatedWorker`" not in cleaned
+    assert "`README.md#fabricated`" not in cleaned
+
+
+def test_grounding_validates_root_documentation_paths_with_punctuation() -> None:
+    content = "Do not cite `MIGRATION-GUIDE.md` or `CODE-OF-CONDUCT.md#policy`."
+
+    cleaned, ungrounded = check_grounding(content, _ctx_for_grounding())
+
+    assert ungrounded == ["MIGRATION-GUIDE.md", "CODE-OF-CONDUCT.md#policy"]
+    assert "`MIGRATION-GUIDE.md`" not in cleaned
+    assert "`CODE-OF-CONDUCT.md#policy`" not in cleaned
+
+
+def test_grounding_validates_qualified_root_build_and_config_paths() -> None:
+    content = "Do not cite `pom.xml#fake`, `Cargo.lock#fake`, or `justfile#fake`."
+
+    cleaned, ungrounded = check_grounding(content, _ctx_for_grounding())
+
+    assert ungrounded == ["pom.xml#fake", "Cargo.lock#fake", "justfile#fake"]
+    for token in ungrounded:
+        assert f"`{token}`" not in cleaned
+
+
+def test_evidence_grounding_preserves_exact_dot_prefixed_paths() -> None:
+    ctx = _ctx_for_grounding()
+    evidence = {
+        ".github/CONTRIBUTING.md": "Contribution workflow.",
+        ".env.example": "EXAMPLE=true",
+    }
+
+    cleaned, ungrounded = check_grounding(
+        (
+            "Read `.github/CONTRIBUTING.md` and `.env.example`, not "
+            "`.github/FAKE.md` or `.env.production`."
+        ),
+        ctx,
+        evidence,
+    )
+
+    assert "`.github/CONTRIBUTING.md`" in cleaned
+    assert "`.env.example`" in cleaned
+    assert ungrounded == [".github/FAKE.md", ".env.production"]
+    assert "`.github/FAKE.md`" not in cleaned
+    assert "`.env.production`" not in cleaned
+
+
+def test_grounding_keeps_documentation_paths_from_structured_context() -> None:
+    ctx = {"hot_files": ["docs/guide.md"]}
+
+    cleaned, ungrounded = check_grounding("Read `docs/guide.md` first.", ctx)
+
+    assert cleaned == "Read `docs/guide.md` first."
+    assert ungrounded == []
+
+
+def test_evidence_path_match_uses_path_boundaries() -> None:
+    ctx = _ctx_for_grounding()
+    evidence = {"docs/notes.md": "old/src/foo.py.bak differs; use src/real.py instead."}
+    content = "`src/foo.py` is fabricated; `src/real.py` is established."
+
+    cleaned, ungrounded = check_grounding(content, ctx, evidence)
+
+    assert ungrounded == ["src/foo.py"]
+    assert "`src/foo.py`" not in cleaned
+    assert "`src/real.py`" in cleaned
+
+
+def test_evidence_path_match_uses_complete_fragment_boundaries() -> None:
+    ctx = _ctx_for_grounding()
+    evidence = {
+        "docs/notes.md": (
+            "README.md#setup#fabricated and src/foo.py#Worker#fabricated are unrelated."
+        )
+    }
+    content = "`README.md#setup` and `src/foo.py#Worker` are not established."
+
+    cleaned, ungrounded = check_grounding(content, ctx, evidence)
+
+    assert ungrounded == ["README.md#setup", "src/foo.py#Worker"]
+    assert "`README.md#setup`" not in cleaned
+    assert "`src/foo.py#Worker`" not in cleaned
+
+
+def test_evidence_symbol_match_uses_qualified_identifier_boundaries() -> None:
+    ctx = _ctx_for_grounding()
+    evidence = {
+        "docs/notes.md": (
+            "Other.EvidenceRouter.dispatch, EvidenceRouter.dispatch.extra, "
+            "Other/EvidenceRouter.dispatch, and Other#EvidenceRouter.dispatch are unrelated."
+        )
+    }
+
+    cleaned, ungrounded = check_grounding("Use `EvidenceRouter.dispatch`.", ctx, evidence)
+
+    assert ungrounded == ["EvidenceRouter.dispatch"]
+    assert "`EvidenceRouter.dispatch`" not in cleaned
+
+
+def test_grounding_validates_non_dot_qualified_symbols() -> None:
+    evidence = {"docs/notes.md": "Router#real Router:real Router/real"}
+    content = "`Router#fabricated`, `Router:fabricated`, and `Router/fabricated` are absent."
+
+    cleaned, ungrounded = check_grounding(content, _ctx_for_grounding(), evidence)
+
+    assert ungrounded == ["Router#fabricated", "Router:fabricated", "Router/fabricated"]
+    for token in ungrounded:
+        assert f"`{token}`" not in cleaned
+
+
 def test_grounding_cleans_reused_page_content() -> None:
     """The check runs on content, so a reused (cached) page carrying a stale
     fabrication is cleaned the same way a fresh one is."""

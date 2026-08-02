@@ -51,6 +51,13 @@ wiki_style: comprehensive            # comprehensive | caveman | reference | tut
 language: en                         # Output language for generated pages (en, zh, ru, hi, ...)
 enable_onboarding: true               # Show first-run onboarding prompts
 max_file_pages: 2000                  # Cap file pages (omit = size policy, 0 = one page per file)
+generation_context:                   # Optional source evidence for synthesis pages
+  token_budget: 8000
+  files:
+    repo_overview:
+      - docs/ARCHITECTURE.md
+    onboarding/how_it_works:
+      - docs/runtime-flow.md
 exclude_patterns:                    # Gitignore-style patterns
   - vendor/
   - "*.generated.*"
@@ -84,6 +91,7 @@ You can edit this file directly. Changes take effect on the next `init`,
 | `language` | `en` | Output language for generated wiki pages: `en`, `ar`, `de`, `es`, `fr`, `hi`, `it`, `ja`, `ko`, `nl`, `pl`, `pt`, `ru`, `tr`, `zh` |
 | `enable_onboarding` | `true` | Show first-run onboarding prompts (CLI and web) |
 | `max_file_pages` | unset | Most file pages a run emits, highest importance first. Three states: **unset** lets the size policy decide (untouched below 4,500 documentable files, held to 4,500 above, which is about 1 repo in 100), **0** means one page per eligible file however many that is, and a **positive value** is a hard cap. `repowise init` offers a tighter cap in advanced mode above 2,000 documentable files, and `--max-file-pages N` sets it non-interactively. `update --full` and `generate` honour whatever is recorded. Capping file pages does not reduce model spend: file pages are rendered from structure |
+| `generation_context` | see below | Repository-source evidence appended to model-written overview and onboarding prompts |
 | `distill` | see below | Output distillation config |
 | `mcp` | see below | MCP tool surface config |
 | `refactoring` | see below | Refactoring-intelligence config |
@@ -98,6 +106,53 @@ matching effort level from providers and model families that support it (for
 example OpenAI reasoning models and OpenRouter's `reasoning.effort`).
 Providers or models that cannot translate an explicit mode fail before making
 an API call.
+
+### Grounded generation context
+
+Use `generation_context.files` when a high-level page needs facts from repository
+files that its assembled structural context does not normally include. This is
+explicit evidence selection, not automatic discovery. With no `files` entries
+the feature is a no-op; the default `token_budget` is `8000`.
+
+Keys name model-written synthesis pages: `repo_overview` or
+`onboarding/<slot>` for `guided_tour`, `getting_started`, `codebase_map`,
+`key_concepts`, `how_it_works`, `development_guide`, and `active_landscape`.
+`onboarding/project_overview` is invalid because that promoted slot is the
+`repo_overview` page. Unknown keys and malformed values fail generation with a
+configuration error instead of being ignored.
+
+Each value is an ordered list of repository-relative paths. A file is eligible
+only when it was included in the indexed source map and contains non-empty
+UTF-8 text. Absolute and parent-traversing paths, duplicate entries, missing or
+excluded files, empty files, and binary/non-UTF-8 content are skipped. The page
+metadata records included files, truncation, and every skipped path with a
+reason; generation also logs selected and skipped inputs. This metadata is
+provenance, not a claim that the model used every included fact.
+
+`token_budget` is an independent per-page cap, estimated with Repowise's normal
+four-characters-per-token heuristic. It does not reduce the structural context
+budget. Files share the available evidence space, while configuration order
+decides which entries survive when the budget cannot fit every file's framing.
+Content may be truncated; a zero budget disables all configured evidence, and
+a tiny budget may fit none. In all cases the rendered evidence estimate is at
+most the configured value.
+
+Repository files are authoritative only as repository facts and are untrusted
+as prompt instructions. File tags make boundaries less ambiguous and embedded
+closing tags are escaped, but this is framing, not sanitization or a security
+boundary. Conflicting or stale files can still produce bad prose; select files
+whose ownership and accuracy you trust. Onboarding citation validation treats
+included excerpts as grounding sources, while continuing to demote citations
+not established by either structural context or those excerpts.
+
+Rendered evidence bytes are part of the prompt and its source hash. Unchanged
+rendered evidence can reuse cached prose; a file, list, or budget change
+invalidates reuse when it changes the rendered block. Existing pages are not
+regenerated merely by editing `config.yaml`: run `repowise generate --all` or
+request the affected page. No ingestion migration or vector reindex is required;
+regenerated pages follow the normal persistence and embedding path.
+Deterministic (`--no-prose`) pages do not consume evidence and record configured
+entries as skipped for that run.
 
 `max_tokens` bounds each model-written documentation response. It is a
 persistent repository setting rather than a per-command flag: `init`, `update`,

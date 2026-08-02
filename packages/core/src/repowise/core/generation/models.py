@@ -10,8 +10,9 @@ import graph stays one-directional:
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Iterator, Mapping
+from copy import deepcopy
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -53,6 +54,63 @@ GENERATION_LEVELS: dict[str, int] = {
 
 FreshnessStatus = Literal["fresh", "stale", "expired", "unknown"]
 DEFAULT_MAX_TOKENS = 16384
+DEFAULT_SOURCE_EVIDENCE_TOKEN_BUDGET = 8000
+
+
+def _source_evidence_page_keys() -> set[str]:
+    """Return synthesis page keys that have a model-written consumer."""
+    from .onboarding.slots import ONBOARDING_ORDER, PROMOTED_SLOTS
+
+    promoted = set(PROMOTED_SLOTS.values())
+    return {"repo_overview"} | {
+        f"onboarding/{slot}" for slot in ONBOARDING_ORDER if slot not in promoted
+    }
+
+
+class _FrozenEvidenceFiles(Mapping[str, tuple[str, ...]]):
+    """Small immutable mapping that preserves the frozen config contract."""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, values: Mapping[str, tuple[str, ...]] | None = None) -> None:
+        object.__setattr__(
+            self,
+            "_items",
+            tuple((key, tuple(paths)) for key, paths in (values or {}).items()),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TypeError("source_evidence_files is immutable")
+
+    def __getitem__(self, key: str) -> tuple[str, ...]:
+        for candidate, paths in self._items:
+            if candidate == key:
+                return paths
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _ in self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        return dict(self.items()) == dict(other.items())
+
+    def __hash__(self) -> int:
+        return hash(frozenset(self.items()))
+
+    def __copy__(self) -> _FrozenEvidenceFiles:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _FrozenEvidenceFiles:
+        memo[id(self)] = self
+        return self
+
+    def __reduce__(self) -> tuple[type[_FrozenEvidenceFiles], tuple[dict[str, tuple[str, ...]]]]:
+        return type(self), (dict(self),)
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +121,10 @@ DEFAULT_MAX_TOKENS = 16384
 @dataclass(frozen=True)
 class GenerationConfig:
     """Configuration for the generation engine.
+
+    Use :meth:`to_dict` for a plain, rehydratable public snapshot. Direct
+    ``dataclasses.asdict`` output is not a public serialization contract because
+    frozen nested values may retain their immutable implementation types.
 
     Attributes:
         max_tokens:               Max tokens in LLM completion.
@@ -205,6 +267,23 @@ class GenerationConfig:
     # (emit an arbitrary subset from the complete repo view) and is what
     # ``repowise generate`` uses to refresh those repo-wide pages on demand.
     file_pages_only: bool = False
+    # New fields stay at the end to preserve GenerationConfig's positional
+    # constructor contract for direct-library callers.
+    # Repository-source excerpts appended to model-written synthesis prompts.
+    # The normal context budget above still owns per-file structural assembly;
+    # this independent cap keeps high-level evidence bounded and predictable.
+    source_evidence_token_budget: int = DEFAULT_SOURCE_EVIDENCE_TOKEN_BUDGET
+    # Page key -> explicit repository-relative files to add. Supported keys are
+    # ``repo_overview`` and ``onboarding/<slot>``.
+    source_evidence_files: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the supported plain, rehydratable configuration snapshot."""
+        snapshot = {item.name: deepcopy(getattr(self, item.name)) for item in fields(self)}
+        snapshot["source_evidence_files"] = {
+            page_key: tuple(paths) for page_key, paths in self.source_evidence_files.items()
+        }
+        return snapshot
 
     @classmethod
     def from_repo_config(
@@ -230,7 +309,40 @@ class GenerationConfig:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
 
-        values = {"max_tokens": max_tokens, **overrides}
+        values: dict[str, Any] = {"max_tokens": max_tokens}
+        raw_evidence = config.get("generation_context")
+        if raw_evidence is not None:
+            if not isinstance(raw_evidence, Mapping):
+                raise ValueError("generation_context must be a mapping")
+
+            raw_budget = raw_evidence.get("token_budget", DEFAULT_SOURCE_EVIDENCE_TOKEN_BUDGET)
+            if isinstance(raw_budget, bool) or not isinstance(raw_budget, int) or raw_budget < 0:
+                raise ValueError("generation_context.token_budget must be a non-negative integer")
+            values["source_evidence_token_budget"] = raw_budget
+
+            raw_files = raw_evidence.get("files", {})
+            if not isinstance(raw_files, Mapping):
+                raise ValueError("generation_context.files must be a mapping")
+            valid_page_keys = _source_evidence_page_keys()
+            evidence_files: dict[str, tuple[str, ...]] = {}
+            for raw_page_key, raw_paths in raw_files.items():
+                page_key = str(raw_page_key).strip()
+                if page_key not in valid_page_keys:
+                    raise ValueError(
+                        "generation_context.files keys must name repo_overview or a "
+                        "model-written onboarding slot; project_overview is configured "
+                        "as repo_overview"
+                    )
+                if not isinstance(raw_paths, (list, tuple)) or not all(
+                    isinstance(path, str) and path.strip() for path in raw_paths
+                ):
+                    raise ValueError(
+                        f"generation_context.files.{page_key} must be a list of file paths"
+                    )
+                evidence_files[page_key] = tuple(path.strip() for path in raw_paths)
+            values["source_evidence_files"] = evidence_files
+
+        values.update(overrides)
         return cls(**values)
 
     def __post_init__(self) -> None:
@@ -242,6 +354,33 @@ class GenerationConfig:
             raise ValueError("max_tokens must be a positive integer")
         if self.embed_concurrency is None:
             object.__setattr__(self, "embed_concurrency", self.max_concurrency)
+        if (
+            isinstance(self.source_evidence_token_budget, bool)
+            or not isinstance(self.source_evidence_token_budget, int)
+            or self.source_evidence_token_budget < 0
+        ):
+            raise ValueError("source_evidence_token_budget must be a non-negative integer")
+        if not isinstance(self.source_evidence_files, Mapping):
+            raise ValueError("source_evidence_files must be a mapping")
+        valid_page_keys = _source_evidence_page_keys()
+        evidence_files: dict[str, tuple[str, ...]] = {}
+        for page_key, paths in self.source_evidence_files.items():
+            if page_key not in valid_page_keys:
+                raise ValueError(
+                    "source_evidence_files keys must name repo_overview or a "
+                    "model-written onboarding slot; project_overview is configured "
+                    "as repo_overview"
+                )
+            if not isinstance(paths, (list, tuple)) or not all(
+                isinstance(path, str) and path.strip() for path in paths
+            ):
+                raise ValueError(f"source_evidence_files.{page_key} must be a list of file paths")
+            evidence_files[page_key] = tuple(path.strip() for path in paths)
+        object.__setattr__(
+            self,
+            "source_evidence_files",
+            _FrozenEvidenceFiles(evidence_files),
+        )
         object.__setattr__(self, "reasoning", normalize_reasoning(self.reasoning))
 
 
