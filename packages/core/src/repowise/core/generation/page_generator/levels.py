@@ -275,7 +275,67 @@ def build_level4_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
     return coros
 
 
-def build_level6_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
+async def _module_corroboration(run: _GenerationRun) -> list[str]:
+    """What the structural side calls the parts of the system.
+
+    One string per module group: its title, plus its summary. A module group
+    is cut from the dependency graph and named from the code, so a mined term
+    appearing in one was arrived at twice — from the documents and from the
+    structure — independently.
+
+    Titles alone are about ninety short strings, which is too thin a net: it
+    misses "Knowledge Graph" and "Code Health" while letting "Architecture"
+    and "Workspace" through on an incidental word. The summaries are what make
+    the corroboration mean something.
+
+    Summaries come from this run when level 4 wrote the page, and from the
+    store when it did not. Both together, because either alone is wrong: the
+    run alone empties the corpus on every scoped update and the section
+    vanishes from the front page, and the store alone is one generation stale
+    on a full run. Never raises — a store that cannot answer costs reach, not
+    a page.
+    """
+    groups = run.sel_module_groups
+    if not groups:
+        return []
+
+    summaries: dict[str, str] = {}
+    missing: list[str] = []
+    for mg in groups:
+        written = run.completed_page_summaries.get(mg.key)
+        if written:
+            summaries[mg.key] = written
+        else:
+            missing.append(mg.key)
+
+    if missing and run.vector_store is not None:
+        try:
+            batch = await run.vector_store.get_page_summaries_by_paths(missing)
+        except Exception as exc:
+            # Reach, not correctness. Said out loud because a quietly thinner
+            # corpus reads downstream as "the structure does not name this".
+            log.warning(
+                "generation.overview_corroboration_store_read_failed",
+                repo_name=run.repo_name,
+                wanted=len(missing),
+                error=str(exc),
+            )
+        else:
+            for path, payload in batch.items():
+                summary = (payload or {}).get("summary")
+                if summary:
+                    summaries[path] = summary
+
+    log.info(
+        "generation.overview_corroboration_corpus",
+        groups=len(groups),
+        from_this_run=sum(1 for mg in groups if run.completed_page_summaries.get(mg.key)),
+        with_summary=len(summaries),
+    )
+    return [f"{mg.display}\n{summaries.get(mg.key, '')}" for mg in groups]
+
+
+async def build_level6_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
     """Level 6 (repo_overview).
 
     The overview carries the architecture map. That map used to sit on a page
@@ -285,6 +345,7 @@ def build_level6_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
     uniquely had, so it moved here and the page retired; its id redirects.
     """
     from ..architecture_mermaid import build_overview_mermaid
+    from ..overview_tables import select_capabilities
 
     gen = run.gen
     overview_mermaid = build_overview_mermaid(run.kg_ctx)
@@ -298,6 +359,24 @@ def build_level6_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
         )
     coros: list[tuple[str, Any]] = []
     if run._emit(compute_page_id("repo_overview", run.repo_name)):
+        # What the repository calls its own capabilities, in its own words.
+        # Mined once per run and shared with level 8. A term reaches the page
+        # only when the structural side names it too, so the front page never
+        # carries a word the documents used and the graph never confirmed.
+        #
+        # Module *groups*, not written module pages: a group is cut and named
+        # on every run, so a scoped run that regenerates the overview alone
+        # selects the same rows as a full one.
+        capabilities = select_capabilities(_mine_house_terms(run), await _module_corroboration(run))
+        if not capabilities:
+            # No table beats an empty one, but a front-page section that
+            # quietly stops appearing is the failure shape this repository has
+            # shipped before. Said out loud with the counts that explain it.
+            log.info(
+                "generation.overview_capability_table_absent",
+                repo_name=run.repo_name,
+                module_groups=len(run.sel_module_groups),
+            )
         coros.append(
             (
                 compute_page_id("repo_overview", run.repo_name),
@@ -318,6 +397,7 @@ def build_level6_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
                     # directory the walker skipped reads as zero rather than
                     # going unmentioned.
                     parsed_files=run.parsed_files,
+                    capabilities=capabilities,
                 ),
             )
         )
@@ -341,11 +421,14 @@ def build_level7_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
 
 
 def _mine_house_terms(run: _GenerationRun) -> tuple[HouseTerm, ...]:
-    """The repository's own vocabulary, read once for the whole onboarding level.
+    """The repository's own vocabulary, read once per run.
 
     Mined here rather than inside a subkind because reading it walks the
     repository: once per run is a cost, once per slot is the same cost eight
-    times over for the same answer.
+    times over for the same answer. Two levels want it now — the overview at
+    6 and onboarding at 8 — so the result is memoised on the run rather than
+    the walk being paid twice. A run that emits neither still pays nothing,
+    because neither caller reaches this.
 
     ``repo_path`` is optional on every generation entry point, and a run
     without one has nothing to read. That is reported rather than absorbed —
@@ -356,6 +439,10 @@ def _mine_house_terms(run: _GenerationRun) -> tuple[HouseTerm, ...]:
     from ..concept_tree.vocabulary import extract_house_terms
     from ..report import record_house_terms
 
+    cached = getattr(run, "_house_terms", None)
+    if cached is not None:
+        return cached
+
     if not run.repo_path:
         log.warning(
             "onboarding.house_terms_skipped",
@@ -363,6 +450,7 @@ def _mine_house_terms(run: _GenerationRun) -> tuple[HouseTerm, ...]:
             reason="no_repo_path",
         )
         record_house_terms(None)
+        run._house_terms = ()
         return ()
 
     # The names the codebase defines. A term matching one may be rendered in
@@ -384,6 +472,7 @@ def _mine_house_terms(run: _GenerationRun) -> tuple[HouseTerm, ...]:
             terms=len(terms),
             top=[t.term for t in terms[:8]],
         )
+    run._house_terms = terms
     return terms
 
 
