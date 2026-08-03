@@ -75,6 +75,9 @@ from repowise.server.mcp_server._answer_pipeline import (
     apply_pagerank_bias as _apply_pagerank_bias,
 )
 from repowise.server.mcp_server._answer_pipeline import (
+    degraded_legs as _degraded_legs,
+)
+from repowise.server.mcp_server._answer_pipeline import (
     demote_noise_hits as _demote_noise_hits,
 )
 from repowise.server.mcp_server._answer_pipeline import (
@@ -87,6 +90,9 @@ from repowise.server.mcp_server._answer_pipeline import (
     hybrid_retrieve as _hybrid_retrieve,
 )
 from repowise.server.mcp_server._answer_pipeline import hydrate_hits as _hydrate_hits
+from repowise.server.mcp_server._answer_pipeline import (
+    retrieval_legs as _retrieval_legs,
+)
 from repowise.server.mcp_server._code_rationale import mine_rationale as _mine_rationale
 from repowise.server.mcp_server._flow_path import expand_via_flow_path as _expand_via_flow_path
 from repowise.server.mcp_server._helpers import (
@@ -134,6 +140,9 @@ from repowise.server.mcp_server.tool_answer.retrieval import (
     _candidate_justification,
     _intersection_boost,
     _rerank_by_coverage,
+)
+from repowise.server.mcp_server.tool_answer.retrieval import (
+    serialize_candidates as _serialize_candidates,
 )
 from repowise.server.mcp_server.tool_answer.retrieval import (
     serialize_hits as _serialize_hits,
@@ -882,6 +891,12 @@ async def get_answer(
     # all anchoring/expansion (which inject file/symbol pages, never noise) so it
     # only reorders what those stages left in place.
     hits = _demote_noise_hits(hits, question, is_why=_is_why_question(question))
+    # Everything retrieval resolved, in rank order, before the cap. Synthesis
+    # keeps its 5-hit budget, which is a context-window decision and the
+    # right one, but the files below the cut are still the best answer to
+    # "where do I look next", and they used to be discarded. ``candidates``
+    # (built after synthesis) hands them over at one line each.
+    resolved_pool = list(hits)
     # Always cap retrieval hits at 5 for the response payload.
     hits = hits[:5]
 
@@ -1660,6 +1675,16 @@ async def get_answer(
     if flow_paths:
         payload["flow_path"] = [" -> ".join(p) for p in flow_paths[:2]]
 
+    # Where to look next, always. ``retrieval`` shrinks as confidence rises
+    # (correctly: it is re-read evidence, and a trustworthy answer needs less
+    # of it), but that left the highest-confidence answers naming no file at
+    # all, which is the one thing an agent always has a use for. This block is
+    # navigation rather than evidence: the ranked shortlist, one path per line,
+    # ungated. It costs ~800 characters against a ~10k response.
+    candidates = _serialize_candidates(resolved_pool)
+    if candidates:
+        payload["candidates"] = candidates
+
     # Persist to cache (upsert). Best-effort: cache failures must never block
     # the response — but they must be LOGGED, not suppressed. A plain INSERT
     # under a blanket suppress violated uq_answer_cache_q on every
@@ -1700,5 +1725,14 @@ async def get_answer(
         repository=repository,
         targets=[*citations, *fallback_targets],
     )
+    # Finding A18. Each retrieval leg is best-effort so one slow backend cannot
+    # block an answer, which is right, but it made a lexical-only answer
+    # indistinguishable from a whole one: nothing failed, nothing was logged
+    # where a caller could see it, and ``embedder_live`` stayed true because a
+    # configured embedder is live whether or not this call beat its 8s budget.
+    # Named only when a leg actually fell over, so a healthy response pays
+    # nothing for it.
+    if degraded := _degraded_legs(_retrieval_legs()):
+        payload["_meta"]["retrieval_degraded"] = degraded
     _apply_lean_high(payload, question)
     return payload

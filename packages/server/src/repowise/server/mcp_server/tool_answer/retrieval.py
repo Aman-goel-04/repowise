@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import Page
+from repowise.server.mcp_server._page_paths import hit_file_path
 from repowise.server.mcp_server.tool_answer.config import (
     _BACKEND_PATH_PREFIXES,
     _BACKEND_QUESTION_TOKENS,
@@ -30,6 +31,58 @@ from repowise.server.mcp_server.tool_answer.config import (
 )
 
 _log = logging.getLogger("repowise.mcp.answer")
+
+
+# How many files ``candidates`` names. Twenty path lines cost roughly 800
+# characters against the ~10k a get_answer response already spends, so the
+# block makes the tool *more* token-efficient per candidate offered, not less.
+_CANDIDATE_LIMIT = 20
+
+
+def serialize_candidates(hits: list[dict], *, limit: int = _CANDIDATE_LIMIT) -> list[dict]:
+    """The files retrieval ranked, one line each, ordered best first.
+
+    Separate from ``retrieval`` on purpose, and deliberately not
+    confidence-gated. ``retrieval`` is *evidence*: enriched hits an agent reads
+    to check the prose, so it is right for it to shrink as the prose gets more
+    trustworthy. This block is *navigation*: the shortlist of files worth
+    opening next. Under the old shape a confident answer named zero files and a
+    medium one named two, which is backwards. The more sure we are of a
+    subsystem, the better placed we are to say which files it lives in.
+
+    One entry per distinct path, ``{path, lines?}``. Line bounds are attached
+    only where a hit already carries hydrated symbols; nothing is fetched to
+    build this.
+
+    ``path`` is always a **file** path, resolved through ``hit_file_path``. A
+    ``symbol_spotlight`` hit's ``target_path`` is ``file.py::Symbol``, which is
+    a page identifier, not something a consumer can open; two distinct symbols
+    in one file are also one file to read, so they collapse to one entry here.
+
+    Pages naming no file at all are skipped rather than emitted (finding A15).
+    A module page's target_path is a structural group key that reads like a
+    directory and an onboarding page's is a slot name, so every "does this look
+    like a path" heuristic says yes and the agent that opens it gets an error.
+    Scoring impact is about zero, measured; it is wrong on the same argument
+    A14 was, which is that this field has one meaning and it is not "page id".
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for h in hits:
+        path = hit_file_path(h)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        entry: dict[str, Any] = {"path": path}
+        symbols = h.get("symbols") or []
+        starts = [s["start_line"] for s in symbols if s.get("start_line")]
+        ends = [s["end_line"] for s in symbols if s.get("end_line")]
+        if starts and ends:
+            entry["lines"] = f"{min(starts)}-{max(ends)}"
+        out.append(entry)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def serialize_hits(
@@ -59,7 +112,14 @@ def serialize_hits(
     """
     out: list[dict] = []
     for h in hits[: limit if limit is not None else len(hits)]:
-        entry: dict[str, Any] = {"path": h.get("target_path")}
+        target = h.get("target_path")
+        entry: dict[str, Any] = {"path": target}
+        # A symbol_spotlight page's target_path is ``file.py::Symbol``: a page
+        # id, not a path a consumer can open. Keep it (callers pipe it into
+        # get_symbol) and name the file too, so ``path`` never has to be
+        # guessed at by anything downstream.
+        if target and "::" in target:
+            entry["file"] = target.split("::", 1)[0]
         if h.get("title"):
             entry["title"] = h["title"]
         summary = h.get("summary") or ""
