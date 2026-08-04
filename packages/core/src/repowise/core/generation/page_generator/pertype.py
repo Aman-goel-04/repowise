@@ -249,11 +249,13 @@ class PerTypeGenerationMixin:
         # group. Placement resolves file ownership from this list, so the
         # dropped files would be parented somewhere else entirely, and the two
         # records of what the page covers would disagree.
-        # A rollup page sits above its child concept pages and owns no files of
-        # its own: its members already belong to the leaves below it, so
-        # claiming them here would parent those files twice and scramble the
-        # tree. It keeps an empty member list, which is exactly what
-        # ``assign_page_tree`` reads as "owns nothing".
+        # A chapter with no group of its own owns no files: everything beneath
+        # it already belongs to the leaves below, so claiming them here would
+        # parent those files twice and scramble the tree. It keeps an empty
+        # member list, which is exactly what ``assign_page_tree`` reads as
+        # "owns nothing". A chapter that *is* also a leaf directory owns its own
+        # loose files and passes ``owns_files``, which is why this is keyed on
+        # ownership rather than on ``is_rollup``.
         if owns_files:
             covered = sorted(members) if members else sorted(fc.file_path for fc in file_contexts)
         else:
@@ -269,6 +271,16 @@ class PerTypeGenerationMixin:
             wiki renumbers it and mints no new pages.
             """
             page.metadata["file_paths"] = covered
+            if is_rollup:
+                # What makes this page a chapter rather than a leaf, recorded
+                # so the tree can nest its children under it. Derivable from
+                # the page set — a directory with two or more module pages
+                # immediately below it — but deriving it there would be a
+                # second place computing the rule that decided the page, and
+                # the two would have to agree forever. Absent on a page written
+                # before this shipped, which reads as "leaf" and leaves those
+                # wikis flat rather than guessing.
+                page.metadata["is_chapter"] = True
             if section:
                 page.metadata["concept_section"] = section
                 page.metadata["concept_order"] = order
@@ -327,10 +339,24 @@ class PerTypeGenerationMixin:
         scc_id: str,
         scc_files: list[str],
         file_contexts: list[FilePageContext],
+        title: str | None = None,
     ) -> GeneratedPage:
+        from ..concept_tree.naming import scc_where
+
         ctx = self._assembler.assemble_scc_page(scc_id, scc_files, file_contexts)
         members = sorted(scc_files)
-        page = self._structural_scc_page(ctx, scc_id, f"Circular Dependency: {scc_id}")
+        # Titled by where the cycle is, not by the hash of its member list. The
+        # id keeps the hash, so nothing is redirected and no link breaks; only
+        # the words a reader and a search see change.
+        #
+        # The caller names the whole set at once, because uniqueness is a
+        # property of the set. This fallback is for a caller that has one
+        # cycle and no set — the name is still better than the hash, and the
+        # collision it cannot see is one two identical names would have had.
+        if not title:
+            where = scc_where(members)
+            title = f"Circular Dependency: {where}" if where else f"Circular Dependency: {scc_id}"
+        page = self._structural_scc_page(ctx, scc_id, title)
         page.metadata["file_paths"] = members
         return page
 
