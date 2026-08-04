@@ -86,12 +86,27 @@ def test_the_self_heal_imports_nothing_heavy(tmp_path: Path) -> None:
 
 
 def _read_payload_probe(repo: Path, rel: str) -> str:
-    """Source that fires the PostToolUse Read hook against a real file."""
+    """Source that fires the PostToolUse Read hook against a real file.
+
+    ``tool_response`` is Read's real shape, ``content`` included: the
+    replacement is built from this object, so a probe that stubs it loses the
+    very path it claims to be timing.
+    """
+    source = (repo / rel).read_text(encoding="utf-8")
     payload = {
         "hook_event_name": "PostToolUse",
         "tool_name": "Read",
         "tool_input": {"file_path": str(repo / rel)},
-        "tool_response": {"file": {"numLines": 400}},
+        "tool_response": {
+            "type": "text",
+            "file": {
+                "filePath": str(repo / rel),
+                "content": source,
+                "numLines": len(source.splitlines()),
+                "startLine": 1,
+                "totalLines": len(source.splitlines()),
+            },
+        },
         "cwd": str(repo),
         "session_id": "perf",
     }
@@ -163,7 +178,14 @@ def test_a_read_that_serves_a_skeleton_imports_nothing_heavy(tmp_path: Path) -> 
 
 
 def test_a_read_in_a_repo_that_did_not_opt_in_imports_nothing_heavy(tmp_path: Path) -> None:
-    """Off by default has to be *cheap* by default, not merely quiet."""
+    """Off by default has to be *cheap* by default, not merely quiet.
+
+    This is now the counterfactual's perf guard as well, and that is the more
+    demanding case: the measurement runs on Reads that are *not* being
+    replaced, so a repo with the feature off pays it on every qualifying read
+    and gets no tokens back. It has to stay on the same cheap import graph as
+    the path it stands in for.
+    """
     repo, rel = _indexed_repo(tmp_path, opted_in=False)
     code = (
         _read_payload_probe(repo, rel)
@@ -179,6 +201,11 @@ def test_a_read_in_a_repo_that_did_not_opt_in_imports_nothing_heavy(tmp_path: Pa
     )
     assert "updatedToolOutput" not in out.stdout, "an opted-out repo had its Read replaced"
     assert out.stderr.strip() == "", f"an opted-out Read pulled in:\n{out.stderr}"
+
+    # Guard the guard, same as the opted-in case: if the counterfactual stopped
+    # running, the import assertion above would pass by doing nothing at all.
+    state = json.loads((repo / ".repowise" / ".augment-session.json").read_text("utf-8"))
+    assert state["forgone"] == [rel], "the probe did not reach the counterfactual"
 
 
 def test_a_silent_invocation_imports_nothing_heavy(tmp_path: Path) -> None:
