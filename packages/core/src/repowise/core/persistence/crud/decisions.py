@@ -14,7 +14,11 @@ import structlog
 from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from repowise.core.analysis.decision_provenance import compute_confidence, rank_for_source
+from repowise.core.analysis.decisions.provenance import (
+    SOURCE_RANK,
+    compute_confidence,
+    rank_for_source,
+)
 
 from ..decision_graph import sync_decision_node_links
 from ..models import (
@@ -462,6 +466,103 @@ def _best_verification(values: list[str]) -> str:
     return "unverified"
 
 
+def _rederive_headline(rec: DecisionRecord, evidence: list[DecisionEvidence]) -> None:
+    """Set a record's confidence + verification from its full evidence set.
+
+    The single definition of how a headline is scored. Both writers use it: the
+    upsert path after accreting a run's evidence, and ``reconcile_source_ranks``
+    after a ladder edit. Kept as one function because the two were briefly
+    copy-pasted and nothing would have forced the copies to stay equal.
+
+    Confidence rises with the best source rank and with the number of
+    *independent* corroborating sources, so it is derived from the whole set
+    rather than from whichever row happened to arrive last. No-op on empty
+    evidence: a record with nothing behind it keeps whatever it had.
+    """
+    if not evidence:
+        return
+    best_ver = _best_verification([e.verification for e in evidence])
+    rec.confidence = compute_confidence(
+        max(e.source_rank for e in evidence),
+        len({e.source for e in evidence}),
+        best_ver,
+    )
+    rec.verification = best_ver
+
+
+def _stale_rank_filter() -> Any:
+    """SQL matching evidence rows whose stored rank disagrees with the ladder.
+
+    Derived from ``SOURCE_RANK`` rather than hardcoded, so a future ladder edit
+    is picked up here automatically instead of needing a second place updated.
+    Bounded by the size of the ladder (a dozen terms), and it keeps the common
+    case — a store already on the current ladder — to an indexed match on
+    ``source`` that returns nothing, rather than hydrating the whole table.
+    """
+    return or_(
+        *[
+            (DecisionEvidence.source == name) & (DecisionEvidence.source_rank != rank)
+            for name, rank in SOURCE_RANK.items()
+        ]
+    )
+
+
+async def reconcile_source_ranks(session: AsyncSession) -> int:
+    """Re-stamp evidence rows whose stored rank predates a ``SOURCE_RANK`` edit.
+
+    ``DecisionEvidence.source_rank`` is written once at insert time, and two
+    ``ORDER BY`` clauses read it straight from the column, so it cannot simply be
+    derived on read. That makes the ladder a value copied into every row: editing
+    ``SOURCE_RANK`` leaves existing rows on the previous ladder, and because
+    headline confidence comes from ``max(source_rank)`` across a decision's
+    evidence, a store would end up scoring headlines off a mixture of two ladders
+    without anything looking wrong.
+
+    **This is the only repair path, deliberately.** An Alembic data migration was
+    written first and removed: hosted runs the same persist pipeline as a local
+    store, so the migration was redundant, and worse, it fixed the ranks *without*
+    re-deriving confidence — which made this function's own no-op check pass on
+    the next run and left hosted confidences on the old ladder permanently. One
+    path cannot disagree with itself.
+
+    Not repo-scoped, on purpose: the ladder is global, so in a workspace store
+    holding several repositories every one of them is on the same ladder and all
+    of them need the same repair.
+
+    Idempotent. Returns the number of evidence rows re-stamped (0 when already
+    reconciled, which is the steady state after the first run).
+    """
+    moved = (
+        (await session.execute(select(DecisionEvidence).where(_stale_rank_filter())))
+        .scalars()
+        .all()
+    )
+    if not moved:
+        return 0
+
+    for row in moved:
+        row.source_rank = rank_for_source(row.source)
+    await session.flush()
+
+    now = _now_utc()
+    for decision_id in {row.decision_id for row in moved}:
+        rec = await session.get(DecisionRecord, decision_id)
+        if rec is None:
+            continue
+        _rederive_headline(rec, await list_decision_evidence(session, decision_id))
+        rec.updated_at = now
+
+    # Flush the re-scored headlines too, not just the ranks. Without this the
+    # function returns with confidence still pending in the session, so whether
+    # the repair survives depends on what the caller does next.
+    await session.flush()
+
+    structlog.get_logger(__name__).info(
+        "decisions.source_ranks_reconciled", evidence_rows=len(moved)
+    )
+    return len(moved)
+
+
 async def list_decision_evidence(
     session: AsyncSession,
     decision_id: str,
@@ -704,13 +805,7 @@ async def bulk_upsert_decisions(
 
         # Re-derive headline confidence + verification from the FULL evidence
         # set (existing + just-added), so corroboration accrues across runs.
-        evidence = await list_decision_evidence(session, rec.id)
-        if evidence:
-            distinct_sources = {e.source for e in evidence}
-            top_rank = max(e.source_rank for e in evidence)
-            best_ver = _best_verification([e.verification for e in evidence])
-            rec.confidence = compute_confidence(top_rank, len(distinct_sources), best_ver)
-            rec.verification = best_ver
+        _rederive_headline(rec, await list_decision_evidence(session, rec.id))
         rec.updated_at = _now_utc()
         touched_ids.append(rec.id)
 

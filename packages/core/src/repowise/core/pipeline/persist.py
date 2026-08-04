@@ -1162,15 +1162,29 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
             if harvested:
                 decision_dicts.extend(harvested)
 
-    # One-shot drain of proposals from the removed code_comment harvest;
-    # without this, DBs indexed before its removal keep a flooded review
-    # queue forever (#751). Confirmed/dismissed rows are kept.
+    # One-shot drain of proposals left by retired extraction sources; without
+    # this, DBs indexed before a removal keep a flooded review queue forever
+    # (#751 for code_comment). Confirmed/dismissed rows are kept.
     try:
+        from repowise.core.analysis.decision_provenance import RETIRED_SOURCES
         from repowise.core.persistence.crud import purge_proposed_decisions_by_source
 
-        await purge_proposed_decisions_by_source(session, repo_id, "code_comment")
+        for _retired in RETIRED_SOURCES:
+            await purge_proposed_decisions_by_source(session, repo_id, _retired)
     except Exception as _purge_err:
         logger.debug("decision_purge_skipped", error=str(_purge_err))
+
+    # Re-stamp evidence rows left on a previous SOURCE_RANK ladder. Local stores
+    # are created by ``init_db`` and never see Alembic, so the migration alone
+    # would only reach hosted; this is the same repair on the path every store
+    # takes. No-op scan once reconciled, and it runs whether or not this run
+    # produced decisions, because a store with nothing new still holds the rows.
+    try:
+        from repowise.core.persistence.crud import reconcile_source_ranks
+
+        await reconcile_source_ranks(session)
+    except Exception as _rank_err:
+        logger.debug("decision_rank_reconcile_skipped", error=str(_rank_err))
 
     if decision_dicts:
         # Reuse the run's shared vector store for semantic (paraphrase) dedup
