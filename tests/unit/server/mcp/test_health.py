@@ -279,3 +279,101 @@ async def test_get_health_metric_carries_dominant_cause_and_magnitude(setup_mcp,
     worst = next(m for m in dash["worst_files"] if m["file_path"] == "src/auth/service.py")
     assert worst["primary_biomarker"] == "complex_method"
     assert worst["total_deduction"] == pytest.approx(3.9)
+
+
+@pytest.mark.asyncio
+async def test_get_health_biomarkers_block_is_capped(setup_mcp, health_data):
+    """``include=["biomarkers"]`` respects ``limit`` and reports the true total.
+
+    Regression: this was the one ranked list in the tool with no cap, so a
+    dashboard-mode call returned every open finding in the repo — 10.3k rows /
+    4.7MB on repowise itself, which overflows an agent's context and yields
+    nothing usable. Every other list caps and carries a ``*_total`` sibling.
+    """
+    from repowise.server.mcp_server import get_health
+
+    result = await get_health(include=["biomarkers"], limit=2)
+    assert len(result["findings"]) == 2
+    # The cap is visible rather than inferred from the length.
+    assert result["findings_total"] == 4
+    # Impact-ordered, so the cap keeps the findings worth reading.
+    impacts = [f["health_impact"] for f in result["findings"]]
+    assert impacts == sorted(impacts, reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_get_health_totals_survive_the_cap(setup_mcp, health_data):
+    """Totals count the whole open set even when only ``limit`` rows ship.
+
+    Dashboard mode no longer hydrates every finding to emit a handful, so the
+    totals come from a separate narrow read; this pins them to the full set
+    rather than the truncated head.
+    """
+    from repowise.server.mcp_server import get_health
+
+    capped = await get_health(limit=1)
+    assert len(capped["top_findings"]) == 1
+    assert capped["top_findings_total"] == 4
+
+    scoped = await get_health(targets=["src/auth/service.py"], limit=1)
+    assert len(scoped["findings"]) == 1
+    assert scoped["findings_total"] == 4
+
+
+@pytest.mark.asyncio
+async def test_get_health_only_projection_preserves_block_content(setup_mcp, health_data):
+    """``only`` gates the work behind a block without changing what it holds.
+
+    The projection now skips expensive optional work rather than computing and
+    discarding it, so the surviving block must still be byte-identical to the
+    one the full response carries.
+    """
+    from repowise.server.mcp_server import get_health
+
+    full = await get_health()
+    projected = await get_health(only=["kpis"])
+    assert set(projected) == {"mode", "kpis", "_meta"}
+    assert projected["kpis"] == full["kpis"]
+
+
+@pytest.mark.asyncio
+async def test_get_health_dimension_filter_is_not_defeated_by_the_cap(setup_mcp, health_data):
+    """A dimension filter selects the rows, rather than trimming a capped head.
+
+    Regression: the filter used to run over the finished response, so it
+    narrowed a list already capped by ``health_impact``. Performance findings
+    carry low impact by construction, so the head was defect-heavy and
+    ``include=["biomarkers", "performance"]`` filtered down to nothing — while
+    ``findings_total`` still reported the whole repo, which reads as "no
+    performance risk here" rather than "none shown".
+    """
+    from repowise.server.mcp_server import get_health
+
+    # limit=1 forces the cap to bite before the filter would have run.
+    result = await get_health(include=["biomarkers", "performance"], limit=1)
+    assert [f["dimension"] for f in result["findings"]] == ["performance"]
+    # The total describes the filtered set, so an empty list is unambiguous.
+    assert result["findings_total"] == 1
+
+    maint = await get_health(include=["biomarkers", "maintainability"], limit=1)
+    assert [f["dimension"] for f in maint["findings"]] == ["maintainability"]
+
+    scoped = await get_health(
+        targets=["src/auth/service.py"], include=["biomarkers", "performance"]
+    )
+    assert [f["dimension"] for f in scoped["findings"]] == ["performance"]
+
+
+@pytest.mark.asyncio
+async def test_get_health_dimension_filter_leaves_kpis_and_ranking_alone(setup_mcp, health_data):
+    """Asking to *see* one dimension must not restate the repo's health.
+
+    The leads and the performance KPI come from the unfiltered open set; only
+    the emitted findings narrow.
+    """
+    from repowise.server.mcp_server import get_health
+
+    full = await get_health()
+    filtered = await get_health(include=["biomarkers", "maintainability"])
+    assert filtered["kpis"]["performance_findings"] == full["kpis"]["performance_findings"]
+    assert filtered["worst_files"] == full["worst_files"]

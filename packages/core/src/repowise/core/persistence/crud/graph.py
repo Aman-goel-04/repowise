@@ -638,3 +638,56 @@ async def get_node_degree_counts(
         "in_degree": in_result.scalar() or 0,
         "out_degree": out_result.scalar() or 0,
     }
+
+
+async def get_node_degree_counts_bulk(
+    session: AsyncSession,
+    repository_id: str,
+    node_ids: list[str],
+) -> dict[str, dict[str, int]]:
+    """Return ``node_id -> {in_degree, out_degree}`` for many nodes at once.
+
+    Three queries total instead of three per node (existence, then one grouped
+    count per direction). Callers that need degrees for a set of files were
+    otherwise forced into an N+1.
+
+    A node absent from the graph is absent from the result, mirroring
+    ``get_graph_node`` returning ``None``: consumers distinguish "not a graph
+    node" (no entry) from "a node with no edges" (``{0, 0}``), and collapsing
+    the two would report isolated files as un-analyzed.
+    """
+    if not node_ids:
+        return {}
+    # Batched like ``get_graph_nodes_by_ids`` above: SQLITE_MAX_VARIABLE_NUMBER
+    # is 999 on SQLite < 3.32, and the caller's input is unbounded by design (a
+    # ``module:`` target expands to every file in the module).
+    unique_ids = list(dict.fromkeys(node_ids))
+    counts: dict[str, dict[str, int]] = {}
+    for i in range(0, len(unique_ids), _BATCH_SIZE):
+        existing = await session.execute(
+            select(GraphNode.node_id).where(
+                GraphNode.repository_id == repository_id,
+                GraphNode.node_id.in_(unique_ids[i : i + _BATCH_SIZE]),
+            )
+        )
+        for node_id in existing.scalars().all():
+            counts[node_id] = {"in_degree": 0, "out_degree": 0}
+    if not counts:
+        return {}
+    present = list(counts)
+    for column, key in (
+        (GraphEdge.target_node_id, "in_degree"),
+        (GraphEdge.source_node_id, "out_degree"),
+    ):
+        for i in range(0, len(present), _BATCH_SIZE):
+            rows = await session.execute(
+                select(column, func.count())
+                .where(
+                    GraphEdge.repository_id == repository_id,
+                    column.in_(present[i : i + _BATCH_SIZE]),
+                )
+                .group_by(column)
+            )
+            for node_id, count in rows.all():
+                counts[node_id][key] = count or 0
+    return counts
