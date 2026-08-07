@@ -27,6 +27,7 @@ from repowise.core.persistence.crud import (
     get_refactoring_suggestions,
     list_health_snapshots,
     load_coverage_for_repo,
+    sort_metrics_worst_first,
 )
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import HealthFileMetric, HealthFinding
@@ -523,15 +524,6 @@ async def get_health(
         effective_targets = file_targets if scoped else []
         nothing_resolved = scoped and not effective_targets
 
-        if scoped:
-            metric_rows = [
-                m
-                for m in sorted(all_metrics, key=lambda r: r.score)
-                if m.file_path in set(effective_targets)
-            ]
-        else:
-            metric_rows = sorted(all_metrics, key=lambda r: r.score)
-
         open_findings = (
             HealthFinding.repository_id == repository.id,
             HealthFinding.status == "open",
@@ -621,6 +613,34 @@ async def get_health(
         # the unfiltered total beside a filtered list is what made an empty
         # ``findings`` read as "nothing here" rather than "nothing shown".
         findings_total = len(emitted)
+
+        # Worst-first order, placed here because ranking needs the summed
+        # deduction per file and ``lead_rows`` is the first point that carries
+        # every open finding this response is entitled to see. Same comparator
+        # the crud layer applies to ``get_health_metrics``, so the REST
+        # dashboard and this tool cannot disagree about which file is worst —
+        # but fed from rows already in memory, so it costs no extra query.
+        #
+        # Deliberately ``lead_rows`` (the unfiltered open set) rather than
+        # ``emitted``: asking to *see* one dimension must not restate which
+        # files the repo's worst are.
+        deduction_by_path: dict[str, float] = {}
+        for f in lead_rows:
+            deduction_by_path[f.file_path] = deduction_by_path.get(f.file_path, 0.0) + float(
+                f.health_impact or 0.0
+            )
+        # Rebound rather than kept beside a sorted copy, and above every reader.
+        # ``kpis``, the module rollup, the leverage view and the churn quadrant
+        # all reduce with ``min()`` or a stable sort, which resolve ties by
+        # *input* order — so leaving them on the raw list would have one
+        # response name one file as the worst performer while the
+        # ``worst_files`` list printed below it led with another.
+        all_metrics = sort_metrics_worst_first(all_metrics, deduction_by_path)
+        metric_rows = (
+            [m for m in all_metrics if m.file_path in set(effective_targets)]
+            if scoped
+            else all_metrics
+        )
 
         # Dashboard perf headline: coverage (how much of the analyzed code the
         # perf pass ran on) + open performance-finding count. Both feed ``kpis``
