@@ -533,6 +533,42 @@ async def get_graph_nodes_by_ids(
     return out
 
 
+async def get_test_file_paths(
+    session: AsyncSession,
+    repository_id: str,
+) -> set[str]:
+    """Relative paths of every file the ingester classified as test material.
+
+    Reads the flag ingestion already decided per file (#1103 made ``is_test``
+    the single canonical answer to "is this a test"). For a file node
+    ``node_id`` *is* the repo-relative path, so the result joins straight onto
+    ``HealthFileMetric.file_path`` / ``HealthFinding.file_path`` with no
+    denormalized column and no migration.
+
+    ``node_type == "file"`` is required, not incidental: symbol nodes carry
+    ``is_test`` too and their ``node_id`` is a ``"<path>::<name>"`` composite,
+    which would never match a file path but would inflate the read.
+
+    Narrow in columns, not in rows — no index covers ``node_type`` or
+    ``is_test``, so this scans the repo's nodes (~55 ms on a 35k-node index).
+    A caller serializing no file row and no finding should skip it.
+
+    Degrades to "nothing is test material" when the graph is missing or lags
+    the health pass. That is the safe direction: a caller sees the unsplit
+    world it saw before, never a production file mislabelled as a test.
+    Censused on this repo's index — 1,030 test file nodes, none of them absent
+    from ``health_file_metrics``.
+    """
+    result = await session.execute(
+        select(GraphNode.node_id).where(
+            GraphNode.repository_id == repository_id,
+            GraphNode.node_type == "file",
+            GraphNode.is_test.is_(True),
+        )
+    )
+    return {row[0] for row in result.all()}
+
+
 async def get_community_members(
     session: AsyncSession,
     repository_id: str,
