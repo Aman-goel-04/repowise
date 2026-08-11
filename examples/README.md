@@ -15,6 +15,7 @@ self-contained README under `examples/<name>/`.
 | [search/](search/) | `repowise search` fulltext / symbol / semantic wiki lookup |
 | [security-scan/](security-scan/) | Working-tree security signals + OSS `security scan --history` (no LLM key) |
 | [structurizr-export/](structurizr-export/) | `export --format structurizr` fragment vs standalone (no LLM key) |
+| [wiki-export/](wiki-export/) | `export` markdown / html / json wiki pages (no LLM key) |
 
 ## Conventions
 
