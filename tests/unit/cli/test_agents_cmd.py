@@ -75,6 +75,7 @@ def test_bare_agents_lists_every_registered_target_as_json(repo: Path) -> None:
         "codex",
         "vscode",
         "cursor",
+        "opencode",
     ]
     for row in payload["agents"]:
         # The keys the table renders, so a dropped one is a broken table.
@@ -353,6 +354,7 @@ def test_doctor_reports_one_row_per_agent_from_its_own_descriptor(repo: Path) ->
         "Agent: codex",
         "Agent: vscode",
         "Agent: cursor",
+        "Agent: opencode",
     ]
     # Nothing is wired on a clean machine, and an agent you do not use is not a
     # problem with your setup.
@@ -480,3 +482,27 @@ def test_a_tty_that_cannot_answer_falls_through_to_the_defaults(repo: Path, monk
 
     assert result.exit_code == 0
     assert (repo / ".vscode" / "mcp.json").exists()
+
+
+def test_removing_every_agent_clears_the_shared_agents_md(repo: Path) -> None:
+    """``agents remove --target=all`` must not keep AGENTS.md for an agent it removes.
+
+    Codex and OpenCode both manage the repo's ``AGENTS.md``, and each target's
+    uninstall asks who else is still using it. During a batch removal the answer
+    used to be "the one not processed yet", so both kept the block on the
+    other's behalf and each told the user to remove an agent they had removed in
+    the same command.
+
+    Driven through ``CliRunner`` on purpose. The registry helper that fixes this
+    is entered in exactly one place in production, and a test that calls it by
+    hand passes with the entire CLI half of the fix deleted.
+    """
+    _run(["agents", "add", str(repo), "--target", "codex,opencode", "--scope", "project", "-y"])
+    agents_md = repo / "AGENTS.md"
+    assert agents_md.exists()
+
+    payload = _json(["agents", "remove", str(repo), "--target", "all", "--scope", "project"])
+
+    assert not agents_md.exists(), "shared AGENTS.md survived removing every agent"
+    notes = [note for agent in payload["agents"] for w in agent["writes"].values() for note in w["notes"]]
+    assert not any("still reads the same managed block" in note for note in notes)
