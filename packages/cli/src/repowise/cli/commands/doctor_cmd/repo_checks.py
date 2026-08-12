@@ -13,6 +13,7 @@ from repowise.cli.helpers import (
     get_db_url_for_repo,
     get_repowise_dir,
     load_state,
+    reconcile_schema_best_effort,
     run_async,
 )
 
@@ -102,6 +103,9 @@ def _run_repo_checks(
                 )
 
                 url = get_db_url_for_repo(repo_path)
+                # So doctor reports the store's real state rather than a
+                # `no such column` failure on a store one repowise older.
+                await reconcile_schema_best_effort(url)
                 engine = create_engine(url)
                 sf = create_session_factory(engine)
                 count = 0
@@ -214,6 +218,7 @@ def _run_repo_checks(
                 )
 
                 url = get_db_url_for_repo(repo_path)
+                await reconcile_schema_best_effort(url)
                 engine = create_engine(url)
                 sf = create_session_factory(engine)
                 async with get_session(sf) as session:
@@ -257,6 +262,7 @@ def _run_repo_checks(
                 from repowise.core.providers.embedding.base import MockEmbedder
 
                 url = get_db_url_for_repo(repo_path)
+                await reconcile_schema_best_effort(url)
                 engine = create_engine(url)
                 sf = create_session_factory(engine)
 
@@ -398,6 +404,7 @@ def _run_repo_checks(
                 from repowise.core.providers.embedding.base import MockEmbedder
 
                 url = get_db_url_for_repo(repo_path)
+                await reconcile_schema_best_effort(url)
                 engine = create_engine(url)
                 sf = create_session_factory(engine)
 
@@ -535,6 +542,7 @@ def _run_repo_checks(
             )
 
             url = get_db_url_for_repo(repo_path)
+            await reconcile_schema_best_effort(url)
             engine = create_engine(url)
             sf = create_session_factory(engine)
             repaired = 0

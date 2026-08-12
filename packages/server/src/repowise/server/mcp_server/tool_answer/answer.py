@@ -169,6 +169,7 @@ from repowise.server.mcp_server.tool_answer.symbols import (
     _hydrate_symbols_for_hits,
     _read_symbol_source,
     build_homonym_union_bodies,
+    is_symbol_lookup_question,
     union_defers_to_synthesis,
     withheld_definitions,
 )
@@ -1799,6 +1800,58 @@ async def get_answer(
     if confidence == "high" and withheld_implicated:
         confidence = "medium"
 
+    # Ninth gate — the LOOKUP half of the eighth, and a routing hole rather
+    # than a threshold problem. Gate 8 asks whether the question names a
+    # WITHHELD symbol; on a bare-name lookup it provably never can, because the
+    # question names the symbol that was SERVED and the withheld names are that
+    # symbol's own inner members. #1451 closed exactly this shape on the union
+    # path with a cap on truncation alone, on the grounds that where the caller
+    # asked for a symbol the bodies ARE the answer. But a name with a single
+    # definition never reaches the union path — `_anchor_symbol_hits`
+    # short-circuits at `len(cands) == 1` before `homonyms["union"]` is built —
+    # so it lands here with the same shape and, until now, no cap.
+    #
+    # Measured on the 2026-08-12 corpus: `ModelAdmin` (django) served 120 of
+    # 1,753 lines at `high`, 93% of the cited body withheld; `useSlider` (mui)
+    # 120 of 558, 78% withheld. Two trees, two languages. The dominance ratios
+    # (1.67x, 1.29x) are not the cause and are not touched.
+    #
+    # Deliberately narrow. It needs the question to read as a symbol lookup
+    # rather than prose, AND the truncated body to be the very symbol the
+    # question named. On a prose question the body is evidence
+    # for a claim rather than the answer itself, and truncation alone is a poor
+    # signal there (22% of truncations withhold nothing the response leans on),
+    # which is why gate 8 keeps the dependency test for that population.
+    # Kept as the entry rather than a flag so the note can quote the real served
+    # range and continuation instead of describing the cut in the abstract.
+    #
+    # `truncated` alone is not trustworthy enough to demote on. It is set by
+    # comparing the INDEXED end_line against what was read, while the read
+    # clamps to the end of the live file — so a symbol whose stored end
+    # overshoots (an unsupported language or a syntax error leaves
+    # `check_symbol_bounds` unverified, and a file that shrank since indexing
+    # does it too) is served WHOLE and still flagged. Requiring the served span
+    # to have hit the line cap says the cut was ours, which is the only case
+    # where something was really withheld.
+    named_body_cut = next(
+        (
+            b
+            for b in symbol_bodies
+            if b.get("truncated")
+            and b.get("continuation")
+            and b.get("name") in question_ids
+            and b["lines"][1] - b["lines"][0] + 1 >= _INLINE_BODY_MAX_LINES
+        ),
+        None,
+    )
+    lookup_body_truncated = (
+        confidence == "high"
+        and named_body_cut is not None
+        and is_symbol_lookup_question(question, question_ids)
+    )
+    if lookup_body_truncated:
+        confidence = "medium"
+
     # Non-dominant ceiling: ambiguous retrieval is the calibration cost of
     # always synthesizing — the answer may be right, but with no single dominant
     # page it must never read "high" (cite without verifying). Cap at medium even
@@ -1960,23 +2013,80 @@ async def get_answer(
                     "participate beyond what the truncated symbol body shows."
                 )
         elif withheld_implicated:
+            # A withheld entry whose name matches the body it was found in is
+            # the ENCLOSING symbol — served up to the cut and continuing past
+            # it — not a symbol that never arrived. Calling that "not served"
+            # is wrong about the payload directly above the note, and sends the
+            # caller to get_symbol for a body they already hold most of:
+            # `NewCmdRoot` lines 53-173 are in the payload and only 174-221 are
+            # missing. The accurate pointer is the `continuation` the entry
+            # already carries, which fetches just the missing part and is a
+            # valid get_symbol id in its own right ("path.py:174-221").
+            # Measured: 7 instances on 5 of 6 corpus trees.
+            _implicated = set(withheld_implicated)
+            _continuing = [
+                b
+                for b in symbol_bodies
+                if b.get("continuation")
+                and b.get("name") in _implicated
+                and any(s.get("name") == b.get("name") for s in (b.get("withheld_symbols") or []))
+            ]
+            _continuing_names = {b["name"] for b in _continuing}
+            _absent = [n for n in withheld_implicated if n not in _continuing_names]
             _ids = [
                 s["symbol_id"]
                 for b in symbol_bodies
                 for s in (b.get("withheld_symbols") or [])
-                if s.get("name") in set(withheld_implicated)
+                if s.get("name") in set(_absent)
             ]
-            payload["note"] = (
-                "Part of the code this answer depends on was not served: "
-                f"{', '.join(withheld_implicated)}. Continue in this tool with "
-                f"get_symbol id='{_ids[0]}' before relying on the mechanism."
-                if _ids else
-                "Part of the code this answer depends on was not served: "
-                f"{', '.join(withheld_implicated)}."
-            )
+            _parts = []
+            if _absent:
+                _parts.append(
+                    "Part of the code this answer depends on was not served: "
+                    f"{', '.join(_absent)}."
+                    + (
+                        " Continue in this tool with "
+                        f"get_symbol id='{_ids[0]}' before relying on the mechanism."
+                        if _ids
+                        else ""
+                    )
+                )
+            # Qualify by path only when the same name was cut in more than one
+            # file, so the common case stays readable and the ambiguous case
+            # does not ship two sentences that look identical.
+            _dupe = len({_b["name"] for _b in _continuing}) < len(_continuing)
+            for _b in _continuing:
+                _who = f"{_b['name']} ({_b['path']})" if _dupe else _b["name"]
+                _parts.append(
+                    f"{_who} was served through line {_b['lines'][1]}; the rest "
+                    f"of its body is at {_b['continuation']}."
+                )
+            payload["note"] = " ".join(_parts)
             payload["next_action_hint"] = (
                 f"call get_symbol id='{_ids[0]}' for the withheld body"
-                if _ids else "request the withheld body before citing"
+                if _ids
+                else (
+                    f"call get_symbol id='{_continuing[0]['continuation']}' for the rest "
+                    f"of {_continuing[0]['name']}"
+                    if _continuing
+                    else "request the withheld body before citing"
+                )
+            )
+        elif lookup_body_truncated:
+            # The ninth gate fired: the caller asked for a symbol by name and
+            # its body did not fit. Without this the demotion would ship with
+            # no note at all, since the high-confidence branch below is now
+            # unreachable for it.
+            payload["note"] = (
+                f"You asked for {named_body_cut['name']} and its body did not fit: "
+                f"lines {named_body_cut['lines'][0]}-{named_body_cut['lines'][1]} are "
+                f"served and it continues at {named_body_cut['continuation']}. Held at "
+                "medium because on a symbol lookup the part you cannot see is part of "
+                "the answer."
+            )
+            payload["next_action_hint"] = (
+                f"call get_symbol id='{named_body_cut['continuation']}' for the rest of "
+                f"{named_body_cut['name']}"
             )
         elif confidence == "high":
             # The rationale deliberately no longer cites "the answer is direct
