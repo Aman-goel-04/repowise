@@ -20,7 +20,7 @@ from __future__ import annotations
 import importlib
 from pathlib import Path
 
-from .types import AgentTarget, Registration, Scope, Tier, derive_tier
+from .types import AgentTarget, InstallMethod, Registration, Tier, derive_tier
 
 #: Every known target, by id. Values are ``module:attribute`` so registration
 #: costs no import.
@@ -80,6 +80,104 @@ def detect_all(repo_path: Path | None = None) -> dict[str, list[Registration]]:
     return found
 
 
+def describe_agents(repo_path: Path | None = None) -> list[dict]:
+    """One row per registered target: what it is, and where it is wired.
+
+    The projection both consumers read — ``repowise agents``' JSON payload and
+    table, and ``init``'s checklist. Built here, next to the descriptors, so
+    there is one answer to "what do we know about this agent" rather than one
+    per caller that drift into disagreeing about which are pre-ticked.
+
+    Every probe is best-effort: a descriptor whose detection or presence check
+    raises is reported as absent rather than taking the listing down.
+    """
+    rows: list[dict] = []
+    for target in all_targets():
+        try:
+            registrations = list(target.detect(repo_path))
+        except Exception:
+            registrations = []
+        try:
+            present = bool(target.is_present(repo_path))
+        except Exception:
+            present = False
+        #: None here means "already provided by a host-managed install", which
+        #: is the stand-down the method axis exists for — not "cannot install".
+        method = select_install_method(target, registrations)
+        rows.append(
+            {
+                "id": target.id,
+                "display_name": target.display_name,
+                "tier": tier_of(target.id).value,
+                "docs_url": target.docs_url,
+                "project_file_id": target.project_file_id,
+                "present": present,
+                "method": method.id if method is not None else None,
+                "registrations": [r.as_dict() for r in registrations],
+            }
+        )
+    return rows
+
+
+def default_selection(rows: list[dict]) -> set[str]:
+    """Which agents to pre-tick, given :func:`describe_agents` rows.
+
+    Wired agents, installed agents, and :data:`_AUTO_FALLBACK` — always, not as
+    a last resort.
+
+    That "always" is the whole point and it is easy to get wrong: unioning in
+    ``resolve_target_flag("auto")`` instead *looks* equivalent and is a no-op,
+    because ``auto`` resolves to the detected targets and only reaches the
+    fallback when detection is empty — which is exactly the case the union was
+    already handling. A repo with a committed ``.codex/config.toml`` on a
+    machine with no ``~/.claude`` still produced a non-empty selection with
+    Claude Code missing from it.
+
+    Why it matters that the fallback is unconditional: leaving an agent
+    unticked is not neutral. For the agent that owns the instruction file the
+    setup path persists the opt-out into ``.repowise/config.yaml``, so one
+    Enter turns off a file that used to default to on and ``update`` never
+    generates it again. **Detection decides what to offer; it must not silently
+    withdraw a default.**
+    """
+    chosen = {row["id"] for row in rows if row["registrations"] or row["present"]}
+    return chosen | {_AUTO_FALLBACK}
+
+
+def select_install_method(
+    target: AgentTarget,
+    registrations: list[Registration],
+) -> InstallMethod | None:
+    """The method to install *target* through, or None to stand down.
+
+    This is where the method axis pays for itself. Claude Code is reachable two
+    ways — its host plugin, and repowise writing the config directly — and both
+    register the same MCP server and the same augment hooks. The host merges
+    them without complaint, so the user gets no error, just two process spawns
+    per matched tool call and a duplicate set of tool schemas resident in every
+    session. Measured on a live machine: three repowise MCP servers at once,
+    ~36 tool schemas for one product.
+
+    So: when *registrations* show a host-managed method already in place, return
+    None. There is nothing for us to write, and writing anyway is how the
+    duplicate happens. Otherwise return the method marked ``preferred`` among
+    the ones repowise can actually write, falling back to the first of those.
+
+    Deliberately not applied by ``init``: standing down there would change what
+    a plugin user's ``init`` does today, and this decision is about cost rather
+    than correctness. ``agents add`` and ``agents refresh`` own it.
+    """
+    detected = {r.method for r in registrations}
+    writable = [m for m in target.methods if m.managed_by != "host"]
+    for method in target.methods:
+        if method.managed_by == "host" and method.id in detected:
+            return None
+    for method in writable:
+        if method.preferred:
+            return method
+    return writable[0] if writable else None
+
+
 def resolve_target_flag(value: str, repo_path: Path | None = None) -> list[AgentTarget]:
     """Resolve a ``--target=`` value to targets.
 
@@ -122,8 +220,3 @@ def resolve_target_flag(value: str, repo_path: Path | None = None) -> list[Agent
             f"Known: {known}, plus 'auto' / 'all' / 'none'."
         )
     return resolved
-
-
-def targets_for_scope(scope: Scope) -> list[AgentTarget]:
-    """Every target that has a config home at *scope*."""
-    return [target for target in all_targets() if target.supports_scope(scope)]

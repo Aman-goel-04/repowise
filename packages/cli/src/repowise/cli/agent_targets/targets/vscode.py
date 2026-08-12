@@ -28,6 +28,7 @@ from ..types import (
     DoctorReport,
     DoctorStatus,
     FileAction,
+    FileWrite,
     InstallMethod,
     Registration,
     Scope,
@@ -75,7 +76,7 @@ def server_entry(repo_path: Path) -> dict:
     return {"type": "stdio", **entry}
 
 
-def write_mcp_config(repo_path: Path) -> Path:
+def write_mcp_config(repo_path: Path) -> FileWrite:
     """Merge the repowise server into ``.vscode/mcp.json``.
 
     Raises ``ValueError`` when the existing file is not strict JSON or is not
@@ -103,11 +104,10 @@ def write_mcp_config(repo_path: Path) -> Path:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         merged = {"servers": new_entry}
 
-    write_json_config(config_path, merged)
-    return config_path
+    return FileWrite(path=config_path, action=write_json_config(config_path, merged))
 
 
-def write_extensions_config(repo_path: Path) -> Path:
+def write_extensions_config(repo_path: Path) -> FileWrite:
     """Recommend the repowise extension, preserving existing entries."""
     from ..formats.json_merge import load_json_object_or_value_error, write_json_config
 
@@ -127,8 +127,47 @@ def write_extensions_config(repo_path: Path) -> Path:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         merged = {"recommendations": [EXTENSION_ID]}
 
-    write_json_config(config_path, merged)
-    return config_path
+    return FileWrite(path=config_path, action=write_json_config(config_path, merged))
+
+
+def _remove_server_entry(config_path: Path) -> tuple[Path, FileAction]:
+    """Drop ``servers.repowise``, preserving sibling servers."""
+    from ..formats.json_merge import load_json_object_or_value_error, write_json_config
+
+    if not config_path.exists():
+        return config_path, FileAction.NOT_FOUND
+    try:
+        existing = load_json_object_or_value_error(config_path, "mcp.json")
+    except ValueError:
+        # Same reason install declines: it is far more likely to be JSONC than
+        # damaged, and rewriting it would silently delete the user's comments.
+        return config_path, FileAction.KEPT
+
+    servers = existing.get("servers")
+    if not isinstance(servers, dict) or "repowise" not in servers:
+        return config_path, FileAction.NOT_FOUND
+    servers.pop("repowise")
+    write_json_config(config_path, existing)
+    return config_path, FileAction.REMOVED
+
+
+def _remove_extension_recommendation(config_path: Path) -> tuple[Path, FileAction]:
+    """Drop our id from ``recommendations``, preserving everyone else's."""
+    from ..formats.json_merge import load_json_object_or_value_error, write_json_config
+
+    if not config_path.exists():
+        return config_path, FileAction.NOT_FOUND
+    try:
+        existing = load_json_object_or_value_error(config_path, "extensions.json")
+    except ValueError:
+        return config_path, FileAction.KEPT
+
+    recommendations = existing.get("recommendations")
+    if not isinstance(recommendations, list) or EXTENSION_ID not in recommendations:
+        return config_path, FileAction.NOT_FOUND
+    existing["recommendations"] = [r for r in recommendations if r != EXTENSION_ID]
+    write_json_config(config_path, existing)
+    return config_path, FileAction.REMOVED
 
 
 def detect(repo_path: Path | None = None) -> list[Registration]:
@@ -169,6 +208,23 @@ class VSCodeTarget:
         """Project scope only — there is no user-level file repowise writes."""
         return scope is Scope.PROJECT
 
+    def is_present(self, repo_path: Path | None = None) -> bool:
+        """``code`` on PATH, a user data directory, or a ``.vscode/`` in the repo.
+
+        The repo-local check earns its place: a workspace with ``.vscode/`` in
+        it is worth configuring even from a machine where the ``code`` shim was
+        never installed, because the file is committed and read by whoever
+        opens the repo next.
+        """
+        import shutil
+
+        if repo_path is not None and (repo_path / ".vscode").is_dir():
+            return True
+        if shutil.which("code") is not None:
+            return True
+        home = Path.home()
+        return any((home / candidate).is_dir() for candidate in (".vscode", ".vscode-server"))
+
     def detect(self, repo_path: Path | None = None) -> list[Registration]:
         return detect(repo_path)
 
@@ -186,7 +242,8 @@ class VSCodeTarget:
             raise ValueError("project-scope install needs a repo_path")
 
         try:
-            result.record(write_mcp_config(repo_path), FileAction.UPDATED)
+            written = write_mcp_config(repo_path)
+            result.record(written.path, written.action)
         except ValueError:
             result.record(mcp_config_path(repo_path), FileAction.KEPT)
             result.note(
@@ -194,7 +251,8 @@ class VSCodeTarget:
                 'comments). Add a "repowise" server under "servers" manually.'
             )
         try:
-            result.record(write_extensions_config(repo_path), FileAction.UPDATED)
+            written = write_extensions_config(repo_path)
+            result.record(written.path, written.action)
         except ValueError:
             result.record(extensions_config_path(repo_path), FileAction.KEPT)
             result.note(
@@ -204,33 +262,19 @@ class VSCodeTarget:
         return result
 
     def uninstall(self, scope: Scope, *, repo_path: Path | None = None) -> WriteResult:
-        """Remove the repowise server entry, preserving sibling servers."""
-        from ..formats.json_merge import (
-            load_json_object_or_value_error,
-            write_json_config,
-        )
+        """Remove the server entry and the extension recommendation.
 
+        Both files, because :meth:`install` writes both and
+        :meth:`describe_paths` names both. Leaving the recommendation behind
+        meant ``agents remove --target=vscode`` still had the editor prompting
+        every contributor to install an extension for an integration that was
+        just removed — and said nothing about the file it had skipped.
+        """
         result = WriteResult()
         if scope is not Scope.PROJECT or repo_path is None:
             return result
-
-        config_path = mcp_config_path(repo_path)
-        if not config_path.exists():
-            result.record(config_path, FileAction.NOT_FOUND)
-            return result
-        try:
-            existing = load_json_object_or_value_error(config_path, "mcp.json")
-        except ValueError:
-            result.record(config_path, FileAction.KEPT)
-            return result
-
-        servers = existing.get("servers")
-        if not isinstance(servers, dict) or "repowise" not in servers:
-            result.record(config_path, FileAction.NOT_FOUND)
-            return result
-        servers.pop("repowise")
-        write_json_config(config_path, existing)
-        result.record(config_path, FileAction.REMOVED)
+        result.record(*_remove_server_entry(mcp_config_path(repo_path)))
+        result.record(*_remove_extension_recommendation(extensions_config_path(repo_path)))
         return result
 
     def print_config(self, scope: Scope, *, repo_path: Path | None = None) -> str:

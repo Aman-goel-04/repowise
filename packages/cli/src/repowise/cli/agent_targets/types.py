@@ -157,6 +157,15 @@ class Registration:
     version: str | None = None
     detail: str | None = None
 
+    def as_dict(self) -> dict:
+        return {
+            "method": self.method,
+            "scope": self.scope.value,
+            "config_path": str(self.config_path),
+            "version": self.version,
+            "detail": self.detail,
+        }
+
 
 @dataclass(frozen=True)
 class FileWrite:
@@ -185,10 +194,6 @@ class WriteResult:
 
     def note(self, message: str) -> None:
         self.notes.append(message)
-
-    def extend(self, other: WriteResult) -> None:
-        self.files.extend(other.files)
-        self.notes.extend(other.notes)
 
     @property
     def changed(self) -> bool:
@@ -272,6 +277,28 @@ class AgentTarget(Protocol):
         """Whether this target has a config home at *scope*."""
         ...
 
+    def is_present(self, repo_path: Path | None = None) -> bool:
+        """Whether this agent looks installed on this machine.
+
+        Distinct from :meth:`detect`, and the distinction is the whole reason
+        this exists: ``detect`` answers "is repowise wired into this agent",
+        which is ``False`` for every agent on a first-time user's machine.
+        "Which agents should we offer to wire up" needs the other question, and
+        it has to be answered by the descriptor — asking it anywhere else
+        rebuilds the per-host ``if agent == "codex"`` chain the seam exists to
+        delete.
+
+        Cheap by contract: a directory probe or a PATH lookup, never a
+        subprocess. This runs on every listing and in the middle of ``init``,
+        and an agent that has to be *launched* to find out it is installed is
+        an agent we report as absent.
+
+        Best-effort in both directions. A false positive costs an unchecked box
+        the user unchecks; a false negative costs a checked box they check.
+        Neither is worth a slow probe.
+        """
+        ...
+
     def detect(self, repo_path: Path | None = None) -> list[Registration]:
         """Every place this target is currently wired.
 
@@ -332,25 +359,23 @@ class AgentTarget(Protocol):
 class InstallLifecycle(Protocol):
     """The ``init`` / ``update`` half of an integration's contract.
 
-    Four methods, and they are a subset of :class:`AgentTarget`:
+    Three methods, and they are a subset of :class:`AgentTarget`:
     ``write_project_files`` is a project-scope install, ``register_client`` is a
-    user-scope one, ``refresh_project_files`` is an install that declines to
-    create what is not already there, and ``configure_options`` is the prompting
-    that decides which of those run.
+    user-scope one, and ``refresh_project_files`` is an install that declines to
+    create what is not already there.
 
     It lives here rather than in ``editor_setup`` so there is exactly one home
     for integration protocols. It is still spelled separately from
-    :class:`AgentTarget` because the two are driven by different callers today:
+    :class:`AgentTarget` because the two are driven by different callers:
     ``init`` and ``update`` drive this one and own the console object and the
-    prompting, while ``AgentTarget`` is driven by detection and repair paths
-    that must never prompt. Phase 2 collapses them, when ``repowise agents``
-    takes over the call sites and the prompting moves behind a resolved
-    interactivity decision rather than a per-integration ``click.confirm``.
-    """
+    per-file progress lines, while ``AgentTarget`` is driven by detection and
+    repair paths that must never print into someone else's layout.
 
-    def configure_options(self, console_obj: object, options: object) -> object:
-        """Let the integration prompt or adjust setup options before writing."""
-        ...
+    It had a fourth method, ``configure_options``, where each integration
+    prompted for itself. That is gone: the prompting is now one registry-built
+    checklist rather than one hand-written question per agent, which is what
+    stops a fourth agent from meaning a fourth prompt in a fourth module.
+    """
 
     def write_project_files(
         self, console_obj: object, repo_path: Path, options: object

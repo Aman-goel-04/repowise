@@ -34,6 +34,7 @@ from ..types import (
     DoctorReport,
     DoctorStatus,
     FileAction,
+    FileWrite,
     InstallMethod,
     Registration,
     Scope,
@@ -108,7 +109,7 @@ def plugin_manifest_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
-def write_project_mcp_config(repo_path: Path) -> Path:
+def write_project_mcp_config(repo_path: Path) -> FileWrite:
     """Merge the repowise server into the repo-root ``.mcp.json``.
 
     Repo-shared and frequently committed, so it keeps the bare ``repowise``
@@ -135,8 +136,7 @@ def write_project_mcp_config(repo_path: Path) -> Path:
     else:
         merged = {"mcpServers": new_entry}
 
-    write_json_config(config_path, merged)
-    return config_path
+    return FileWrite(path=config_path, action=write_json_config(config_path, merged))
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +236,19 @@ class ClaudeCodeTarget:
     def supports_scope(self, scope: Scope) -> bool:
         return True
 
+    def is_present(self, repo_path: Path | None = None) -> bool:
+        """``~/.claude`` exists, or Claude Desktop's config directory does.
+
+        Claude Code creates ``~/.claude`` on first run and never removes it, so
+        its presence is the cheapest honest signal. Claude Desktop is checked
+        separately because it is a different product with the same brand and a
+        user can have either.
+        """
+        if (Path.home() / ".claude").is_dir():
+            return True
+        desktop = desktop_config_path()
+        return desktop is not None and desktop.parent.is_dir()
+
     def detect(self, repo_path: Path | None = None) -> list[Registration]:
         return detect(repo_path)
 
@@ -263,22 +276,33 @@ class ClaudeCodeTarget:
         if scope is Scope.PROJECT:
             if repo_path is None:
                 raise ValueError("project-scope install needs a repo_path")
-            result.record(write_project_mcp_config(repo_path), FileAction.UPDATED)
+            written = write_project_mcp_config(repo_path)
+            result.record(written.path, written.action)
             return result
 
         if repo_path is None:
             raise ValueError("user-scope registration needs a repo_path to point at")
 
-        desktop = register_with_claude_desktop(repo_path)
-        if desktop:
-            result.record(desktop, FileAction.UPDATED)
-        code = register_with_claude_code(repo_path)
-        if code:
-            result.record(code, FileAction.UPDATED)
-        hooks = install_claude_code_hooks()
-        if hooks:
-            result.record(hooks, FileAction.UPDATED)
+        from ..formats.observe import observed_action, read_bytes
+
+        settings = settings_path()
+        desktop_path = desktop_config_path()
+        settings_before = read_bytes(settings)
+        desktop_before = read_bytes(desktop_path) if desktop_path is not None else None
+
+        register_with_claude_desktop(repo_path)
+        register_with_claude_code(repo_path)
+        install_claude_code_hooks()
         enable_tool_search_in_claude_code()
+
+        # One entry per file, not one per call: three of the four calls above
+        # write settings.json, and reporting it three times says nothing a
+        # reader can act on.
+        result.record(settings, observed_action(settings_before, read_bytes(settings)))
+        if desktop_path is not None:
+            after = read_bytes(desktop_path)
+            if not (desktop_before is None and after is None):
+                result.record(desktop_path, observed_action(desktop_before, after))
         return result
 
     def uninstall(self, scope: Scope, *, repo_path: Path | None = None) -> WriteResult:
@@ -333,6 +357,27 @@ class ClaudeCodeTarget:
         from repowise.cli.editor_integrations.claude_config import (
             claude_code_rewrite_hook_matcher,
         )
+
+        from ..formats.json_merge import is_damaged
+
+        # Checked before detection, because detection cannot tell an absent
+        # registration from one inside a file it could not parse — and
+        # reporting "not installed" for a settings file with a trailing comma
+        # sends the user to run an install that refuses for the same reason.
+        settings = settings_path()
+        if is_damaged(settings):
+            return DoctorReport(
+                target_id=ID,
+                status=DoctorStatus.BROKEN,
+                issues=(
+                    f"{settings} is not valid JSON, so Claude Code ignores all of it. "
+                    "Fix or remove it, then re-register.",
+                ),
+                # `add`, not `refresh`. A file this damaged makes detection
+                # find nothing, and refresh only touches what it detects — so
+                # it would skip this target entirely and report success.
+                fix_command="repowise agents add --target=claude-code",
+            )
 
         registrations = detect()
         if not registrations:
