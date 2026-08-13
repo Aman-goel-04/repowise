@@ -645,7 +645,7 @@ def _drop_already_surfaced(rationale: list[dict], *surfaced: list[dict]) -> list
 
 
 def _gather_body_candidates(
-    hits: list[dict], answer_text: str
+    hits: list[dict], answer_text: str, *, anchor_names: set[str] | None = None
 ) -> list[tuple[int, int, int, str, dict]]:
     """Rank the definitions to inline in ``symbol_bodies``, most-relevant first.
 
@@ -660,6 +660,15 @@ def _gather_body_candidates(
     extract_all method of DecisionExtractor" serves extract_all, not the
     1,300-line class head), then document order. Only definitions the answer
     text actually names qualify; constants stay in ``quotes``.
+
+    ``anchor_names`` switches tier 0 off the prose and onto the identifiers the
+    QUESTION named: the degraded path, where there is no synthesised text to
+    match against. Selection was the only thing coupling ``symbol_bodies`` to
+    synthesis: the bodies themselves are read live off disk from index anchors,
+    and tier 0's input (``_anchor_symbols``) is driven by
+    ``_extract_question_identifiers`` off the question, so it is fully determined
+    before synthesis would have run. Tier 1 is skipped in this mode by
+    construction, since it exists to catch a symbol only the prose names.
     """
     candidates: list[tuple[int, int, int, str, dict]] = []
     for h in hits[:_ENRICH_TOP_N_HITS]:
@@ -668,11 +677,15 @@ def _gather_body_candidates(
             continue
         for s in h.get("_anchor_symbols") or []:
             name = s.get("name")
-            if not name or name not in answer_text:
+            if not name:
+                continue
+            if name not in anchor_names if anchor_names is not None else name not in answer_text:
                 continue
             kind = s.get("kind")
             kind_rank = 0 if kind in ("function", "method") else 1
             candidates.append((0, kind_rank, s.get("start_line") or 0, path, s))
+        if anchor_names is not None:
+            continue
         for s in h.get("symbols") or []:
             name = s.get("name")
             if not name or len(name) < 3 or not s.get("_matched"):
@@ -686,6 +699,94 @@ def _gather_body_candidates(
             candidates.append((1, kind_rank, s.get("start_line") or 0, path, s))
     candidates.sort(key=lambda t: (t[0], t[1], t[2]))
     return candidates
+
+
+def _retrieval_quality(hits: list[dict], agreement_dominant: bool) -> str:
+    """Rate the retrieval, independently of the text it fed.
+
+    Where ``confidence`` says "how much should you trust the synthesised text",
+    this says "how good was the retrieval that fed it". The agent reads
+    confidence to decide whether to re-read, and this to decide whether to call
+    search_codebase again with a refined query.
+
+    Kept as one function because the degraded path needs the same rating and must
+    not invent a second one. That path has no synthesised text to rate (its
+    ``confidence`` stays low, correctly), but it ran exactly the same retrieval,
+    and "high" has to mean the same thing to a keyless caller as to a keyed one
+    or the field is worth less than nothing.
+    """
+    if len(hits) >= 2:
+        ratio = hits[0].get("score", 0.0) / (hits[1].get("score", 0.0) or 1e-9)
+    else:
+        ratio = float("inf") if hits else 0.0
+    top_score = hits[0].get("score", 0.0) if hits else 0.0
+    dominant_grade = ratio >= _DOMINANCE_RATIO or agreement_dominant
+    if dominant_grade and top_score >= _HIGH_CONFIDENCE_SCORE_FLOOR:
+        return "high"
+    return "partial" if dominant_grade else "weak"
+
+
+def _build_symbol_bodies(
+    body_candidates: list[tuple[int, int, int, str, dict]], repo_root: Path | None
+) -> tuple[list[dict], bool]:
+    """Inline the ranked definitions as live source, with the truncation contract.
+
+    Returns ``(symbol_bodies, served_named_body)``. ``served_named_body`` is True
+    once a tier-0 body (the exact symbol the question named) is inlined; the
+    confidence gates read it to avoid the "low, go Read" label on a payload that
+    already holds the answer.
+
+    Every step here is prose-independent: the body is re-read live from disk at
+    the indexed bounds, and when the indexed body outruns the line cap a
+    ``continuation`` names the exact range read for the remainder plus the
+    ``withheld_symbols`` it covers. That is why the degraded path can call this
+    too. The only thing it lacks is the answer text that selects the candidates,
+    which ``_gather_body_candidates(anchor_names=...)`` supplies instead.
+    """
+    symbol_bodies: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    served_named_body = False
+    for tier, _kind_rank, start, path, s in body_candidates:
+        if len(symbol_bodies) >= _INLINE_BODY_MAX_SYMBOLS:
+            break
+        name = s["name"]
+        if (path, name) in seen:
+            continue
+        sym_end = s.get("end_line") or 0
+        # Re-read a fuller body than the synthesis excerpt: this block is for
+        # the agent, so a docstring-heavy def shouldn't spend its whole window
+        # on docstring and truncate the logic the question asked about. Falls
+        # back to the hydrator's excerpt if the re-read fails.
+        body = _read_symbol_source(
+            repo_root, path, start, sym_end, max_lines=_INLINE_BODY_MAX_LINES
+        ) or s.get("source_excerpt")
+        if not body:
+            continue
+        served = body.count("\n") + 1
+        end_served = start + served - 1
+        sym_end = sym_end or end_served
+        entry: dict = {
+            "path": path,
+            "name": name,
+            "lines": [start, end_served],
+            "source": body,
+        }
+        if sym_end > end_served:
+            entry["truncated"] = True
+            entry["continuation"] = f"{path}:{end_served + 1}-{sym_end}"
+            # Say WHAT was withheld, not just that something was. A bare
+            # truncated flag plus a get_symbol pointer was followed zero times
+            # across the agent runs measured, so the consumer needs the names in
+            # hand to decide whether it is missing anything it cares about, and
+            # to continue inside this tool rather than falling back to Read.
+            withheld = withheld_definitions(repo_root, entry["continuation"])
+            if withheld:
+                entry["withheld_symbols"] = withheld
+        symbol_bodies.append(entry)
+        seen.add((path, name))
+        if tier == 0:
+            served_named_body = True
+    return symbol_bodies, served_named_body
 
 
 def _build_data_shape_payload(grounded: dict, t0: float, repository) -> dict:
@@ -803,7 +904,7 @@ def _with_candidates(payload: dict, resolved_pool: list[dict]) -> dict:
     return payload
 
 
-def _degraded_payload(
+async def _degraded_payload(
     *,
     reason: str,
     note: str,
@@ -811,6 +912,10 @@ def _degraded_payload(
     fallback_targets: list[str],
     repository,
     t0: float,
+    ctx=None,
+    question_ids: set[str] | None = None,
+    exclude_spec=None,
+    agreement_dominant: bool = False,
     resolved_pool: list[dict] | None = None,
 ) -> dict:
     """Shape a synthesis-less get_answer response.
@@ -831,9 +936,61 @@ def _degraded_payload(
     carries, so it can never claim more than it has, and no prose about the
     question itself is invented, that being precisely the part that needs a
     provider.
+
+    The evidence beside the prose is built here too. Everything below the
+    provider check in ``get_answer`` (bodies, citations, the next action) is
+    read live off disk from index anchors and needs no LLM; the only thing that
+    coupled it to synthesis was that ``_gather_body_candidates`` selects against
+    the answer text. Measured on the keyless arm (26 paired questions, flask +
+    django, 2026-08-13) that cost 9 of 26 questions the very body the keyed arm
+    served: a caller asking for ``Flask`` got three paths where the keyed arm got
+    ``src/flask/app.py`` 105-225. Selecting tier 0 against the question's own
+    identifiers instead recovers it, and an agent handed the body of the symbol
+    it asked about answers from the tool rather than leaving it to Read.
+
+    ``confidence`` stays "low" and is not up for debate: it rates the synthesised
+    text, and here that text is assembled boilerplate, byte-identical on 24 of
+    the 26 measured questions. An agent told to cite it would cite that sentence.
+    What was missing is ``retrieval_quality``, which rates the retrieval instead
+    and was simply never set: 26 of 26 keyless payloads carried no such key, so
+    the only trust signal a caller had was a "low" about something it should not
+    have been trusting anyway, and 11 of them said it while rank 1 was a file the
+    keyed arm went on to cite. The same rule the synthesised path uses answers
+    that question here, and it stays honest in the other direction: 14 of the 26
+    retrievals were genuinely weak in both arms and still grade "weak".
     """
+    retrieval_quality = _retrieval_quality(hits, agreement_dominant)
+    repo_root = Path(str(ctx.path)) if getattr(ctx, "path", None) else None
+    symbol_bodies, _served_named_body = _build_symbol_bodies(
+        _gather_body_candidates(hits, "", anchor_names=question_ids or set()),
+        repo_root,
+    )
+    # Cite what is actually in hand. `[]` was right when the payload carried no
+    # source; with bodies inlined the paths they were read from are citations in
+    # the ordinary sense, and a caller filtering on non-empty `citations` stops
+    # discarding this reply.
+    citations = list(dict.fromkeys(b["path"] for b in symbol_bodies))
+
     served = len(hits)
-    if served:
+    if symbol_bodies:
+        _names = ", ".join(f"`{b['name']}`" for b in symbol_bodies)
+        # Never say "full" over a body the payload itself flags as cut. The
+        # entry carries `truncated` and a `continuation` two keys away, so the
+        # claim is refutable from inside the same response.
+        _cut = any(b.get("truncated") for b in symbol_bodies)
+        summary = (
+            f"No synthesized prose ({reason}), but the evidence is here: "
+            f"`symbol_bodies` carries the live source of {_names}, read from the "
+            "current checkout"
+            + (
+                ", cut at the line cap where noted; see `continuation`. "
+                if _cut
+                else " in full. "
+            )
+            + "Answer from that; `retrieval`, `fallback_targets` and `candidates` "
+            "cover the wider question."
+        )
+    elif served:
         summary = (
             f"No synthesized prose ({reason}), but retrieval succeeded and this "
             f"payload is usable: {served} ranked "
@@ -848,26 +1005,85 @@ def _degraded_payload(
             "or search directly."
         )
 
-    return _with_candidates(
-        {
-            "answer": summary,
-            "citations": [],
-            "confidence": "low",
-            "degraded": reason,
-            "fallback_targets": fallback_targets,
-            "retrieval": _serialize_hits(hits),
-            "note": note,
-            "_meta": {
-                **_build_meta(
-                    timing_ms=(time.perf_counter() - t0) * 1000,
-                    hint=_answer_hint("low", len(hits)),
-                    repository=repository,
-                    targets=fallback_targets,
-                ),
-                "degraded": reason,
-            },
-        },
-        resolved_pool if resolved_pool is not None else hits,
+    payload: dict = {
+        "answer": summary,
+        "citations": citations,
+        "confidence": "low",
+        "retrieval_quality": retrieval_quality,
+        "degraded": reason,
+        "fallback_targets": fallback_targets,
+        "retrieval": _serialize_hits(hits),
+        "note": note,
+    }
+    if symbol_bodies:
+        payload["symbol_bodies"] = symbol_bodies
+        payload["grounding"] = "symbol_body"
+        payload["next_action_hint"] = await _degraded_next_action(
+            symbol_bodies, ctx, repository, exclude_spec
+        )
+        payload["note"] += (
+            " symbol_bodies carries the live body of the symbol(s) you named, so "
+            "answer from that rather than re-reading the file."
+        )
+    payload["_meta"] = {
+        **_build_meta(
+            timing_ms=(time.perf_counter() - t0) * 1000,
+            hint=_answer_hint(
+                "low",
+                len(hits),
+                degraded=reason,
+                retrieval_quality=retrieval_quality,
+                has_bodies=bool(symbol_bodies),
+            ),
+            repository=repository,
+            targets=[*citations, *fallback_targets],
+        ),
+        "degraded": reason,
+    }
+    return _with_candidates(payload, resolved_pool if resolved_pool is not None else hits)
+
+
+async def _degraded_next_action(
+    symbol_bodies: list[dict], ctx, repository, exclude_spec
+) -> str:
+    """The one next step a degraded payload with bodies in hand should name.
+
+    A whole body is a terminal answer, so say so rather than sending the caller
+    to Read a file it already holds. A cut body is not: name the continuation, or
+    a withheld symbol when one resolves.
+
+    Two filters on the withheld ids, both already established on the synthesised
+    path. A withheld entry carrying the served body's OWN name is the enclosing
+    symbol continuing past the cut, not something that never arrived, so it is
+    dropped and the ``continuation``, which fetches exactly the missing part,
+    is the pointer. And the ids come from a regex scanner over source lines, so
+    it can name something that is not a symbol at all: ``_first_resolvable_id``
+    keeps a fabricated id from becoming the next action here exactly as it does
+    there.
+    """
+    cut = next((b for b in symbol_bodies if b.get("continuation")), None)
+    if cut is None:
+        return (
+            f"Read the {symbol_bodies[0]['name']} body in symbol_bodies: it is the "
+            "full live source, so no follow-up call is needed."
+        )
+    hint_id = await _first_resolvable_id(
+        [
+            s["symbol_id"]
+            for s in (cut.get("withheld_symbols") or [])
+            if s.get("symbol_id") and s.get("name") != cut["name"]
+        ],
+        ctx,
+        repository,
+        exclude_spec,
+    )
+    return (
+        f"{cut['name']} was served through line {cut['lines'][1]}; call get_symbol "
+        + (
+            f"id='{hint_id}' for the withheld body."
+            if hint_id
+            else f"id='{cut['continuation']}' for the rest of it."
+        )
     )
 
 
@@ -1536,17 +1752,20 @@ async def get_answer(
             "get_answer running WITHOUT synthesis: no LLM provider resolvable "
             "(set REPOWISE_PROVIDER + its API key, or any supported API key)."
         )
-        return _degraded_payload(
+        return await _degraded_payload(
             reason="no-llm-provider",
             note=(
                 "DEGRADED: no LLM provider configured (set REPOWISE_PROVIDER "
-                "+ API key). "
-                "Returning retrieval hits only — Read the listed files to answer."
+                "+ API key). Synthesis is what is missing here, not retrieval."
             ),
             hits=hits,
             fallback_targets=fallback_targets,
             repository=repository,
             t0=t0,
+            ctx=ctx,
+            question_ids=question_ids,
+            exclude_spec=exclude_spec,
+            agreement_dominant=agreement_dominant,
             resolved_pool=resolved_pool,
         )
 
@@ -1581,13 +1800,17 @@ async def get_answer(
         repo_id=repo_id,
     )
     if failure_note is not None:
-        return _degraded_payload(
+        return await _degraded_payload(
             reason="synthesis-failed",
             note=failure_note,
             hits=hits,
             fallback_targets=fallback_targets,
             repository=repository,
             t0=t0,
+            ctx=ctx,
+            question_ids=question_ids,
+            exclude_spec=exclude_spec,
+            agreement_dominant=agreement_dominant,
             resolved_pool=resolved_pool,
         )
 
@@ -1639,57 +1862,16 @@ async def get_answer(
     # from get_symbol's `verified` contract. When the indexed body is longer
     # than the hydrator's line cap, a `continuation` names the exact range
     # read for the remainder (mirrors get_symbol).
-    _body_candidates = _gather_body_candidates(hits, answer_text)
-
-    symbol_bodies: list[dict] = []
-    _seen_bodies: set[tuple[str, str]] = set()
-    # True once a tier-0 body (the exact symbol the question named, resolved by
-    # symbol anchoring) is inlined. Its full live body IS the ground truth, so a
-    # response carrying it is content-grounded even when synthesis hedges — the
-    # confidence gate below reads this to avoid the "low, go Read" label that
-    # contradicts a payload already holding the answer (2026-07-11 dogfood).
-    served_named_body = False
+    # ``served_named_body`` is True once a tier-0 body (the exact symbol the
+    # question named, resolved by symbol anchoring) is inlined. Its full live
+    # body IS the ground truth, so a response carrying it is content-grounded
+    # even when synthesis hedges. The confidence gate below reads this to avoid
+    # the "low, go Read" label that contradicts a payload already holding the
+    # answer (2026-07-11 dogfood).
     repo_root = Path(str(ctx.path)) if getattr(ctx, "path", None) else None
-    for _tier, _kind_rank, start, path, s in _body_candidates:
-        if len(symbol_bodies) >= _INLINE_BODY_MAX_SYMBOLS:
-            break
-        name = s["name"]
-        if (path, name) in _seen_bodies:
-            continue
-        sym_end = s.get("end_line") or 0
-        # Re-read a fuller body than the synthesis excerpt: this block is for
-        # the agent, so a docstring-heavy def shouldn't spend its whole window
-        # on docstring and truncate the logic the question asked about. Falls
-        # back to the hydrator's excerpt if the re-read fails.
-        body = _read_symbol_source(
-            repo_root, path, start, sym_end, max_lines=_INLINE_BODY_MAX_LINES
-        ) or s.get("source_excerpt")
-        if not body:
-            continue
-        served = body.count("\n") + 1
-        end_served = start + served - 1
-        sym_end = sym_end or end_served
-        entry: dict = {
-            "path": path,
-            "name": name,
-            "lines": [start, end_served],
-            "source": body,
-        }
-        if sym_end > end_served:
-            entry["truncated"] = True
-            entry["continuation"] = f"{path}:{end_served + 1}-{sym_end}"
-            # Say WHAT was withheld, not just that something was. A bare
-            # truncated flag plus a get_symbol pointer was followed zero times
-            # across the agent runs measured, so the consumer needs the names in
-            # hand to decide whether it is missing anything it cares about, and
-            # to continue inside this tool rather than falling back to Read.
-            withheld = withheld_definitions(repo_root, entry["continuation"])
-            if withheld:
-                entry["withheld_symbols"] = withheld
-        symbol_bodies.append(entry)
-        _seen_bodies.add((path, name))
-        if _tier == 0:
-            served_named_body = True
+    symbol_bodies, served_named_body = _build_symbol_bodies(
+        _gather_body_candidates(hits, answer_text), repo_root
+    )
 
     # Compute confidence from the dominance ratio (top hit vs second hit).
     # The dominance ratio is a more reliable separator than absolute BM25
@@ -1913,17 +2095,7 @@ async def get_answer(
     if not dominant and not earn_high and confidence == "high":
         confidence = "medium"
 
-    # retrieval_quality is a separate signal from confidence. Where confidence
-    # says "how much should you trust the synthesised text", retrieval_quality
-    # says "how good was the retrieval that fed it". The agent uses confidence
-    # to decide whether to re-read; retrieval_quality to decide whether to
-    # call search_codebase again with a refined query.
-    if _top_score >= _HIGH_CONFIDENCE_SCORE_FLOOR and _dominant_grade:
-        retrieval_quality = "high"
-    elif _dominant_grade:
-        retrieval_quality = "partial"
-    else:
-        retrieval_quality = "weak"
+    retrieval_quality = _retrieval_quality(hits, agreement_dominant)
 
     if hedged:
         # Hedged answers: keep the retrieval payload lean but non-empty. The
