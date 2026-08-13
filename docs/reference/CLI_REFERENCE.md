@@ -148,7 +148,7 @@ All three reach the indexing knobs; the LLM-only knobs appear only when model-wr
 | `--provider` | LLM provider: `anthropic`, `openai`, `openrouter`, `gemini`, `deepseek`, `kimi`, `ollama`, `litellm`, `codex_cli`, `opencode`, `mock` |
 | `--model` | Model name override (e.g., `claude-sonnet-4-6`) |
 | `--embedder` | Embedder for semantic search: `gemini`, `openai`, `openrouter`, `ollama`, `mock` (default: auto-detect) |
-| `--prose` / `--no-prose` | The single knob over LLM spend. The file, symbol, layer and cycle (SCC), API and infra pages are rendered from structure either way, with no key and no cost. The model-written set is the subsystem (concept) tree plus the repo overview, the architecture diagram, and the onboarding collection: `--prose` writes those as model prose and needs a key; `--no-prose` leaves them as structural stubs, so the whole wiki is keyless and free. Default: prose when a key is available. Full-text search works either way; semantic search needs an embedder. Fill or refill that prose later with [`repowise generate`](#repowise-generate-path). |
+| `--prose` / `--no-prose` | The single knob over LLM spend. The file, symbol, cycle (SCC), API and infra pages are rendered from structure either way, with no key and no cost. The model-written set is the subsystem (concept) tree plus the repo overview, the architecture diagram, and the onboarding collection: `--prose` writes those as model prose and needs a key; `--no-prose` leaves them as structural stubs, so the whole wiki is keyless and free. Default: prose when a key is available. Full-text search works either way; semantic search needs an embedder. Fill or refill that prose later with [`repowise generate`](#repowise-generate-path). |
 | `--index-only` | Deprecated hidden alias for `--no-prose`. |
 | `--docs` | Deprecated hidden alias: `--docs llm` == `--prose`, `--docs deterministic` == `--no-prose`. Prefer `--prose` / `--no-prose`. |
 | `--mode` | Pipeline depth: `standard` (default) or `fast` (graph + essential-git only, no per-file blame/co-change, no LLM docs, for very large repos; upgrade later with `update --full`) |
@@ -162,7 +162,7 @@ All three reach the indexing knobs; the LLM-only knobs appear only when model-wr
 | `--coverage-report` | Test-coverage report to ingest (LCOV / Cobertura / Clover). Repeatable. Auto-discovered when omitted. This is test coverage for code-health, not a documentation-breadth knob: every code file is documented either way. |
 | `--onboarding` / `--no-onboarding` | Generate the curated Onboarding collection (up to 8 overview pages). Default: on; slots without enough signal are skipped. |
 | `--harvest-decisions` / `--no-harvest-decisions` | Harvest architectural decisions during page generation (verified against source before storage). Default: on. |
-| `--wiki-style` | Documentation voice/density: `comprehensive` (default), `caveman` (token-condensed, AI-first), `reference` (API-manual), `tutorial` (beginner-friendly). Interactive full runs prompt when omitted. Saved to config so `update` keeps the style. See [WIKI_STYLES.md](../layers/WIKI_STYLES.md). |
+| `--wiki-style` | Documentation voice/density: `comprehensive` (default), `caveman` (token-condensed, AI-first), `reference` (API-manual), `tutorial` (beginner-friendly). Interactive full runs prompt when omitted. Saved to config so `update` keeps the style. See [WIKI.md](../layers/WIKI.md#styles). |
 | `--language` | Output language for generated wiki pages: `en` (default), `ar`, `de`, `es`, `fr`, `hi`, `it`, `ja`, `ko`, `nl`, `pl`, `pt`, `ru`, `tr`, `zh`. Code, file paths, and symbol names stay untranslated. Saved to config so `update` keeps the language. Also asked in advanced interactive mode. To switch an existing wiki's language, set the flag and re-run `init --force`. |
 | `--resume` | Continue a previous run instead of redoing it: completed phases (indexing, analysis) are skipped, the earlier run's git tier is kept, and generation writes only the pages this repo does not have yet. Use it after an interrupted run, and after one that finished with failed pages (a provider outage, rate limiting) — pages already written are skipped with no model call, so nothing is paid for twice. Matching is per page, not per model, so switching provider still keeps what the old one wrote. |
 | `--force` | Regenerate all pages even if they exist |
@@ -297,7 +297,7 @@ is an actionable error naming the key-setup path.
 `generate` writes the model-written pages, and only those: the numbered concept
 tree above the file level plus the repo overview, the architecture diagram, and
 the onboarding collection. Every structural page (file, symbol, API, infra,
-cycle, layer) is rendered from structure and refreshes on `repowise update`, so
+cycle) is rendered from structure and refreshes on `repowise update`, so
 naming one with `--page` is an actionable error rather than a silent LLM
 re-render.
 
@@ -378,7 +378,7 @@ With no `STYLE`, prints the current style and the available choices.
 
 Styles only differ in voice and density; the markdown structure (headings,
 sections) stays the same, so search, the table of contents, and cross-links keep
-working. See [WIKI_STYLES.md](../layers/WIKI_STYLES.md).
+working. See [WIKI.md](../layers/WIKI.md#styles).
 
 **Options:**
 
