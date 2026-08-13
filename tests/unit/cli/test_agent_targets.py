@@ -47,7 +47,7 @@ def test_registry_exposes_the_shipped_targets() -> None:
     Order is load-bearing: it is the order agents appear in prompts, in
     ``--target=all`` and in listings, and new ids append rather than sort in.
     """
-    assert ALL_IDS == ["claude-code", "codex", "vscode", "cursor", "opencode"]
+    assert ALL_IDS == ["claude-code", "codex", "vscode", "cursor", "opencode", "hermes"]
 
 
 @pytest.mark.parametrize("target_id", ALL_IDS)
@@ -125,6 +125,7 @@ def test_tiers_are_derived_from_the_adapters_a_target_names() -> None:
     assert tier_of("vscode") is Tier.GOOD
     assert tier_of("cursor") is Tier.GOOD
     assert tier_of("opencode") is Tier.GOOD
+    assert tier_of("hermes") is Tier.GOOD
 
 
 def test_a_target_cannot_reach_full_without_a_session_adapter() -> None:
@@ -1935,3 +1936,1201 @@ def test_marker_block_names_the_malformed_states(tmp_path: Path) -> None:
 
     doc.write_text("<!--S-->dangling\n", encoding="utf-8")
     assert marker_block.inspect(doc, "<!--S-->", "<!--E-->").state.value == "orphaned"
+
+
+# ---------------------------------------------------------------------------
+# Hermes
+#
+# The first target whose config is YAML, and the first whose two config keys
+# invite a second write that would be actively harmful. Both properties get
+# their own tests, because neither is visible in a fresh-install golden.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def hermes_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+def _hermes():
+    from repowise.cli.agent_targets.targets import hermes
+
+    return hermes
+
+
+def _seed(home: Path, body: str) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / "config.yaml"
+    config.write_bytes(body.encode("utf-8"))
+    return config
+
+
+def test_hermes_home_follows_the_hosts_own_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HERMES_HOME wins, then the platform default, and Windows is not ``~/.hermes``.
+
+    The Windows branch is the one worth pinning. An entry written to
+    ``~/.hermes`` on Windows is not broken, it is invisible, and nothing about
+    the install would report a problem.
+    """
+    hermes = _hermes()
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "explicit"))
+    assert hermes.hermes_home() == tmp_path / "explicit"
+
+    # Blank and whitespace-only are not a prefix: joining them resolves to the
+    # filesystem root, or to a relative path named " ".
+    monkeypatch.setenv("HERMES_HOME", "   ")
+    monkeypatch.setattr(hermes.sys, "platform", "linux")
+    assert hermes.hermes_home() == Path.home() / ".hermes"
+
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(hermes.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+    assert hermes.hermes_home() == tmp_path / "AppData" / "Local" / "hermes"
+    assert hermes.hermes_home() != Path.home() / ".hermes"
+
+
+def test_hermes_writes_the_server_entry_and_is_idempotent(hermes_home: Path) -> None:
+    import yaml
+
+    hermes = _hermes()
+    target = get_target("hermes")
+
+    first = target.install(Scope.USER)
+    assert [written.action for written in first.files] == [FileAction.CREATED]
+
+    config = hermes.config_path()
+    doc = yaml.safe_load(config.read_text(encoding="utf-8"))
+    entry = doc["mcp_servers"]["repowise"]
+    # No repo path: one per-machine registration serves every repo, and the
+    # server resolves the repo it was launched in.
+    assert entry["args"] == ["mcp", "--transport", "stdio"]
+    # Keys Hermes does not document must not be invented, and ``enabled``
+    # defaults to true so writing it only creates something to overwrite.
+    assert set(entry) == {"command", "args"}
+
+    second = target.install(Scope.USER)
+    assert [written.action for written in second.files] == [FileAction.UNCHANGED]
+
+
+def test_hermes_does_not_turn_a_permissive_config_into_an_allowlist(
+    hermes_home: Path,
+) -> None:
+    """The single most consequential thing this target does not do.
+
+    Hermes exposes every enabled MCP server to a platform unless that
+    platform's toolset list already names one, at which point the list becomes
+    an allowlist. Adding ``repowise`` to a list that names none would flip the
+    config onto the allowlist branch with exactly one entry and cut off every
+    other MCP server the user had.
+    """
+    import yaml
+
+    config = _seed(
+        hermes_home,
+        "mcp_servers:\n"
+        "  github:\n"
+        "    command: npx\n"
+        "\n"
+        "platform_toolsets:\n"
+        "  cli: [hermes-cli]\n",
+    )
+    get_target("hermes").install(Scope.USER)
+
+    doc = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert doc["platform_toolsets"]["cli"] == ["hermes-cli"]
+    assert "repowise" in doc["mcp_servers"]
+    assert "github" in doc["mcp_servers"]
+
+
+def test_hermes_joins_a_list_that_is_already_an_mcp_allowlist(hermes_home: Path) -> None:
+    """The mirror case, where omitting the entry is the silent failure.
+
+    The list already names an MCP server, so Hermes is filtering on it, and a
+    repowise absent from it would be registered and never reach the CLI.
+    """
+    import yaml
+
+    config = _seed(
+        hermes_home,
+        "mcp_servers:\n"
+        "  github:\n"
+        "    command: npx\n"
+        "\n"
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "  - hermes-cli\n"
+        "  - github\n",
+    )
+    get_target("hermes").install(Scope.USER)
+
+    doc = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert doc["platform_toolsets"]["cli"] == ["hermes-cli", "github", "repowise"]
+
+
+def test_hermes_ignores_an_allowlist_naming_only_a_disabled_server(
+    hermes_home: Path,
+) -> None:
+    """Membership is tested against *enabled* servers, exactly as the host tests it.
+
+    A list naming a server the user has since switched off is not an allowlist
+    to Hermes, so joining it would create the restriction the test above exists
+    to prevent.
+    """
+    import yaml
+
+    config = _seed(
+        hermes_home,
+        "mcp_servers:\n"
+        "  github:\n"
+        "    command: npx\n"
+        "    enabled: false\n"
+        "\n"
+        "platform_toolsets:\n"
+        "  cli: [hermes-cli, github]\n",
+    )
+    get_target("hermes").install(Scope.USER)
+
+    doc = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert doc["platform_toolsets"]["cli"] == ["hermes-cli", "github"]
+
+
+def test_hermes_reports_the_no_mcp_sentinel_rather_than_writing_past_it(
+    hermes_home: Path,
+) -> None:
+    """``no_mcp`` turns every MCP server off for the platform.
+
+    The entry is still written, because the sentinel is a per-platform switch
+    the user can flip back, but a silent success here looks exactly like a
+    working install right up to the point where no tools appear.
+    """
+    import yaml
+
+    config = _seed(
+        hermes_home,
+        "mcp_servers:\n"
+        "  github:\n"
+        "    command: npx\n"
+        "\n"
+        "platform_toolsets:\n"
+        "  cli: [hermes-cli, no_mcp]\n",
+    )
+    result = get_target("hermes").install(Scope.USER)
+
+    assert any("no_mcp" in note for note in result.notes)
+    doc = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert doc["platform_toolsets"]["cli"] == ["hermes-cli", "no_mcp"]
+
+
+def test_hermes_preserves_comments_anchors_and_line_endings(hermes_home: Path) -> None:
+    """The reason this target splices rather than reserializing.
+
+    A ``safe_load``/``safe_dump`` round-trip loses all three: the comments
+    outright, and the anchors by expanding them into the values they stand for,
+    which is a change no diff of the parsed data would show.
+    """
+    original = (
+        "# my hermes config\r\n"
+        "defaults: &d\r\n"
+        "  timeout: 30\r\n"
+        "model:\r\n"
+        "  <<: *d\r\n"
+        "  name: gpt-5  # the good one\r\n"
+    )
+    config = _seed(hermes_home, original)
+    get_target("hermes").install(Scope.USER)
+
+    text = config.read_bytes().decode("utf-8")
+    assert "# my hermes config" in text
+    assert "&d" in text
+    assert "<<: *d" in text
+    assert "# the good one" in text
+    assert "\r\n" in text
+    assert "\n" not in text.replace("\r\n", "")
+
+
+def test_hermes_does_not_convert_an_lf_config_to_crlf(hermes_home: Path) -> None:
+    """The discriminating half of line-ending preservation, and it only shows on Windows.
+
+    A CRLF fixture cannot prove this here: the platform translation an ordinary
+    config write uses *also* emits CRLF on Windows, so that test stays green
+    against a writer that ignores the file entirely. An LF file is the case
+    where the two answers differ, and turning every line of a user's config
+    over on a three-line edit is a whole-file diff rather than a cosmetic one.
+    """
+    config = _seed(hermes_home, "# my hermes config\nmodel:\n  name: gpt-5\n")
+    get_target("hermes").install(Scope.USER)
+
+    assert b"\r\n" not in config.read_bytes()
+
+
+def test_hermes_round_trips_a_seeded_config_byte_for_byte(hermes_home: Path) -> None:
+    original = (
+        "# my hermes config\n"
+        "model:\n"
+        "  name: gpt-5  # the good one\n"
+        "\n"
+        "platform_toolsets:\n"
+        "  cli: [hermes-cli]\n"
+    )
+    config = _seed(hermes_home, original)
+    target = get_target("hermes")
+
+    target.install(Scope.USER)
+    assert config.read_bytes() != original.encode("utf-8")
+
+    target.uninstall(Scope.USER)
+    assert config.read_bytes() == original.encode("utf-8")
+
+
+def test_hermes_declines_a_config_it_cannot_splice_safely(hermes_home: Path) -> None:
+    """A repeated top-level key is a shape the line matching cannot get right.
+
+    The search finds the first ``mcp_servers:`` while the parser keeps the
+    last, so an edit lands in a block the document does not use. It is caught
+    by re-parsing the spliced text and comparing it against the document the
+    target meant to write, which is what makes line-based surgery safe to ship:
+    a mis-fired splice becomes a decline, never a corrupted file.
+    """
+    original = (
+        "mcp_servers:\n"
+        "  github:\n"
+        "    command: gh\n"
+        "mcp_servers:\n"
+        "  other:\n"
+        "    command: npx\n"
+    )
+    config = _seed(hermes_home, original)
+
+    result = get_target("hermes").install(Scope.USER)
+
+    assert [written.action for written in result.files] == [FileAction.KEPT]
+    assert config.read_bytes() == original.encode("utf-8")
+    assert any("print-config hermes" in note for note in result.notes)
+
+
+def test_hermes_declines_unparseable_and_undecodable_configs(hermes_home: Path) -> None:
+    """``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError``.
+
+    Nothing wraps ``install``, so an escape here aborts the whole run after
+    other agents' configs have been written.
+    """
+    hermes = _hermes()
+    target = get_target("hermes")
+
+    broken = _seed(hermes_home, "model: [unclosed\n")
+    result = target.install(Scope.USER)
+    assert [written.action for written in result.files] == [FileAction.KEPT]
+    assert broken.read_bytes() == b"model: [unclosed\n"
+    assert target.doctor().status.value == "broken"
+
+    (hermes_home / "config.yaml").write_bytes(b"model:\n  name: caf\xe9\n")
+    result = target.install(Scope.USER)
+    assert [written.action for written in result.files] == [FileAction.KEPT]
+    assert (hermes_home / "config.yaml").read_bytes() == b"model:\n  name: caf\xe9\n"
+    # detect is contracted never to raise, whatever the file holds.
+    assert hermes.detect() == []
+
+
+def test_hermes_leaves_a_remote_entry_alone(hermes_home: Path) -> None:
+    """Hermes prefers a ``url`` over a ``command`` even when both are present.
+
+    So merging our command into an entry that has a url would leave a
+    registration that reads as repointed and still never launches us. The
+    shared ``is_remote_entry`` helper keys on a declared ``type`` field, which
+    this host does not have, and its fallback limb would call this entry local.
+    """
+    original = (
+        "mcp_servers:\n"
+        "  repowise:\n"
+        '    url: "https://example.invalid/mcp"\n'
+        "    command: repowise\n"
+    )
+    config = _seed(hermes_home, original)
+
+    result = get_target("hermes").install(Scope.USER)
+
+    assert [written.action for written in result.files] == [FileAction.KEPT]
+    assert config.read_bytes() == original.encode("utf-8")
+    assert any("remote server" in note for note in result.notes)
+
+
+def test_hermes_keeps_the_keys_a_user_added_to_our_entry(hermes_home: Path) -> None:
+    """Generated keys win so a moved install takes effect; everything else survives.
+
+    ``enabled: false`` is the one most worth keeping: parking a server without
+    deleting it is the documented use of that flag, and re-enabling it on every
+    ``agents refresh`` would undo a deliberate choice.
+    """
+    import yaml
+
+    config = _seed(
+        hermes_home,
+        "mcp_servers:\n"
+        "  repowise:\n"
+        "    command: /old/path/repowise\n"
+        "    args: [mcp]\n"
+        "    env:\n"
+        "      MY_KEY: secret\n"
+        "    timeout: 300\n"
+        "    enabled: false\n",
+    )
+    get_target("hermes").install(Scope.USER)
+
+    entry = yaml.safe_load(config.read_text(encoding="utf-8"))["mcp_servers"]["repowise"]
+    assert entry["command"] != "/old/path/repowise"
+    assert entry["args"] == ["mcp", "--transport", "stdio"]
+    assert entry["env"] == {"MY_KEY": "secret"}
+    assert entry["timeout"] == 300
+    assert entry["enabled"] is False
+
+
+def test_hermes_uninstall_keeps_a_config_file_it_did_not_create(hermes_home: Path) -> None:
+    """``config.yaml`` is the host's own file, so an empty one is not proof it is ours.
+
+    The unambiguous signal is the directory: Hermes seeds ``SOUL.md`` and ten
+    subdirectories into its home on every config load, so a lone ``config.yaml``
+    cannot have come from it, and anything else beside it means the file stays.
+    """
+    hermes = _hermes()
+    config = _seed(hermes_home, "")
+    (hermes_home / "SOUL.md").write_text("you are helpful\n", encoding="utf-8")
+
+    target = get_target("hermes")
+    target.install(Scope.USER)
+    target.uninstall(Scope.USER)
+
+    assert config.exists()
+    assert hermes.hermes_home().exists()
+    assert config.read_text(encoding="utf-8").strip() == ""
+
+
+def test_hermes_uninstall_removes_a_home_it_created(hermes_home: Path) -> None:
+    """Otherwise our own residue keeps the agent pre-ticked forever.
+
+    ``is_present`` reads this directory as evidence the user has Hermes, so an
+    ``agents add`` followed by an ``agents remove`` would leave the machine
+    looking like a Hermes machine when it never was.
+    """
+    hermes = _hermes()
+    target = get_target("hermes")
+
+    assert not hermes.hermes_home().exists()
+    target.install(Scope.USER)
+    assert hermes.config_path().exists()
+
+    target.uninstall(Scope.USER)
+    assert not hermes.config_path().exists()
+    assert not hermes.hermes_home().exists()
+
+
+def test_hermes_project_scope_manages_the_agents_md_block(
+    hermes_home: Path, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "AGENTS.md").write_bytes(b"# House rules\n\nBe nice.\n")
+    target = get_target("hermes")
+
+    first = target.install(Scope.PROJECT, repo_path=repo)
+    assert [written.action for written in first.files] == [FileAction.UPDATED]
+    second = target.install(Scope.PROJECT, repo_path=repo)
+    assert [written.action for written in second.files] == [FileAction.UNCHANGED]
+
+    target.uninstall(Scope.PROJECT, repo_path=repo)
+    assert (repo / "AGENTS.md").read_bytes() == b"# House rules\n\nBe nice.\n"
+
+
+def test_hermes_does_not_write_the_file_the_host_prefers(
+    hermes_home: Path, tmp_path: Path
+) -> None:
+    """Hermes loads one project context file, and ``HERMES.md`` outranks ``AGENTS.md``.
+
+    Writing the host-named file into a repo that already has an ``AGENTS.md``
+    would take precedence over it and suppress the repo's real instructions.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    get_target("hermes").install(Scope.PROJECT, repo_path=repo)
+
+    assert (repo / "AGENTS.md").exists()
+    assert not (repo / "HERMES.md").exists()
+    assert not (repo / ".hermes.md").exists()
+
+
+def test_hermes_project_registration_requires_the_global_one(
+    hermes_home: Path, tmp_path: Path
+) -> None:
+    """A managed block on its own must not report Hermes as wired.
+
+    ``AGENTS.md`` is written by two other agents, so reading the block alone as
+    "Hermes is wired here" would report Hermes as an owner of that file on a
+    machine that has never had Hermes, and ``other_managers_of`` asks exactly
+    that before letting ``agents remove --target=codex`` strip the block.
+    """
+    hermes = _hermes()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = get_target("hermes")
+
+    target.install(Scope.PROJECT, repo_path=repo)
+    assert hermes.detect(repo) == []
+
+    target.install(Scope.USER)
+    assert [registration.scope for registration in hermes.detect(repo)] == [
+        Scope.USER,
+        Scope.PROJECT,
+    ]
+
+
+def test_hermes_and_codex_do_not_strip_the_shared_block_from_each_other(
+    hermes_home: Path, tmp_path: Path
+) -> None:
+    """Three targets now manage ``AGENTS.md``, and the guard is over the registry.
+
+    Driven through both targets rather than by calling the helper by hand, so
+    deleting either side's guard fails this.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    hermes_target = get_target("hermes")
+    codex_target = get_target("codex")
+
+    codex_target.install(Scope.PROJECT, repo_path=repo)
+    hermes_target.install(Scope.USER)
+    hermes_target.install(Scope.PROJECT, repo_path=repo)
+
+    removed_codex = codex_target.uninstall(Scope.PROJECT, repo_path=repo)
+    assert FileAction.KEPT in [written.action for written in removed_codex.files]
+    assert any("Hermes" in note for note in removed_codex.notes)
+
+    removed_hermes = hermes_target.uninstall(Scope.PROJECT, repo_path=repo)
+    assert FileAction.KEPT in [written.action for written in removed_hermes.files]
+    assert any("Codex" in note for note in removed_hermes.notes)
+
+    # The block is still there, which is the whole point.
+    assert "REPOWISE_DISTILL:START" in (repo / "AGENTS.md").read_text(encoding="utf-8")
+
+
+def test_hermes_batch_removal_does_not_deadlock_on_the_shared_block(
+    hermes_home: Path, tmp_path: Path
+) -> None:
+    """Removing both at once must not have each keep the file for the other."""
+    from repowise.cli.agent_targets.registry import removing
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    hermes_target = get_target("hermes")
+    codex_target = get_target("codex")
+
+    codex_target.install(Scope.PROJECT, repo_path=repo)
+    hermes_target.install(Scope.USER)
+    hermes_target.install(Scope.PROJECT, repo_path=repo)
+
+    with removing(["codex", "hermes"]):
+        codex_target.uninstall(Scope.PROJECT, repo_path=repo)
+        hermes_target.uninstall(Scope.PROJECT, repo_path=repo)
+
+    assert not (repo / "AGENTS.md").exists()
+
+
+def test_hermes_print_config_parses_as_the_shape_the_host_reads(hermes_home: Path) -> None:
+    """It also must not touch the filesystem, and must not print the toolset key.
+
+    Printing ``platform_toolsets`` would invite the user to paste the exact
+    change this target declines to make, and a snippet cannot carry the
+    condition under which it is correct.
+    """
+    import yaml
+
+    snippet = get_target("hermes").print_config(Scope.USER)
+    assert not hermes_home.exists()
+
+    doc = yaml.safe_load(snippet)
+    assert set(doc) == {"mcp_servers"}
+    assert doc["mcp_servers"]["repowise"]["args"] == ["mcp", "--transport", "stdio"]
+
+
+def test_hermes_describe_paths_names_what_each_scope_writes(
+    hermes_home: Path, tmp_path: Path
+) -> None:
+    target = get_target("hermes")
+    repo = tmp_path / "repo"
+
+    assert target.describe_paths(Scope.USER) == [str(hermes_home / "config.yaml")]
+    assert target.describe_paths(Scope.PROJECT, repo_path=repo) == [str(repo / "AGENTS.md")]
+
+
+def test_hermes_doctor_distinguishes_absent_from_damaged(hermes_home: Path) -> None:
+    target = get_target("hermes")
+    assert target.doctor().status.value == "not-installed"
+
+    config = _seed(hermes_home, "model: [unclosed\n")
+    report = target.doctor()
+    assert report.status.value == "broken"
+    # Refresh skips what it cannot detect and install declines for the same
+    # reason this failed, so --repair has nothing to offer.
+    assert report.repairable is False
+
+    # Install declines against a file it cannot read, so the row stays broken
+    # rather than flipping to ok on a write that did not happen.
+    target.install(Scope.USER)
+    assert target.doctor().status.value == "broken"
+
+    config.unlink()
+    target.install(Scope.USER)
+    assert target.doctor().status.value == "ok"
+
+
+def test_hermes_uninstall_keeps_a_config_holding_only_the_users_comments(
+    hermes_home: Path,
+) -> None:
+    """An empty document is not an empty file, and the parse cannot tell them apart.
+
+    A ``config.yaml`` that is nothing but the user's comments parses to ``{}``,
+    and so does one whose only server is commented out with a note about why it
+    is parked. Deleting either on the strength of the parse destroys a file the
+    user wrote, reports it as ``removed``, and says nothing. This is the
+    sole-occupant case too, so the directory test alone does not save it.
+    """
+    target = get_target("hermes")
+
+    # Comments at top level only. After the removal the document really is
+    # empty, so this is the case that isolates the text test: nothing else
+    # stops the delete.
+    bare = "# my hermes config, managed by chezmoi\n# model:\n#   name: gpt-5\n"
+    config = _seed(hermes_home, bare)
+    assert [entry.name for entry in hermes_home.iterdir()] == ["config.yaml"]
+
+    target.install(Scope.USER)
+    target.uninstall(Scope.USER)
+
+    assert config.exists()
+    assert config.read_bytes() == bare.encode("utf-8")
+    assert hermes_home.exists()
+
+    # Comments inside the section we own. Here the section header survives with
+    # them, so the document is not empty either, and both guards have to hold
+    # for the round trip to be exact.
+    parked = (
+        "mcp_servers:\n"
+        "  # github parked 2026-08-01, re-enable after the token rotates\n"
+        "  # github:\n"
+        "  #   command: gh\n"
+    )
+    config.write_bytes(parked.encode("utf-8"))
+    target.install(Scope.USER)
+    target.uninstall(Scope.USER)
+
+    assert config.exists()
+    assert config.read_bytes() == parked.encode("utf-8")
+
+
+def test_hermes_installs_into_a_section_header_with_nothing_under_it(
+    hermes_home: Path,
+) -> None:
+    """``mcp_servers:`` with only a comment under it parses to ``None``, not ``{}``.
+
+    ``setdefault`` is the obvious way to reach that key and it does not replace
+    a present-but-null one, so this declined permanently with a note calling a
+    valid file invalid, and doctor then handed back the command that had just
+    refused. Hermes coerces the same key before reading it.
+    """
+    import yaml
+
+    config = _seed(hermes_home, "model: gpt\nmcp_servers:\n  # servers go here\n")
+    result = get_target("hermes").install(Scope.USER)
+
+    assert [written.action for written in result.files] == [FileAction.UPDATED]
+    assert result.notes == []
+    doc = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert "repowise" in doc["mcp_servers"]
+    assert "# servers go here" in config.read_text(encoding="utf-8")
+
+
+def test_hermes_installs_into_a_flow_style_section(hermes_home: Path) -> None:
+    """``mcp_servers: {}`` is legal and used to be an unfixable decline.
+
+    The whole cycle, because keeping the inline style on write and not teaching
+    removal about it left uninstall reporting ``kept`` and doing nothing.
+    """
+    import yaml
+
+    original = "model: gpt\nmcp_servers: {}\n"
+    config = _seed(hermes_home, original)
+    target = get_target("hermes")
+
+    result = target.install(Scope.USER)
+    assert [written.action for written in result.files] == [FileAction.UPDATED]
+    doc = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert "repowise" in doc["mcp_servers"]
+    assert doc["model"] == "gpt"
+
+    assert [written.action for written in target.install(Scope.USER).files] == [
+        FileAction.UNCHANGED
+    ]
+
+    removed = target.uninstall(Scope.USER)
+    assert [written.action for written in removed.files] == [FileAction.REMOVED]
+    assert config.read_bytes() == original.encode("utf-8")
+
+
+def test_hermes_survives_a_byte_order_mark(hermes_home: Path) -> None:
+    """A BOM hides the first key from a search anchored at column zero.
+
+    The edit then appends a second copy of a section that was already there,
+    the duplicate makes the merged text parse to something else, and install
+    declines forever on a file both PyYAML and Hermes read fine. The mark is
+    carried across rather than dropped, so the round trip is byte exact.
+    """
+    import yaml
+
+    original = "﻿mcp_servers:\n  github:\n    command: gh\n"
+    config = _seed(hermes_home, original)
+    target = get_target("hermes")
+
+    result = target.install(Scope.USER)
+    assert [written.action for written in result.files] == [FileAction.UPDATED]
+
+    text = config.read_bytes().decode("utf-8")
+    assert text.startswith("﻿")
+    doc = yaml.safe_load(text)
+    assert set(doc["mcp_servers"]) == {"github", "repowise"}
+
+    target.uninstall(Scope.USER)
+    assert config.read_bytes() == original.encode("utf-8")
+
+
+def test_hermes_round_trips_an_allowlist_config_through_the_cli_path(
+    hermes_home: Path,
+) -> None:
+    """The allowlist branch, exercised through install and uninstall.
+
+    The other round-trip test seeds ``cli: [hermes-cli]``, which does not name
+    an MCP server and so never reaches the toolset write at all. Without this
+    one, the inline-list rendering is covered only by calling the helper by
+    hand, and the failure it guards against shows up on uninstall.
+    """
+    original = (
+        "mcp_servers:\n"
+        "  othersrv:            # a server I already had\n"
+        "    command: npx\n"
+        "\n"
+        "platform_toolsets:\n"
+        "  cli: [hermes-cli, othersrv]\n"
+    )
+    config = _seed(hermes_home, original)
+    target = get_target("hermes")
+
+    target.install(Scope.USER)
+    text = config.read_text(encoding="utf-8")
+    assert "  cli: [hermes-cli, othersrv, repowise]\n" in text
+    assert "# a server I already had" in text
+
+    assert [written.action for written in target.install(Scope.USER).files] == [
+        FileAction.UNCHANGED
+    ]
+
+    target.uninstall(Scope.USER)
+    assert config.read_bytes() == original.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# yaml_merge
+# ---------------------------------------------------------------------------
+
+
+def test_yaml_merge_treats_a_same_indent_block_list_as_part_of_its_key() -> None:
+    """The dumper writes block sequences at the parent key's own indent.
+
+    Reading the first ``- `` line as the next sibling truncates the block after
+    one line, and the edit then lands above items that are still there.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    text = "platform_toolsets:\n  cli:\n  - hermes-cli\n  - github\nother: 1\n"
+    merged = yaml_merge.set_child(text, "platform_toolsets", "cli", ["hermes-cli", "x"])
+
+    assert yaml_merge.load_mapping(merged) == {
+        "platform_toolsets": {"cli": ["hermes-cli", "x"]},
+        "other": 1,
+    }
+    assert "github" not in merged
+
+
+def test_yaml_merge_verify_refuses_a_splice_that_missed() -> None:
+    """The guard that makes line surgery safe: intent is checked, not assumed."""
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    yaml_merge.verify("a: 1\n", {"a": 1})
+    with pytest.raises(ValueError):
+        yaml_merge.verify("a: 1\n", {"a": 2})
+
+
+def test_yaml_merge_rejects_what_is_not_a_mapping() -> None:
+    """A ``yaml.YAMLError`` is not a ``ValueError``, so it would escape every handler."""
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    assert yaml_merge.load_mapping("") == {}
+    with pytest.raises(ValueError):
+        yaml_merge.load_mapping("- a\n- b\n")
+    with pytest.raises(ValueError):
+        yaml_merge.load_mapping("a: [unclosed\n")
+
+
+def test_yaml_merge_detects_the_newline_to_write_back_with() -> None:
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    assert yaml_merge.detect_newline("a: 1\nb: 2\n") == "\n"
+    assert yaml_merge.detect_newline("a: 1\r\nb: 2\r\n") == "\r\n"
+
+
+def test_yaml_merge_removes_the_parent_once_it_is_empty() -> None:
+    """A bare ``parent:`` parses as ``None``, which is a different document."""
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    text = "mcp_servers:\n  repowise:\n    command: x\nmodel: gpt\n"
+    merged, section = yaml_merge.remove_child(text, "mcp_servers", "repowise")
+
+    assert section is yaml_merge.ABSENT
+    assert yaml_merge.load_mapping(merged) == {"model": "gpt"}
+    assert "mcp_servers" not in merged
+
+
+def test_yaml_merge_keeps_a_section_that_still_holds_the_users_comments() -> None:
+    """Comments are content, and the parse cannot see them.
+
+    A section left holding only comments must survive, which means the header
+    survives with it and the key parses to ``None`` rather than going away. The
+    caller is told which happened because it cannot work it out from the text,
+    and ``verify`` cannot catch getting it wrong: deleting the comments leaves
+    the same document.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    text = (
+        "mcp_servers:\n"
+        "  # github parked 2026-08-01, re-enable after the token rotates\n"
+        "  # github:\n"
+        "  #   command: gh\n"
+        "  repowise:\n"
+        "    command: x\n"
+    )
+    merged, section = yaml_merge.remove_child(text, "mcp_servers", "repowise")
+
+    # The header stays with the comments, so the key holds ``None`` rather than
+    # being gone. ``ABSENT`` is a sentinel precisely so those two stay distinct.
+    assert section is None
+    assert section is not yaml_merge.ABSENT
+    assert "token rotates" in merged
+    assert "#   command: gh" in merged
+    assert yaml_merge.load_mapping(merged) == {"mcp_servers": None}
+
+
+def test_yaml_merge_can_add_a_child_to_a_flow_mapping_parent() -> None:
+    """``mcp_servers: {}`` is an ordinary way to write an empty section.
+
+    A block child cannot be spliced under a value that is already closed, so
+    this used to produce unparseable text, get refused by ``verify``, and
+    surface "not valid YAML" about a file that is entirely valid, with no way
+    forward for the user.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    empty = yaml_merge.set_child(
+        "model: gpt\nmcp_servers: {}\n", "mcp_servers", "repowise", {"command": "x"}
+    )
+    assert yaml_merge.load_mapping(empty) == {
+        "model": "gpt",
+        "mcp_servers": {"repowise": {"command": "x"}},
+    }
+
+    populated = yaml_merge.set_child(
+        "mcp_servers: {github: {command: gh}}\n",
+        "mcp_servers",
+        "repowise",
+        {"command": "x"},
+    )
+    assert yaml_merge.load_mapping(populated) == {
+        "mcp_servers": {"github": {"command": "gh"}, "repowise": {"command": "x"}}
+    }
+
+
+def test_yaml_merge_flow_parent_edits_only_its_own_line() -> None:
+    """The parent's range runs to the next top-level key, so replacing it is wrong.
+
+    Everything between the inline value and the next section is blank lines and
+    the user's comments, and splicing over the whole range deleted them. Same
+    mistake the block path's walk-back exists to avoid, on a path that did not
+    inherit the rule, and invisible to ``verify`` because the document is
+    identical either way.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    merged = yaml_merge.set_child(
+        "mcp_servers: {}\n\n# ---- model settings, do not remove ----\nmodel: a\n",
+        "mcp_servers",
+        "repowise",
+        {"command": "x"},
+    )
+
+    assert "# ---- model settings, do not remove ----" in merged
+    assert yaml_merge.load_mapping(merged) == {
+        "mcp_servers": {"repowise": {"command": "x"}},
+        "model": "a",
+    }
+
+
+def test_yaml_merge_does_not_read_a_hash_inside_an_inline_value_as_a_comment() -> None:
+    """``#`` inside a plain scalar is data, and a nearby helper cannot tell.
+
+    The scalar-line helper guards only against quoting, so given
+    ``{a: {args: [-c, foo#bar]}}`` it returned ``#bar]}}`` and wrote that
+    fragment of the user's own config into their file as a comment on the
+    section header. The document is unchanged, so nothing downstream noticed.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    merged = yaml_merge.set_child(
+        "mcp_servers: {a: {command: sh, args: [-c, foo#bar]}}\n",
+        "mcp_servers",
+        "repowise",
+        {"command": "x"},
+    )
+
+    # Exactly one hash survives, the one that is part of the user's argument.
+    # A second means a fragment of their value was copied out into a comment.
+    assert merged.count("#") == 1
+    assert "#bar]}}" not in merged.replace("foo#bar", "")
+    assert yaml_merge.load_mapping(merged) == {
+        "mcp_servers": {
+            "a": {"command": "sh", "args": ["-c", "foo#bar"]},
+            "repowise": {"command": "x"},
+        }
+    }
+
+    # A real trailing comment survives, including one that mentions a bracket.
+    # Searching backwards from the last bracket looks like the same answer and
+    # reads the brace in "e.g. {a: b}" as the end of the value, throwing the
+    # comment away, so both limbs are here.
+    for comment in ("# my servers", "# e.g. {name: {command: x}}", "# note with ] bracket"):
+        kept = yaml_merge.set_child(
+            f"mcp_servers: {{}}  {comment}\n",
+            "mcp_servers",
+            "repowise",
+            {"command": "x"},
+        )
+        assert comment in kept
+
+
+def test_yaml_merge_finds_the_comment_boundary_the_way_the_parser_does() -> None:
+    """Three hand-written rules were tried and each was wrong its own way.
+
+    An apostrophe in a plain scalar is the case that defeats a quote tracker:
+    ``note: don't`` leaves it stuck open, every bracket after it is miscounted,
+    and the next hash in the data is returned as a comment. Which way it then
+    goes is a coin toss, so both are pinned here: a fragment of the value must
+    never be copied out into a comment, and a real comment must never be lost.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    def merged(line: str) -> str:
+        return yaml_merge.set_child(
+            line + "\n", "mcp_servers", "repowise", {"command": "R"}
+        )
+
+    # No comment here at all: the hash lives inside a quoted scalar.
+    fragment = merged("mcp_servers: {a: don't, b: 'x}y # z'}")
+    assert "#" not in fragment.replace("# z", "")
+    assert yaml_merge.load_mapping(fragment)["mcp_servers"]["b"] == "x}y # z"
+
+    # A real comment survives an apostrophe, and an escaped quote, before it.
+    for line in (
+        "mcp_servers: {a: {command: gh, args: [don't]}}  # keep me",
+        'mcp_servers: {a: {command: "a\\"b"}}  # keep me',
+    ):
+        assert "# keep me" in merged(line)
+
+
+def test_yaml_merge_refuses_a_wrapped_value_holding_a_comment() -> None:
+    """A wrapped value is re-rendered onto one line, so a comment inside it has
+    nowhere to go. Only the one following the value is recoverable, so rather
+    than eat the rest the value is left alone. The uncommented wrapped case is
+    the common one and still works.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    commented = (
+        "mcp_servers: {github: {command: gh},   # first server\n"
+        "              other: {command: o}}\n"
+        "model: a\n"
+    )
+    assert (
+        yaml_merge.set_child(commented, "mcp_servers", "repowise", {"command": "R"})
+        == commented
+    )
+
+
+def test_yaml_merge_matches_a_quoted_key_at_both_levels() -> None:
+    """Teaching one of the two searches about quoting was worse than neither.
+
+    The child search learned it first, and the parent search left behind sent a
+    quoted section down the append path, where the block it added was a
+    duplicate key and the write then refused for good.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    for spelling in ('"mcp_servers"', "'mcp_servers'"):
+        merged = yaml_merge.set_child(
+            f"{spelling}:\n  github:\n    command: gh\n",
+            "mcp_servers",
+            "repowise",
+            {"command": "R"},
+        )
+        assert merged.count("mcp_servers") == 1
+        assert sorted(yaml_merge.load_mapping(merged)["mcp_servers"]) == [
+            "github",
+            "repowise",
+        ]
+
+
+def test_yaml_merge_handles_an_inline_value_that_wraps_across_lines() -> None:
+    """The shortest slice that parses is the value.
+
+    An unbalanced flow collection does not parse, so the first slice that does
+    is the whole of it. Reading only the first line looks equivalent and turns
+    a wrapped value from a working install into a permanent refusal.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    merged = yaml_merge.set_child(
+        "mcp_servers: {github: {command: gh},\n              other: {command: o}}\nmodel: a\n",
+        "mcp_servers",
+        "repowise",
+        {"command": "x"},
+    )
+
+    assert yaml_merge.load_mapping(merged) == {
+        "mcp_servers": {
+            "github": {"command": "gh"},
+            "other": {"command": "o"},
+            "repowise": {"command": "x"},
+        },
+        "model": "a",
+    }
+
+
+def test_yaml_merge_refuses_an_inline_value_carrying_an_anchor() -> None:
+    """Adding a child re-renders the whole inline value, and anchors do not survive.
+
+    The dumper writes them back under generated names, so a factoring the user
+    wrote is replaced by ``&id001``. Everything else re-rendering normalises is
+    cosmetic; this one is the damage the module refuses to do to a whole file,
+    so it refuses it here too.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    original = "mcp_servers: {a: &base {command: gh}, b: *base}\n"
+    assert (
+        yaml_merge.set_child(original, "mcp_servers", "repowise", {"command": "x"})
+        == original
+    )
+
+    # A star inside an ordinary scalar is not an alias and must not be refused.
+    shell = "mcp_servers: {a: {command: sh, args: [-c, 'ls *']}}\n"
+    merged = yaml_merge.set_child(shell, "mcp_servers", "repowise", {"command": "x"})
+    assert "repowise" in yaml_merge.load_mapping(merged)["mcp_servers"]
+
+
+def test_hermes_uninstall_declines_when_the_splice_missed(hermes_home: Path) -> None:
+    """A removal that changed nothing must never report ``removed``.
+
+    ``remove_child`` reports what it did, and reporting it by re-parsing its own
+    output looks like the same answer: the caller feeds that value straight into
+    the document it hands ``verify``, so both sides came from one parse of one
+    string and the check could not fail. It then reported ``removed`` over a
+    file that still held the entry, leaving repowise registered.
+
+    The shape here is a repeated top-level key. The parser keeps the last, so
+    the entry is genuinely registered, while the line search finds the first and
+    edits a block the document does not use.
+    """
+    original = (
+        "mcp_servers:\n"
+        "  other:\n"
+        "    command: y\n"
+        "mcp_servers:\n"
+        "  repowise:\n"
+        "    command: x\n"
+    )
+    config = _seed(hermes_home, original)
+
+    result = get_target("hermes").uninstall(Scope.USER)
+
+    assert [written.action for written in result.files] == [FileAction.KEPT]
+    assert config.read_bytes() == original.encode("utf-8")
+
+
+def test_hermes_updates_a_quoted_key_in_place(hermes_home: Path) -> None:
+    """Quoting a mapping key is ordinary YAML, and matching only the bare form
+    was wrong in both directions: the write appended a second entry beside the
+    quoted one, leaving a duplicate key the parser silently resolves to the
+    last, and the removal then found neither and declined for good.
+    """
+    import yaml
+
+    config = _seed(
+        hermes_home,
+        'mcp_servers:\n  "repowise":\n    command: old\n    env:\n      K: v\nmodel: a\n',
+    )
+    target = get_target("hermes")
+
+    target.install(Scope.USER)
+    text = config.read_text(encoding="utf-8")
+    assert text.count("repowise:") == 1
+    entry = yaml.safe_load(text)["mcp_servers"]["repowise"]
+    assert entry["command"] != "old"
+    assert entry["env"] == {"K": "v"}
+
+    assert [written.action for written in target.install(Scope.USER).files] == [
+        FileAction.UNCHANGED
+    ]
+    assert [written.action for written in target.uninstall(Scope.USER).files] == [
+        FileAction.REMOVED
+    ]
+    assert "repowise" not in config.read_text(encoding="utf-8")
+
+
+def test_yaml_merge_removes_a_child_from_an_inline_parent() -> None:
+    """The mirror of the inline write, and it has to exist for the same reason.
+
+    Teaching the write path about inline parents and leaving removal behind
+    meant the child search looked for a line that is not on a line of its own,
+    found nothing, reported the parent unchanged, and uninstall then failed its
+    own consistency check and left the entry in place. An emptied inline parent
+    comes back as ``{}``, which is what it was before the install.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    text, section = yaml_merge.remove_child(
+        "mcp_servers: {github: {command: gh}, repowise: {command: x}}\n",
+        "mcp_servers",
+        "repowise",
+    )
+    assert text == "mcp_servers: {github: {command: gh}}\n"
+    assert section == {"github": {"command": "gh"}}
+
+    emptied, section = yaml_merge.remove_child(
+        "mcp_servers: {repowise: {command: x}}\n", "mcp_servers", "repowise"
+    )
+    assert emptied == "mcp_servers: {}\n"
+    assert section == {}
+
+
+def test_yaml_merge_leaves_a_deeper_comment_with_the_child_it_documents() -> None:
+    """A comment indented past the children belongs to the one above it.
+
+    Stepping over it moves the user's note inside our block, where it reads as
+    documenting our entry. The same indent rule keeps a ``#`` line that is
+    *content* rather than a comment, a literal inside a ``key: |`` block
+    scalar, from being stepped over at all, which truncated the scalar.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    kept = yaml_merge.set_child(
+        "mcp_servers:\n  github:\n    command: gh\n    # note about github\nmodel: a\n",
+        "mcp_servers",
+        "repowise",
+        {"command": "x"},
+    )
+    lines = kept.splitlines()
+    assert lines.index("    # note about github") < lines.index("  repowise:")
+
+    scalar = yaml_merge.set_child(
+        "mcp_servers:\n  desc: |\n    # literal text\nmodel: a\n",
+        "mcp_servers",
+        "repowise",
+        {"command": "x"},
+    )
+    assert yaml_merge.load_mapping(scalar)["mcp_servers"]["desc"] == "# literal text\n"
+
+
+def test_yaml_merge_appends_above_a_comment_introducing_the_next_section() -> None:
+    """The parent's range runs to the next top-level key, heading included.
+
+    Stopping at the first blank line puts our entry below the user's section
+    heading, which indents their title into our block and leaves the section it
+    introduced without it. The document is unchanged either way, so ``verify``
+    is structurally blind to this one.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    merged = yaml_merge.set_child(
+        "mcp_servers:\n  foo:\n    command: x\n\n# ---- model settings ----\nmodel: a\n",
+        "mcp_servers",
+        "repowise",
+        {"command": "y"},
+    )
+
+    lines = merged.splitlines()
+    assert lines.index("  repowise:") < lines.index("# ---- model settings ----")
+    assert lines.index("# ---- model settings ----") == lines.index("model: a") - 1
+
+
+def test_yaml_merge_keeps_a_comment_on_the_line_it_replaces() -> None:
+    """Replacing a child replaces its whole first line, comment included.
+
+    Recovering it is conservative: a ``#`` inside a quoted scalar is not a
+    comment, and moving a fragment of the user's data into one is a worse
+    outcome than losing a comment in a rare shape.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    kept = yaml_merge.set_child(
+        "platform_toolsets:\n  cli: [hermes-cli]   # deliberately an allowlist\n",
+        "platform_toolsets",
+        "cli",
+        ["hermes-cli", "repowise"],
+    )
+    assert "# deliberately an allowlist" in kept
+    assert yaml_merge.load_mapping(kept) == {
+        "platform_toolsets": {"cli": ["hermes-cli", "repowise"]}
+    }
+
+    quoted = yaml_merge.set_child(
+        'platform_toolsets:\n  cli: ["a#b"]\n', "platform_toolsets", "cli", ["x"]
+    )
+    assert "#" not in quoted
+    assert yaml_merge.load_mapping(quoted) == {"platform_toolsets": {"cli": ["x"]}}
+
+
+def test_yaml_merge_keeps_an_inline_list_inline_and_still_findable() -> None:
+    """Editing one item of a user's inline list gives back an inline list.
+
+    The second assertion is the one that matters, and it is the defect this
+    pins: rendering the *pair* in flow style produces ``{cli: [a, b]}``, which
+    is valid YAML and the right document, so nothing downstream complains --
+    but the key is then inside a flow mapping where the line-based search
+    cannot find it, and the next edit appends a second copy rather than
+    replacing it. Uninstall is where that surfaces, as a removal that silently
+    does nothing.
+    """
+    from repowise.cli.agent_targets.formats import yaml_merge
+
+    text = "platform_toolsets:\n  cli: [hermes-cli, othersrv]\n"
+    added = yaml_merge.set_child(
+        text, "platform_toolsets", "cli", ["hermes-cli", "othersrv", "repowise"]
+    )
+    assert "  cli: [hermes-cli, othersrv, repowise]\n" in added
+    assert "{cli:" not in added
+
+    # The round trip has to land back on the exact bytes, which only holds if
+    # the edited line is still reachable.
+    restored = yaml_merge.set_child(
+        added, "platform_toolsets", "cli", ["hermes-cli", "othersrv"]
+    )
+    assert restored == text
