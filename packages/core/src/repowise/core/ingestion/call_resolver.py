@@ -25,11 +25,18 @@ per strategy, and it is what the edge carries.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 import structlog
 
+from .languages.receiver_types import (
+    RECEIVER_TYPE_LANGUAGES,
+    Declaration,
+    scan_declarations,
+    types_in_span,
+)
 from .models import (
     CallSite,
     NamedBinding,
@@ -51,15 +58,20 @@ class _LanguageCallStrategies:
     """What a language resolves that the language-neutral tiers cannot.
 
     ``free`` runs after the same-file tier and before the import tiers;
-    ``member`` runs before every receiver strategy. Both stop at the first hit.
+    ``member`` runs before every receiver strategy; ``member_fallback`` runs
+    after all of them, so a strategy there only ever sees a call nothing else
+    claimed and can only add an edge. All three stop at the first hit.
     Strategies are named rather than bound so a probe can substitute one.
     """
 
     free: tuple[str, ...] = ()
     member: tuple[str, ...] = ()
+    member_fallback: tuple[str, ...] = ()
 
 
 _NO_LANGUAGE_STRATEGIES = _LanguageCallStrategies()
+
+_TYPED_RECEIVER = ("_resolve_typed_receiver",)
 
 _JVM_STRATEGIES = _LanguageCallStrategies(
     free=("_resolve_jvm_same_package",),
@@ -75,11 +87,18 @@ _LANGUAGE_CALL_STRATEGIES: dict[str, _LanguageCallStrategies] = {
         free=("_resolve_go_same_package",),
         member=("_resolve_go_package_call",),
     ),
-    "java": _JVM_STRATEGIES,
+    # Kotlin shares the JVM tiers but not the typed-receiver fallback: it has
+    # no declaration shapes yet, so registering it would promise a resolution
+    # the language gate immediately declines.
+    "java": replace(_JVM_STRATEGIES, member_fallback=_TYPED_RECEIVER),
     "kotlin": _JVM_STRATEGIES,
+    "csharp": _LanguageCallStrategies(member_fallback=_TYPED_RECEIVER),
     "cpp": _CPP_STRATEGIES,
     "c": _CPP_STRATEGIES,
 }
+
+_SOURCE_CACHE_FILES = 4
+_BODY_TYPE_CACHE_ENTRIES = 2048
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,9 +115,14 @@ class ResolvedCall:
 class CallResolver:
     """Resolve raw CallSites to symbol-level edges.
 
-    Constructed once per ``GraphBuilder.build()`` call with the full set
-    of parsed files and import edges. Stateless after construction —
-    ``resolve_file()`` can be called concurrently for different files.
+    Constructed once per ``GraphBuilder.build()`` call with the full set of
+    parsed files and import edges, then driven one file at a time.
+
+    ``resolve_file()`` is **not** safe to call concurrently. Several lazy
+    caches are filled during resolution, and the capped ones evict wholesale.
+    Every cached value is a pure function of state fixed at construction, so a
+    race would cost recomputation rather than a wrong answer, but the eviction
+    makes concurrent use pointless as well as unsupported.
     """
 
     def __init__(
@@ -155,6 +179,18 @@ class CallResolver:
 
         # Lazy per-file set of (line, target) that also carry a receiver.
         self._member_shaped: dict[str, set[tuple[int, str]]] = {}
+
+        # Receiver typing reads source text, so both caches are capped rather
+        # than per-repo: files resolve one at a time, so a few slots always
+        # hit, and the cap is what keeps a whole repo's source out of memory.
+        # Scanning is memoised per *function*, not per reference — one scan
+        # answers every unresolved receiver in a body.
+        self._source_text: dict[str, str] = {}
+        self._declarations: dict[str, tuple[Declaration, ...]] = {}
+        self._symbol_spans: dict[str, dict[str, tuple[int, int]]] = {}
+        self._body_types: dict[tuple[str, str], dict[str, str]] = {}
+        self._external_names: dict[str, frozenset[str]] = {}
+        self._method_name_set: frozenset[str] | None = None
 
         # Barrel re-export origins: {barrel_file: {name: origin_file}}
         self._barrel_origins: dict[str, dict[str, str]] = defaultdict(dict)
@@ -818,31 +854,15 @@ class CallResolver:
                     )
 
         # Strategies 2 and 2b: the receiver names a class that declares the
-        # method — in this file, in an imported one, or anywhere at all. No
-        # class declares the pair unless the global method index holds it, and
-        # that check also keeps the merged-import view from being built for a
-        # pair that cannot be in it.
-        key = (receiver_name, method_name)
-        if key in self._global_methods:
-            file_methods = self._file_methods.get(file_path, {})
-            if key in file_methods:
-                return ResolvedCall(
-                    caller_id, file_methods[key], 0.93, call.line, "receiver_same_file"
-                )
-
-            merged_methods = self._merged_methods_for(file_path)
-            if key in merged_methods:
-                return ResolvedCall(
-                    caller_id, merged_methods[key], 0.88, call.line, "receiver_import"
-                )
-
-            # Trait method dispatch — the method may be defined on a trait's
-            # impl block in another file. The global index preserves
-            # file-insertion match order; the caller's own file is skipped.
-            for _path, sym_id in self._global_methods[key]:
-                if _path == file_path:
-                    continue
-                return ResolvedCall(caller_id, sym_id, 0.75, call.line, "receiver_global")
+        # method — in this file, in an imported one, or anywhere at all.
+        match = self._receiver_pair_match(file_path, (receiver_name, method_name))
+        if match is not None:
+            sym_id, tier = match
+            if tier == "same_file":
+                return ResolvedCall(caller_id, sym_id, 0.93, call.line, "receiver_same_file")
+            if tier == "import":
+                return ResolvedCall(caller_id, sym_id, 0.88, call.line, "receiver_import")
+            return ResolvedCall(caller_id, sym_id, 0.75, call.line, "receiver_global")
 
         # Strategy 3: receiver is "self" or "this" — look in same class.
         # Only the caller's own file can hold the match, so index straight
@@ -854,10 +874,223 @@ class CallResolver:
                 if sym_id is not None and sym_id != caller_id:
                     return ResolvedCall(caller_id, sym_id, 0.95, call.line, "self_scope")
 
-        # No further fallback: any (class, method) pair present in any file's
-        # method index was already resolved by strategy 2 (same file) or 2b
-        # (global method index), which are built from the same symbols.
+        # Last: the receiver may be a local or parameter, which names no class
+        # at all. Everything above has already declined it.
+        for strategy in self._strategies_for(file_path).member_fallback:
+            hit = getattr(self, strategy)(file_path, call, caller_id)
+            if hit is not None:
+                return hit
+
         return None
+
+    def _receiver_pair_match(
+        self,
+        file_path: str,
+        key: tuple[str, str],
+    ) -> tuple[str, str] | None:
+        """The symbol a ``(class, method)`` pair names, and the scope that held it.
+
+        No class declares the pair unless the global method index holds it, and
+        that check also keeps the merged-import view from being built for a
+        pair that cannot be in it.
+        """
+        if key not in self._global_methods:
+            return None
+
+        file_methods = self._file_methods.get(file_path, {})
+        if key in file_methods:
+            return file_methods[key], "same_file"
+
+        merged_methods = self._merged_methods_for(file_path)
+        if key in merged_methods:
+            return merged_methods[key], "import"
+
+        # Trait method dispatch — the method may be defined on a trait's impl
+        # block in another file. The global index preserves file-insertion
+        # match order; the caller's own file is skipped.
+        for path, sym_id in self._global_methods[key]:
+            if path != file_path:
+                return sym_id, "global"
+
+        return None
+
+    def _resolve_typed_receiver(
+        self,
+        file_path: str,
+        call: CallSite,
+        caller_id: str,
+    ) -> ResolvedCall | None:
+        """Resolve ``local.method()`` by typing the local from its declaration.
+
+        Emits nothing unless the inferred type declares the method, which is
+        what makes a text scan safe: a mis-inference reaches no index and
+        yields no edge.
+        """
+        receiver_name = call.receiver_name or ""
+        # Lowercase-initial only. A capitalised receiver already names a type
+        # and every tier above has tried it; an underscore one is a field,
+        # whose declaration is not in this body.
+        if not receiver_name[:1].islower() or receiver_name in ("self", "this"):
+            return None
+
+        parsed = self._parsed_files.get(file_path)
+        language = parsed.file_info.language if parsed else ""
+        if language not in RECEIVER_TYPE_LANGUAGES:
+            return None
+
+        # Scanning a body is the expensive half, so refuse before it rather
+        # than after. Nothing here can resolve unless some class declares a
+        # method of this name; the gate above only proves some *symbol* does,
+        # which a free function satisfies.
+        if call.target_name not in self._method_names():
+            return None
+
+        type_name = self._declared_types_in(file_path, caller_id, language).get(receiver_name)
+        if type_name is None:
+            return None
+        key = (type_name, call.target_name)
+
+        # An import statement binds the name outright, so it settles which type
+        # this is before any scope search.
+        bound = self._import_names.get(file_path, {}).get(type_name)
+        if bound is not None and not bound.startswith("external:"):
+            sym_id = self._file_methods.get(bound, {}).get(key)
+            if sym_id is None:
+                return None
+            return ResolvedCall(caller_id, sym_id, 0.88, call.line, "receiver_typed_import")
+
+        # Bound to something outside the repo and there is no edge to find,
+        # however many local classes share the simple name. A compatibility
+        # test that imports a third-party `Cache` is otherwise read as calling
+        # ours, and it looks right in every sample that does not check imports.
+        if type_name in self._externally_bound_names(file_path):
+            return None
+
+        # The caller's own file first. A nested class here outranks a
+        # same-named one in a package sibling, which is the whole ambiguity in
+        # a repo that keeps near-duplicate implementations side by side.
+        sym_id = self._file_methods.get(file_path, {}).get(key)
+        if sym_id is not None:
+            return ResolvedCall(caller_id, sym_id, 0.93, call.line, "receiver_typed_same_file")
+
+        # Only the JVM registers both a member strategy and this fallback, so
+        # the scope that answers here is its same-package one. A second
+        # language pairing the two needs an origin word of its own.
+        typed_call = replace(call, receiver_name=type_name)
+        for strategy in self._strategies_for(file_path).member:
+            hit = getattr(self, strategy)(file_path, typed_call, caller_id)
+            if hit is not None:
+                return ResolvedCall(
+                    caller_id,
+                    hit.callee_id,
+                    0.90,
+                    call.line,
+                    "receiver_typed_same_package",
+                )
+
+        match = self._receiver_pair_match(file_path, key)
+        if match is None:
+            return None
+        sym_id, tier = match
+        if tier == "import":
+            return ResolvedCall(caller_id, sym_id, 0.88, call.line, "receiver_typed_import")
+        return ResolvedCall(caller_id, sym_id, 0.75, call.line, "receiver_typed_global")
+
+    def _method_names(self) -> frozenset[str]:
+        """Every name declared as a method of some class, built once."""
+        if self._method_name_set is None:
+            self._method_name_set = frozenset(method for _, method in self._global_methods)
+        return self._method_name_set
+
+    def _externally_bound_names(self, file_path: str) -> frozenset[str]:
+        """Simple names this file imports from outside the repo.
+
+        Read off the raw import statements rather than ``_import_names``, which
+        only carries bindings that resolved to a file — precisely the ones this
+        needs to exclude.
+        """
+        names = self._external_names.get(file_path)
+        if names is not None:
+            return names
+
+        parsed = self._parsed_files.get(file_path)
+        found: set[str] = set()
+        for imp in parsed.imports if parsed else ():
+            if imp.resolved_file and not imp.resolved_file.startswith("external:"):
+                continue
+            bound = (*imp.imported_names, imp.module_path.rsplit(".", 1)[-1])
+            found.update(name for name in bound if name and name != "*")
+
+        names = frozenset(found)
+        if len(self._external_names) >= _SOURCE_CACHE_FILES:
+            self._external_names.clear()
+        self._external_names[file_path] = names
+        return names
+
+    def _declared_types_in(
+        self,
+        file_path: str,
+        caller_id: str,
+        language: str,
+    ) -> dict[str, str]:
+        """``{name: type}`` for the body of one function."""
+        key = (file_path, caller_id)
+        types = self._body_types.get(key)
+        if types is not None:
+            return types
+
+        span = self._spans_for(file_path).get(caller_id)
+        if span is None:
+            types = {}
+        else:
+            types = types_in_span(self._declarations_for(file_path, language), *span)
+
+        if len(self._body_types) >= _BODY_TYPE_CACHE_ENTRIES:
+            self._body_types.clear()
+        self._body_types[key] = types
+        return types
+
+    def _declarations_for(self, file_path: str, language: str) -> tuple[Declaration, ...]:
+        """Every declaration in one file, scanned once however many bodies ask."""
+        found = self._declarations.get(file_path)
+        if found is None:
+            found = scan_declarations(self._text_of(file_path), language)
+            if len(self._declarations) >= _SOURCE_CACHE_FILES:
+                self._declarations.clear()
+            self._declarations[file_path] = found
+        return found
+
+    def _spans_for(self, file_path: str) -> dict[str, tuple[int, int]]:
+        """``{symbol_id: (start_line, end_line)}`` for one file."""
+        spans = self._symbol_spans.get(file_path)
+        if spans is None:
+            parsed = self._parsed_files.get(file_path)
+            spans = {s.id: (s.start_line, s.end_line) for s in (parsed.symbols if parsed else ())}
+            if len(self._symbol_spans) >= _SOURCE_CACHE_FILES:
+                self._symbol_spans.clear()
+            self._symbol_spans[file_path] = spans
+        return spans
+
+    def _text_of(self, file_path: str) -> str:
+        """One file's source, or empty if it cannot be read."""
+        text = self._source_text.get(file_path)
+        if text is not None:
+            return text
+
+        parsed = self._parsed_files.get(file_path)
+        text = ""
+        if parsed is not None:
+            try:
+                text = Path(parsed.file_info.abs_path).read_text(
+                    encoding="utf-8", errors="ignore"
+                )
+            except OSError:
+                text = ""
+
+        if len(self._source_text) >= _SOURCE_CACHE_FILES:
+            self._source_text.clear()
+        self._source_text[file_path] = text
+        return text
 
 
 def _rivals_a_class_method(symbol_id: str) -> bool:
