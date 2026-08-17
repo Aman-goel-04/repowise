@@ -41,6 +41,8 @@ _EDGE_VERB: dict[str, str] = {
     "dynamic_uses": "uses",
     "dynamic_url_route": "uses",
     "framework": "uses",
+    # Symbol-level wiring; same verb as its file-level sibling on purpose.
+    "framework_binds": "uses",
     "reads": "uses",
     # A type reference without an import: named, but not imported.
     "type_use": "references",

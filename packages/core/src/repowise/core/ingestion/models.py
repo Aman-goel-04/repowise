@@ -291,9 +291,15 @@ EdgeType = Literal[
     "dispatches_to",
     "co_changes",
     "framework",
-    # A data reference rather than a call. Two `_add_reads_edge` helpers emit
-    # it at different layers: C# member access file → file, Express
-    # route/middleware wiring symbol → symbol.
+    # The symbol-level sibling of `framework`, emitted when a handler can name
+    # both ends as symbols. Deliberately not `calls`: nothing here is a call the
+    # parser could have seen, and letting it read as one would put an inferred
+    # wiring hop into an execution flow as if it were source.
+    "framework_binds",
+    # A data reference rather than a call: C# member access, file → file. It
+    # used to name two unrelated things — the Express route wiring emitted it
+    # symbol → symbol — which is why one consumer set could not say which layer
+    # it meant. That producer now emits `framework_binds`.
     "reads",
     # Dynamic-dispatch hints. `dynamic_hints` extractors emit a `DynamicKind`
     # sub-type and `EdgesMixin.add_dynamic_edges` prefixes it, so `url_route`
@@ -466,6 +472,9 @@ SYMBOL_USE_EDGE_TYPES: frozenset[str] = frozenset(
         # answers for, and that call lands on the base. Without this the whole
         # implementation side of an interface reads as called by nobody.
         "dispatches_to",
+        # A fixture nobody calls and a collaborator nobody constructs are both
+        # used — by the container, which no parser sees.
+        "framework_binds",
         "reads",
         # Naming a function is using it. A handler sitting in a dispatch table
         # is never called anywhere a parser can see, and treating that as "no
