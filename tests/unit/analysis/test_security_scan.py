@@ -88,6 +88,49 @@ class TestScanFile:
         findings = asyncio.run(scanner.scan_file("b.py", CLEAN.decode(), symbols=[]))
         assert findings == []
 
+    def test_single_line_subprocess_shell_true_is_flagged(self) -> None:
+        scanner = SecurityScanner(session=None, repo_id="r1")  # type: ignore[arg-type]
+        source = 'subprocess.run("rm -rf " + path, shell=True)\n'
+        findings = asyncio.run(scanner.scan_file("a.py", source, symbols=[]))
+        hits = [f for f in findings if f["kind"] == "subprocess_shell_true"]
+        assert len(hits) == 1
+        assert hits[0]["line"] == 1
+
+    def test_multiline_subprocess_shell_true_is_flagged(self) -> None:
+        scanner = SecurityScanner(session=None, repo_id="r1")  # type: ignore[arg-type]
+        source = 'subprocess.run(\n    "rm -rf " + path,\n    shell=True,\n)\n'
+        findings = asyncio.run(scanner.scan_file("a.py", source, symbols=[]))
+        hits = [f for f in findings if f["kind"] == "subprocess_shell_true"]
+        assert len(hits) == 1
+        assert hits[0]["line"] == 1
+
+    def test_multiline_popen_shell_true_is_flagged(self) -> None:
+        scanner = SecurityScanner(session=None, repo_id="r1")  # type: ignore[arg-type]
+        source = 'subprocess.Popen(\n    ["/bin/sh"],\n    shell=True,\n)\n'
+        findings = asyncio.run(scanner.scan_file("a.py", source, symbols=[]))
+        hits = [f for f in findings if f["kind"] == "subprocess_shell_true"]
+        assert len(hits) == 1
+        assert hits[0]["line"] == 1
+
+    def test_subprocess_without_shell_does_not_fire(self) -> None:
+        scanner = SecurityScanner(session=None, repo_id="r1")  # type: ignore[arg-type]
+        source = 'subprocess.run(\n    ["git", "rev-parse", "HEAD"],\n    capture_output=True,\n)\n'
+        findings = asyncio.run(scanner.scan_file("a.py", source, symbols=[]))
+        hits = [f for f in findings if f["kind"] == "subprocess_shell_true"]
+        assert hits == []
+
+    def test_spanning_pass_does_not_jump_to_later_shell_true(self) -> None:
+        """A closed subprocess call must not claim a later column-0 shell=True."""
+        scanner = SecurityScanner(session=None, repo_id="r1")  # type: ignore[arg-type]
+        source = (
+            'subprocess.run(["ls"], capture_output=True)\n'
+            "\n"
+            "os.popen(cmd, shell=True)\n"
+        )
+        findings = asyncio.run(scanner.scan_file("a.py", source, symbols=[]))
+        hits = [f for f in findings if f["kind"] == "subprocess_shell_true"]
+        assert hits == []
+
 
 class TestPersistSecurityFindings:
     """The persist.py wiring: source_map in, idempotent rows out."""

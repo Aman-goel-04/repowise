@@ -50,6 +50,25 @@ _PATTERNS: list[tuple[re.Pattern, str, str]] = [
 # _PATTERNS matches, so findings are unchanged.
 _ANY_PATTERN = re.compile("|".join(f"(?:{p.pattern})" for p, _, _ in _PATTERNS))
 
+# Patterns whose calls legitimately span multiple physical lines: the opening
+# ``subprocess.<call>(`` lands on one line and ``shell=True`` on another. The
+# per-line loop can never see such a call (``.*`` stops at the newline), so it
+# gets an extra whole-source pass.
+#
+# Continuation is restricted to the same physical line or a newline that is
+# followed by indentation (``(?:[^\n]|\n(?=[ \t]))``), so a closed
+# ``subprocess.run(...)`` cannot jump to a later ``os.popen(..., shell=True)``
+# on a column-0 line. The span is also capped (~200 chars) as a second bound.
+_SPANNING_PATTERNS: list[tuple[re.Pattern, str, str]] = [
+    (
+        re.compile(
+            r"subprocess\.[A-Za-z]+\((?:[^\n]|\n(?=[ \t])){0,200}?shell\s*=\s*True"
+        ),
+        "subprocess_shell_true",
+        "high",
+    ),
+]
+
 # Symbol names that are informational security hotspots
 _SYMBOL_KEYWORDS = re.compile(
     r"\b(auth|token|password|jwt|session|crypto)\b", re.IGNORECASE
@@ -114,6 +133,31 @@ class SecurityScanner:
                             "line": lineno,
                         }
                     )
+
+        # Whole-source pass for patterns that span physical lines
+        # (``subprocess.run(\n    ...,\n    shell=True,\n)``). The per-line
+        # loop above can never see the sink when the call opens on one line
+        # and ``shell=`` lands on another, so scan the full source once. The
+        # finding is reported on the line where the call starts, and a match
+        # the per-line pass already caught on that line is not duplicated.
+        for pattern, kind, severity in _SPANNING_PATTERNS:
+            for match in pattern.finditer(source):
+                start_line = source.count("\n", 0, match.start()) + 1
+                if any(f["kind"] == kind and f["line"] == start_line for f in findings):
+                    continue
+                line_start = source.rfind("\n", 0, match.start()) + 1
+                line_end = source.find("\n", match.start())
+                if line_end == -1:
+                    line_end = len(source)
+                snippet = source[line_start:line_end].strip()[:120]
+                findings.append(
+                    {
+                        "kind": kind,
+                        "severity": severity,
+                        "snippet": snippet,
+                        "line": start_line,
+                    }
+                )
 
         # Symbol-name scan (informational / low)
         for sym in symbols:
