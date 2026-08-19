@@ -222,3 +222,64 @@ class TestPersistSecurityFindings:
 
         rows = asyncio.run(_run())
         assert ("auth.py", "security_sensitive_symbol", 7) in rows
+
+    def test_replace_findings_duplicate_key_does_not_lose_rows(self, tmp_path: Path) -> None:
+        """Two findings sharing a provenance key must not abort the batch and
+        drop the file's other rows (regression for the bulk-INSERT abort that
+        swallowed IntegrityError and silently truncated the insert)."""
+        from repowise.core.analysis.security_scan import SecurityScanner
+        from repowise.core.persistence import get_session
+
+        async def _run():
+            engine, sf = await _fresh_session_factory(tmp_path)
+            async with get_session(sf) as session:
+                scanner = SecurityScanner(session, "repo-1")
+                await scanner.replace_findings(
+                    {
+                        "a.py": [
+                            {"kind": "hardcoded_password", "severity": "high", "line": 1},
+                            {"kind": "security_sensitive_symbol", "severity": "low", "line": 7},
+                            {"kind": "security_sensitive_symbol", "severity": "low", "line": 7},
+                        ],
+                    },
+                    ["a.py"],
+                )
+            rows = await _rows(sf)
+            await engine.dispose()
+            return rows
+
+        rows = asyncio.run(_run())
+        assert sorted(rows) == [
+            ("a.py", "hardcoded_password", 1),
+            ("a.py", "security_sensitive_symbol", 7),
+        ]
+
+    def test_replace_findings_rescan_keeps_prior_and_new_rows(self, tmp_path: Path) -> None:
+        """Re-running replace_findings over the same file must yield the same
+        full row set — duplicates on the provenance key are no-ops, never a
+        partial insert."""
+        from repowise.core.analysis.security_scan import SecurityScanner
+        from repowise.core.persistence import get_session
+
+        async def _run():
+            engine, sf = await _fresh_session_factory(tmp_path)
+            findings = {
+                "a.py": [
+                    {"kind": "hardcoded_password", "severity": "high", "line": 1},
+                    {"kind": "security_sensitive_symbol", "severity": "low", "line": 7},
+                    {"kind": "security_sensitive_symbol", "severity": "low", "line": 7},
+                ],
+            }
+            for _ in range(2):
+                async with get_session(sf) as session:
+                    scanner = SecurityScanner(session, "repo-1")
+                    await scanner.replace_findings(findings, ["a.py"])
+            rows = await _rows(sf)
+            await engine.dispose()
+            return rows
+
+        rows = asyncio.run(_run())
+        assert sorted(rows) == [
+            ("a.py", "hardcoded_password", 1),
+            ("a.py", "security_sensitive_symbol", 7),
+        ]
