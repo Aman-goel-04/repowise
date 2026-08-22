@@ -83,6 +83,7 @@ class RepoIndex:
         self._session = session
         self._engine = engine
         self._by_file: dict[str, list[IndexedSymbol]] = {}
+        self._by_name: dict[str, list[IndexedSymbol]] = {}
         self._externals: list[ExternalImport] = []
 
     # -- Loading -----------------------------------------------------------
@@ -127,6 +128,8 @@ class RepoIndex:
         # the last is the method.
         for symbols in self._by_file.values():
             symbols.sort(key=lambda s: (s.start_line, -s.end_line))
+            for sym in symbols:
+                self._by_name.setdefault(sym.name, []).append(sym)
 
         edges = await self._session.execute(
             select(
@@ -199,6 +202,21 @@ class RepoIndex:
         ):
             return following
         return containing
+
+    def symbol_named(self, expression: str) -> IndexedSymbol | None:
+        """The one symbol *expression* names in this repo, or None.
+
+        *expression* may be qualified (``OrderHandlers.GetOrder``); the qualifier
+        settles a member name that is ambiguous on its own, which is the common
+        case for the handler shape this exists for (``Endpoint.HandleAsync``).
+        A name that still resolves to more than one symbol is refused rather
+        than guessed: which one the caller meant would otherwise be decided by
+        index row order.
+        """
+        found = self._by_name.get(expression.rsplit(".", 1)[-1], ())
+        if len(found) > 1 and "." in expression:
+            found = [s for s in found if s.qualified_name.endswith(expression)]
+        return found[0] if len(found) == 1 else None
 
     def external_import_edges(self) -> list[ExternalImport]:
         """Every ``imports`` edge leaving the repo, with the names it consumes."""
