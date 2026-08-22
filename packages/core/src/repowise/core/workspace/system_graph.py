@@ -68,6 +68,9 @@ _CONTRACT_TYPE_TO_EDGE_KIND: dict[str, str] = {
     "socket": "socket",
     "topic": "event",
     "data": "db",
+    # A package boundary is exactly what the existing "package" kind means,
+    # so the graph, the conformance rules and the map need no new taxonomy.
+    "code": "package",
 }
 
 #: All edge kinds the graph can carry. ``db`` carries the shared-table
@@ -332,7 +335,10 @@ class _GraphBuilder:
         for e in edges:
             endpoints.add(e.source)
             endpoints.add(e.target)
-            if e.structural and e.kind != "package":
+            # A `package` edge is a manifest dependency, which says nothing
+            # about whether a contract was consumed — unless a `code` contract
+            # link built it, which `contract_refs` is what distinguishes.
+            if e.structural and (e.kind != "package" or e.contract_refs):
                 contract_targets.add(e.target)
                 contract_sources.add(e.source)
 
