@@ -24,6 +24,7 @@ from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.server.mcp_server._budget import OmissionCollector, fit_to_budget
 from repowise.server.mcp_server._helpers import (
     _get_repo,
+    _is_workspace_mode,
     _resolve_repo_context,
     _unsupported_repo_all,
 )
@@ -38,12 +39,20 @@ _IMPACTED_TESTS_LIMIT = 10
 #: per-file blocks in this response stay the same size.
 _PRIOR_FIXES_LIMIT = 10
 
+#: Caps on the cross-repo block. It answers "does this commit cross a repo
+#: boundary", not "list every consumer" — get_blast_radius is the tool for the
+#: full traversal, so both lists stay short and report their own overflow.
+_CROSS_REPO_BREAKING_LIMIT = 5
+_CROSS_REPO_CONSUMER_LIMIT = 10
+
 # Cheapest loss first; the score, its drivers and fix_history's numbers are the
-# answer and never shed.
+# answer and never shed. cross_repo outlives the run-list: a test list is
+# recoverable by running the suite, a broken consumer in another repo is not.
 _SHED_ORDER: tuple[str, ...] = (
     "exclude_patterns",
     "prior_fixes",
     "impacted_tests",
+    "cross_repo",
     "fix_history.files",
 )
 
@@ -58,24 +67,26 @@ async def get_change_risk(
 ) -> dict:
     """Score a live commit, ``base..head`` range, or uncommitted work.
 
-    Use this for a pre-merge read on a commit or PR range. Distinct from
-    ``get_risk``, which scores indexed files and PR blast radius. The filters
-    below also apply to the percentile baseline.
+    For a pre-merge read on a commit or PR range; ``get_risk`` scores indexed
+    files instead. The filters also apply to the percentile baseline.
 
-    Lead with ``fix_history``: the recency-weighted bug-fix record of the files
-    touched, ``files`` naming where the pressure sits. It separates a surgical
-    edit to a bug magnet from a bulk rename of files that never break. ``score`` measures diff size and spread, not where the change lands
-    (see ``score_measures``); calibrated per commit, so a PR-sized change reads
-    high by construction. ``risk_percentile`` ranks that shape against recent
+    Lead with ``fix_history``: the recency-weighted bug-fix record of the
+    touched files, ``files`` naming where the pressure sits. It separates a
+    surgical edit to a bug magnet from a bulk rename. ``score`` measures diff
+    size and spread, not where the change lands (see ``score_measures``),
+    calibrated per commit; ``risk_percentile`` ranks that shape against recent
     commits.
 
-    ``impacted_tests.tests_to_run`` names the tests for this change;
-    ``missing_tests`` the uncovered lines. ``basis``: ``measured`` = a coverage
-    map proves those tests run the changed *lines*; ``inferred`` = test files
-    the graph shows reaching it (candidates, file-level). No map is never
-    "untested": ``no_map`` means run the suite. On ``truncated``, expand
+    ``impacted_tests.tests_to_run`` names the tests to run; ``missing_tests``
+    the uncovered lines. ``basis``: ``measured`` = a coverage map proves those
+    tests run the changed *lines*; ``inferred`` = test files the graph shows
+    reaching it (file-level candidates). No map is never "untested":
+    ``no_map`` means run the suite. On ``truncated``, expand
     ``omission_marker`` for the tail. ``prior_fixes``
     counts past fixes whose lines overlap this diff.
+
+    ``cross_repo`` (workspace mode) names other repos' consumers of the changed
+    files and what broke, as of the last workspace update.
 
     Args:
         revspec: Commit or ``base..head`` range to score. Omit it to score the
@@ -115,11 +126,12 @@ async def get_change_risk(
     # extensions + riskignore + request excludes), so nothing downstream
     # disagrees with the score about which files the change touches. Read once
     # and shared: both blocks below need it and git is the expensive part.
-    # Skipped entirely without an index, because neither block can say anything
-    # then and the git call is the expensive half of this response.
+    # The test and fix blocks need the index; the cross-repo block needs only
+    # workspace contracts, so an unindexed member still gets one rather than
+    # going silently blind. Nothing else pays the git call.
     changed: dict[str, set[int]] = {}
     changed_error: tuple[str, str] | None = None
-    if getattr(ctx, "session_factory", None) is not None:
+    if getattr(ctx, "session_factory", None) is not None or _has_contract_data():
         changed, changed_error = await _changed_in_scope(
             str(ctx.path),
             revspec,
@@ -134,6 +146,9 @@ async def get_change_risk(
     prior_fixes = await _prior_fixes_block(ctx, changed)
     if prior_fixes is not None:
         payload["prior_fixes"] = prior_fixes
+    cross_repo = _cross_repo_block(getattr(ctx, "alias", ""), sorted(changed))
+    if cross_repo is not None:
+        payload["cross_repo"] = cross_repo
     # source: live_git marks that the *score* is computed from the working
     # checkout's git. The two blocks above are index-backed, so the freshness
     # fields do apply to them, scoped to the change's files. None (not []) when
@@ -205,6 +220,142 @@ def _filter_changed(
             continue
         out[path] = lines
     return out
+
+
+def _has_contract_data() -> bool:
+    """Whether workspace contracts are loaded, so the cross-repo block can speak."""
+    from repowise.server.mcp_server import _state
+
+    if not _is_workspace_mode():
+        return False
+    enricher = _state._cross_repo_enricher
+    return bool(enricher is not None and getattr(enricher, "has_contract_data", False))
+
+
+def _cross_repo_block(alias: str, changed_files: list[str]) -> dict[str, Any] | None:
+    """What this commit does to consumers in other repos, or ``None``.
+
+    A commit that changes a published signature is the same class of fact as
+    its fix history, so it belongs beside it. Two sources, both from the last
+    ``repowise update --workspace``: the contract links whose provider file this
+    commit touched (who calls it), and the breaking-change report entries
+    attributed to those same files (what broke). ``None`` outside workspace
+    mode, without artifacts, or when the commit touches no published file, so
+    the block never appears just to say nothing. Never raises.
+    """
+    try:
+        from repowise.server.mcp_server import _state
+
+        if not changed_files or not _is_workspace_mode():
+            return None
+        enricher = _state._cross_repo_enricher
+        if enricher is None or not getattr(enricher, "has_contract_data", False):
+            return None
+
+        touched = set(changed_files)
+        consumers: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for path in changed_files:
+            for link in enricher.get_contract_links_as_provider(alias, path):
+                if link.get("consumer_repo") == alias:
+                    continue
+                # Keyed by contract too: collapsing loses a contract_id.
+                key = (
+                    link.get("consumer_repo") or "",
+                    link.get("consumer_file") or "",
+                    link.get("contract_id") or "",
+                    path,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                consumers.append(
+                    {
+                        "provider_file": path,
+                        "repo": link.get("consumer_repo"),
+                        "file": link.get("consumer_file"),
+                        "contract_id": link.get("contract_id"),
+                        "contract_type": link.get("contract_type"),
+                        "match_type": link.get("match_type"),
+                        **(
+                            {"provider_symbol_id": psid}
+                            if (psid := link.get("provider_symbol_id"))
+                            else {}
+                        ),
+                        **(
+                            {"symbol_id": sid}
+                            if (sid := link.get("consumer_symbol_id"))
+                            else {}
+                        ),
+                    }
+                )
+
+        breaking: list[dict[str, Any]] = []
+        breaking_total = 0
+        has_breaking_report = bool(getattr(enricher, "has_breaking_changes", False))
+        if has_breaking_report:
+            for change in enricher.get_breaking_changes_for_repo(alias):
+                if change.get("provider_file") not in touched:
+                    continue
+                cross = [
+                    c for c in change.get("impacted_consumers", []) if c.get("repo") != alias
+                ]
+                if not cross:
+                    continue
+                breaking_total += 1
+                if len(breaking) >= _CROSS_REPO_BREAKING_LIMIT:
+                    continue
+                breaking.append(
+                    {
+                        "contract_id": change.get("contract_id"),
+                        "type": change.get("contract_type"),
+                        "kind": change.get("kind"),
+                        "severity": change.get("severity"),
+                        "detail": change.get("detail"),
+                        "provider_file": change.get("provider_file"),
+                        "impacted_repos": sorted({c.get("repo") or "" for c in cross}),
+                        **(
+                            {"provider_symbol_id": psid}
+                            if (psid := change.get("provider_symbol_id"))
+                            else {}
+                        ),
+                    }
+                )
+
+        if not consumers and not breaking:
+            return None
+        report = enricher.get_breaking_changes() or {}
+        # A removed endpoint has no current link, so its repos survive only on
+        # the breaking side.
+        repos = sorted(
+            {c["repo"] for c in consumers if c.get("repo")}
+            | {r for b in breaking for r in b["impacted_repos"] if r}
+        )
+        summary = (
+            f"{len(consumers)} consumer link(s) in {len(repos)} other repo(s) touch the "
+            f"files this change edits"
+        )
+        if breaking_total:
+            summary += f"; {breaking_total} of the changed contracts broke them."
+        elif has_breaking_report:
+            summary += "; the last workspace update found no break in them."
+        else:
+            summary += "; no breaking-change report has been built for them."
+        return {
+            "consumers": consumers[:_CROSS_REPO_CONSUMER_LIMIT],
+            "consumers_truncated": max(0, len(consumers) - _CROSS_REPO_CONSUMER_LIMIT),
+            "consumer_repos": repos,
+            "breaking_changes": breaking,
+            "breaking_changes_truncated": breaking_total - len(breaking),
+            # False = no detection pass ran, so the empty list is silence.
+            "breaking_changes_available": has_breaking_report,
+            # Stamps the breaking half only; the consumer list comes from the
+            # contract artifact, which carries no exposed stamp.
+            "breaking_changes_as_of": report.get("generated_at") or None,
+            "summary": summary,
+        }
+    except Exception:
+        return None
 
 
 def _empty_impacted(status: str, summary: str) -> dict[str, Any]:
