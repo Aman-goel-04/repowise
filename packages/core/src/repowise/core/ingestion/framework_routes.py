@@ -36,6 +36,10 @@ class RouteMatch:
     handler: str | None  # handler argument, when the shape names one identifier
     offset: int  # match start, for line and nearest-prefix lookups
     paren_offset: int  # the '(' opening the call, for an argument scan
+    #: The handler expression is itself invoked (``api.RequireSession(h)``), so
+    #: it names a wrapper. The graph consumer still wants the edge to it; the
+    #: contract consumer must not bind a route to its middleware.
+    handler_call: bool = False
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,22 @@ class GroupMatch:
 
 def _opt(value: str | None) -> str | None:
     return value or None
+
+
+def _next_top_level_comma(args: str, *, hash_comments: bool = False) -> int:
+    """Index just past the first comma separating *args*, or -1."""
+    for i, c, depth in scan_code(args, hash_comments=hash_comments):
+        if c == "," and depth == 0:
+            return i + 1
+    return -1
+
+
+def _groups(pattern: re.Pattern[str], content: str) -> Iterator[GroupMatch]:
+    """Every ``var``/``parent``/``prefix`` match of *pattern* in *content*."""
+    for m in pattern.finditer(content):
+        yield GroupMatch(
+            var=m.group("var"), parent=_opt(m.group("parent")), prefix=m.group("prefix")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -102,10 +122,7 @@ def aspnet_routes(content: str) -> Iterator[RouteMatch]:
 
 def aspnet_groups(content: str) -> Iterator[GroupMatch]:
     """``MapGroup`` prefix bindings in *content*."""
-    for m in _ASPNET_GROUP_RE.finditer(content):
-        yield GroupMatch(
-            var=m.group("var"), parent=_opt(m.group("parent")), prefix=m.group("prefix")
-        )
+    return _groups(_ASPNET_GROUP_RE, content)
 
 
 # ---------------------------------------------------------------------------
@@ -144,3 +161,220 @@ def express_routes(content: str) -> Iterator[RouteMatch]:
             offset=m.start(),
             paren_offset=m.start("paren"),
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared scanning
+# ---------------------------------------------------------------------------
+
+
+def scan_code(
+    text: str, start: int = 0, *, quotes: str = "\"'`", hash_comments: bool = False
+) -> Iterator[tuple[int, str, int]]:
+    """``(index, char, paren_depth)`` over *text*, skipping strings and comments.
+
+    Route calls run across lines and carry commented-out arguments, so a scanner
+    that reads a comment as code is worse than one that reads a line: an
+    apostrophe in ``// won't work`` opens a string that never closes.
+
+    *quotes* is what opens a string literal — Rust must pass ``'"'``, because its
+    ``'`` is a lifetime. *hash_comments* adds PHP's ``#``, excluding the ``#[``
+    of an attribute.
+    """
+    depth = 0
+    i, n = start, len(text)
+    while i < n:
+        c = text[i]
+        if c in quotes:
+            i += 1
+            while i < n and text[i] != c:
+                i += 2 if text[i] == "\\" else 1
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            i = text.find("\n", i)
+            if i == -1:
+                return
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            if end == -1:
+                return
+            i = end + 2
+            continue
+        if hash_comments and c == "#" and text[i + 1 : i + 2] != "[":
+            i = text.find("\n", i)
+            if i == -1:
+                return
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        yield i, c, depth
+        i += 1
+
+
+def match_paren(
+    text: str, open_idx: int, *, quotes: str = "\"'`", hash_comments: bool = False
+) -> int:
+    """Index of the ``)`` closing the ``(`` at *open_idx*, or -1."""
+    for i, c, depth in scan_code(text, open_idx, quotes=quotes, hash_comments=hash_comments):
+        if c == ")" and depth == 0:
+            return i
+    return -1
+
+
+# ---------------------------------------------------------------------------
+# Go — gin / echo / chi routers and stdlib net/http
+# ---------------------------------------------------------------------------
+
+# `HandleFunc` precedes `Handle` so the longer name wins the alternation.
+_GO_VERBS = "GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD|Any|HandleFunc|Handle"
+
+# r.GET("/users", GetUsers). The receiver may be empty on an inline chain. The
+# handler may be wrapped (`api.RequireSession(h)`) or a composite literal
+# (`healthHandler{}`). The two keywords that can open one are excluded: they name
+# no symbol, and `r.GET("/x", func(c *gin.Context) {...})` otherwise yields the
+# handler `func`.
+_GO_ROUTE_RE = re.compile(
+    rf"(?P<receiver>\w*)\s*\.\s*(?P<verb>{_GO_VERBS})\s*(?P<paren>\()"
+    r"""\s*(?P<q>["'])(?P<path>[^"']*)(?P=q)"""
+    r"(?:\s*,\s*(?P<handler>(?!(?:func|struct)\b)[A-Za-z_][\w.]*)\s*(?P<after>[,)({]))?"
+)
+
+# api := r.Group("/v1") — groups nest, so the parent is captured for transitive
+# composition by `mounts.group_prefixes`.
+_GO_GROUP_RE = re.compile(
+    r"""(?P<var>\w+)\s*:?=\s*(?P<parent>\w+)\s*\.\s*Group\s*\(\s*["'](?P<prefix>[^"']+)["']"""
+)
+
+
+def go_routes(content: str) -> Iterator[RouteMatch]:
+    """Router and ``net/http`` handler registrations in *content*."""
+    for m in _GO_ROUTE_RE.finditer(content):
+        yield RouteMatch(
+            verb=m.group("verb").upper(),
+            path=m.group("path"),
+            receiver=_opt(m.group("receiver")),
+            handler=m.group("handler"),
+            offset=m.start(),
+            paren_offset=m.start("paren"),
+            handler_call=m.group("after") == "(",
+        )
+
+
+def go_groups(content: str) -> Iterator[GroupMatch]:
+    """``Group`` prefix bindings in *content*."""
+    return _groups(_GO_GROUP_RE, content)
+
+
+# ---------------------------------------------------------------------------
+# Laravel
+# ---------------------------------------------------------------------------
+
+# `resource`/`apiResource`/`any`/`match` name no single verb; the contract
+# consumer drops them, the graph consumer wants their controller.
+_LARAVEL_VERBS = "get|post|put|patch|delete|any|match|resource|apiResource"
+
+_LARAVEL_CALL_RE = re.compile(
+    rf"Route::(?P<verb>{_LARAVEL_VERBS})\s*(?P<paren>\()", re.IGNORECASE
+)
+
+# The path literal, when the first argument is one. It often is not:
+# `Route::post('/hook/'.config('x'), ...)` truncates to the literal head, which
+# is what the matcher this replaces recorded too.
+_LARAVEL_PATH_RE = re.compile(r"""\s*(?P<q>["'])(?P<path>[^"']*)(?P=q)""")
+
+# Three handler spellings co-exist: the array form, the legacy
+# 'Controller@method' string, and the bare `Controller::class` of a resource
+# route. The array branch is first so `[C::class, 'm']` is not read as bare.
+_LARAVEL_HANDLER_RE = re.compile(
+    r"\[\s*(?P<array>[\w\\]+)\s*::\s*class"
+    r"""|["'](?P<legacy>[\w\\]+)@\w+["']"""
+    r"|(?P<cls>[\w\\]+)\s*::\s*class"
+)
+
+
+def laravel_routes(content: str) -> Iterator[RouteMatch]:
+    """``Route::verb(...)`` registrations in *content*.
+
+    The arguments are delimited by the call's own parens: a route's path is
+    routinely a concatenation containing a call of its own, which a scan to the
+    next comma reads wrongly and a scan to the next paren stops short of.
+
+    ``handler`` is the controller class only; the member name the array form
+    also carries is dropped, since the graph consumer links to the class's file.
+    """
+    for m in _LARAVEL_CALL_RE.finditer(content):
+        close = match_paren(content, m.start("paren"), hash_comments=True)
+        if close == -1:
+            continue
+        args = content[m.end() : close]
+        path = _LARAVEL_PATH_RE.match(args)
+        # Only past the first top-level comma: the path expression can itself
+        # contain `X::class` or a quoted 'word@word', neither of which is the
+        # handler (`Route::get(trans('Contact@us'), [PageController::class, ...])`).
+        second = _next_top_level_comma(args, hash_comments=True)
+        handler = _LARAVEL_HANDLER_RE.search(args, second) if second != -1 else None
+        yield RouteMatch(
+            verb=m.group("verb").upper(),
+            path=path.group("path") or None if path else None,
+            receiver=None,
+            handler=(
+                handler.group("array") or handler.group("legacy") or handler.group("cls")
+                if handler
+                else None
+            ),
+            offset=m.start(),
+            paren_offset=m.start("paren"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Rust — axum
+# ---------------------------------------------------------------------------
+
+# The head of `.route("/path", <method router>)`.
+_AXUM_ROUTE_HEAD_RE = re.compile(
+    r"""\.\s*route\s*(?P<paren>\()\s*(?P<q>["'])(?P<path>[^"']+)(?P=q)\s*,"""
+)
+
+# A verb inside the method-router argument. `on` names no literal verb
+# (`on(MethodFilter::GET, h)`); the contract consumer drops it. Requiring the
+# closing paren is what makes a `get(|| async {...})` closure yield no handler.
+_AXUM_METHOD_RE = re.compile(
+    r"\b(?P<verb>get|post|put|delete|patch|head|options|trace|on)\s*\("
+    r"\s*(?:(?P<handler>[\w:]+)\s*\))?"
+)
+
+
+def axum_routes(content: str) -> Iterator[RouteMatch]:
+    """Axum ``.route(...)`` registrations in *content*, one per verb.
+
+    A method router chains verbs (``get(list).post(create)``), so one call site
+    yields several matches sharing a path and an offset. The verb scan is bounded
+    by the route call's own parens, so a multi-line route is still read.
+    """
+    for head in _AXUM_ROUTE_HEAD_RE.finditer(content):
+        close = match_paren(content, head.start("paren"), quotes='"')
+        if close == -1:
+            continue  # truncated call; scanning to EOF would credit it every verb
+        region = content[head.end() : close]
+        # Only verbs the method router itself chains. A verb nested in another
+        # call's arguments is not one: `get(h).with_state(state.options())`
+        # would otherwise fabricate an OPTIONS route.
+        for i, _c, depth in scan_code(region, quotes='"'):
+            if depth != 0:
+                continue
+            m = _AXUM_METHOD_RE.match(region, i)
+            if m is None:
+                continue
+            yield RouteMatch(
+                verb=m.group("verb").upper(),
+                path=head.group("path"),
+                receiver=None,
+                handler=m.group("handler"),
+                offset=head.start(),
+                paren_offset=head.start("paren"),
+            )
