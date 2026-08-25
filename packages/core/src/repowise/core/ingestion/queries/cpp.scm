@@ -237,6 +237,25 @@
   arguments: (argument_list) @call.arguments
 ) @call.site
 
+; The same call once more, for a three-part qualifier: ns::util::fn(args).
+; The grammar nests qualified_identifier left-recursively (see the two-level
+; qualified function definition above), so the outer node's name field is
+; itself a qualified_identifier rather than an identifier, neither pattern
+; above can match it, and no call site was produced at all for this shape
+; (#1918). Capturing the innermost identifier as the target and its adjacent
+; scope as the qualifier mirrors how a two-part call is already captured;
+; the deeper namespace prefix (ns) is dropped the same way the class-name
+; extractor already drops it for definitions.
+(call_expression
+  function: (qualified_identifier
+    name: (qualified_identifier
+      scope: (namespace_identifier) @call.scope
+      name: (identifier) @call.target
+    )
+  )
+  arguments: (argument_list) @call.arguments
+) @call.site
+
 ; Chained call: obj.method1().method2(args)
 (call_expression
   function: (field_expression
