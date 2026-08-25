@@ -438,21 +438,38 @@ async def test_get_risk_names_an_unknown_include_rather_than_applying_it(setup_m
     result = await get_risk(["src/auth/service.py"], include=["graph", "nonsense"])
     assert "impact_surface" in result["targets"]["src/auth/service.py"]
     assert result["ignored_arguments"] == [
-        {"argument": "include", "values": ["nonsense"], "valid": ["churn", "graph"]}
+        {"argument": "include", "values": ["nonsense"], "valid": ["churn", "graph", "scales"]}
     ]
 
 
 @pytest.mark.asyncio
 async def test_get_risk_directive_does_not_copy_the_analyzer_score(setup_mcp):
-    """overall_risk_score lives in pr_blast_radius, with a note on its scale."""
+    """The structural heuristic lives in blast detail, not the directive."""
     from repowise.server.mcp_server import get_risk
 
     result = await get_risk(["src/auth/service.py"], changed_files=["src/auth/service.py"])
 
     assert "overall_risk_score" not in result["directive"]
     blast = result["pr_blast_radius"]
-    assert "overall_risk_score" in blast
-    assert "get_change_risk.score" in blast["overall_risk_score_measures"]
+    assert blast["overall_risk_score"] == blast["structural_impact_score"]
+    assert blast["overall_risk_score_compatibility"] == {
+        "deprecated": True,
+        "replacement": "structural_impact_score",
+        "equivalent_value": True,
+        "historical_meaning": "uncalibrated 0-10 structural blast-radius heuristic",
+    }
+    scale = blast["structural_impact_scale"]
+    assert scale["calibration"]["status"] == "uncalibrated"
+    assert scale["runtime_breakage_probability"] is False
+    # Guard tier by default; the reference tier follows the caller's include.
+    assert "component_fields" not in scale
+    assert "risk_scales" not in result
+
+    expanded = await get_risk(
+        ["src/auth/service.py"], changed_files=["src/auth/service.py"], include=["scales"]
+    )
+    assert expanded["risk_scales"][0]["field"] == "targets.*.hotspot_score"
+    assert expanded["pr_blast_radius"]["structural_impact_scale"]["component_fields"]
 
 
 @pytest.mark.asyncio
