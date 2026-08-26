@@ -6,22 +6,31 @@ several commits.  The compact ``evidence_refs`` objects emitted here therefore
 describe only the supporting evidence coordinates; decision ids, statuses and
 lineage remain untouched.
 
-The helpers are presentation-only.  They do not merge persisted records, use
-text similarity, or introduce another response registry that budgeting could
-leave dangling.
+The helpers do not merge persisted records or use text similarity. Evidence
+objects are also written to the repo-local sidecar so another server worker can
+resolve a just-emitted live or historical reference without scanning Git or
+source files.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import copy
 import json
-import posixpath
 import re
+import sqlite3
 import subprocess
+import threading
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
+
+from repowise.server.mcp_server._references import (
+    _content_id,
+    _path_identity,
+    _reference,
+)
 
 ProvenanceKind = Literal[
     "human_decision",
@@ -40,6 +49,106 @@ _HISTORICAL_SOURCES = frozenset(
 )
 _INFERRED_SOURCES = frozenset({"inferred", "semantic"})
 _FULL_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
+_REFERENCE_CACHE_LIMIT = 4096
+_reference_cache: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+_reference_cache_lock = threading.Lock()
+
+
+def _remember_evidence_references(value: object) -> None:
+    if isinstance(value, Mapping):
+        identifier = value.get("id")
+        repository = value.get("repository")
+        if (
+            isinstance(identifier, str)
+            and identifier.startswith("ev_")
+            and isinstance(repository, str)
+        ):
+            key = (repository, identifier)
+            with _reference_cache_lock:
+                _reference_cache[key] = copy.deepcopy(dict(value))
+                _reference_cache.move_to_end(key)
+                while len(_reference_cache) > _REFERENCE_CACHE_LIMIT:
+                    _reference_cache.popitem(last=False)
+        for child in value.values():
+            _remember_evidence_references(child)
+    elif isinstance(value, list):
+        for child in value:
+            _remember_evidence_references(child)
+
+
+def resolve_cached_evidence_reference(
+    repository: str, reference_id: str
+) -> dict[str, Any] | None:
+    """Return an exact evidence object emitted by this server process."""
+
+    key = (repository, reference_id)
+    with _reference_cache_lock:
+        cached = _reference_cache.get(key)
+        if cached is None:
+            return None
+        _reference_cache.move_to_end(key)
+        return copy.deepcopy(cached)
+
+
+def _persist_evidence_references(value: object, repo_root: str | Path) -> bool:
+    from repowise.core.distill.store import OmissionStore
+
+    references: dict[str, dict[str, Any]] = {}
+
+    def collect(child: object) -> None:
+        if isinstance(child, Mapping):
+            identifier = child.get("id")
+            repository = child.get("repository")
+            if (
+                isinstance(identifier, str)
+                and identifier.startswith("ev_")
+                and isinstance(repository, str)
+            ):
+                references[identifier] = dict(child)
+            for nested in child.values():
+                collect(nested)
+        elif isinstance(child, list):
+            for nested in child:
+                collect(nested)
+
+    collect(value)
+    if not references:
+        return True
+    try:
+        with OmissionStore.open_default(Path(repo_root)) as store:
+            for identifier, reference_value in references.items():
+                store.put_evidence_reference(
+                    identifier,
+                    json.dumps(reference_value, sort_keys=True, separators=(",", ":")),
+                    repository=str(reference_value["repository"]),
+                )
+    except (OSError, sqlite3.Error):
+        return False
+    return True
+
+
+def resolve_persisted_evidence_reference(
+    repository: str, reference_id: str, repo_root: str | Path
+) -> dict[str, Any] | None:
+    """Resolve an exact evidence object emitted by this or another worker."""
+
+    from repowise.core.distill.store import OmissionStore, default_store_path
+
+    db_path = default_store_path(Path(repo_root))
+    if not db_path.exists():
+        return None
+    try:
+        with OmissionStore(db_path) as store:
+            row = store.get_evidence_reference(reference_id)
+    except (OSError, sqlite3.Error):
+        return None
+    if row is None or row["repository"] != repository:
+        return None
+    try:
+        value = json.loads(row["content"])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def provenance_for_source(source: str | None) -> ProvenanceKind:
@@ -55,32 +164,6 @@ def provenance_for_source(source: str | None) -> ProvenanceKind:
     if normalized in _INFERRED_SOURCES:
         return "inferred"
     return "unknown"
-
-
-def _repository_identity(repository: str) -> str:
-    return repository.strip().replace("\\", "/").strip("/").casefold()
-
-
-def _path_identity(path: str) -> str:
-    normalized = posixpath.normpath(path.strip().replace("\\", "/"))
-    return normalized.removeprefix("./")
-
-
-def _content_id(value: object) -> str:
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
-
-
-def _reference(kind: str, repository: str, **coordinates: object) -> dict[str, Any]:
-    identity = {
-        "repository": _repository_identity(repository),
-        "kind": kind,
-        **coordinates,
-    }
-    return {
-        "id": f"ev_{_content_id(identity)}",
-        **identity,
-    }
 
 
 def _commit_value(value: object) -> str:
@@ -218,6 +301,8 @@ def decision_evidence_refs(
             )
             ref["provenance"] = "historical"
             ref["source"] = source
+            ref["source_kind"] = source or "commit"
+            ref["verification_basis"] = "historical"
             refs.append(ref)
         evidence_file = getattr(evidence, "evidence_file", None)
         if evidence_file:
@@ -253,6 +338,8 @@ def decision_evidence_refs(
                 )
             ref["provenance"] = provenance_for_source(source)
             ref["source"] = source
+            ref["source_kind"] = source or "unknown"
+            ref["verification_basis"] = "indexed"
             if verification:
                 ref["verification"] = verification
             refs.append(ref)
@@ -264,6 +351,8 @@ def decision_evidence_refs(
         )
         ref["provenance"] = provenance_for_source(getattr(record, "source", None))
         ref["source"] = getattr(record, "source", None)
+        ref["source_kind"] = getattr(record, "source", None) or "unknown"
+        ref["verification_basis"] = "indexed"
         refs.append(ref)
     unique: dict[tuple[str, object, object], dict[str, Any]] = {}
     for ref in refs:
@@ -367,6 +456,8 @@ def _annotate_commit_row(
         )
     ref["provenance"] = "historical"
     ref["source"] = channel
+    ref["source_kind"] = channel
+    ref["verification_basis"] = "historical"
     row["evidence_refs"] = [ref]
 
 
@@ -408,6 +499,7 @@ def annotate_response_evidence(
     records: Iterable[Any] = (),
     *,
     resolved_commits: Mapping[str, str] | None = None,
+    repo_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Add self-resolving evidence refs and provenance to every ``get_why`` lane."""
 
@@ -488,10 +580,15 @@ def annotate_response_evidence(
         ]
         row["evidence_refs"][0]["provenance"] = "extracted_rationale"
         row["evidence_refs"][0]["source"] = "live_code_rationale"
+        row["evidence_refs"][0]["source_kind"] = "code_comment"
         row["evidence_refs"][0]["verification"] = "exact"
+        row["evidence_refs"][0]["verification_basis"] = "live"
     for row in result.get("episodes") or []:
         if isinstance(row, dict):
             _annotate_commit_row(row, repository, resolved_commits, channel="episode")
+    _remember_evidence_references(result)
+    if repo_root is not None:
+        _persist_evidence_references(result, repo_root)
     return result
 
 
@@ -508,9 +605,21 @@ async def annotate_response_evidence_async(
     resolved = await asyncio.to_thread(
         _resolved_commits, result, record_list, repo_root
     )
-    return annotate_response_evidence(
-        result, repository, record_list, resolved_commits=resolved
+    annotated = annotate_response_evidence(
+        result,
+        repository,
+        record_list,
+        resolved_commits=resolved,
     )
+    persisted = await asyncio.to_thread(
+        _persist_evidence_references, annotated, repo_root
+    )
+    if not persisted:
+        annotated.setdefault("_meta", {})["reference_persistence"] = {
+            "available": False,
+            "reason": "repo-local evidence sidecar could not be written",
+        }
+    return annotated
 
 
 def _annotate_archaeology(
