@@ -82,6 +82,23 @@ async def test_dashboard_zero_limit_has_exact_ranked_page_recovery(setup_mcp, he
 
 
 @pytest.mark.asyncio
+async def test_cursor_beyond_end_offers_one_call_reset(setup_mcp, health_data):
+    from repowise.server.mcp_server import get_health
+
+    result = await get_health(
+        targets=["module:auth"], only=["metrics"], limit=1, cursor=99
+    )
+
+    assert result["metrics"] == []
+    assert result["metrics_total"] == 1
+    recovery = result["recovery"]["metrics"]
+    assert recovery["remaining"] == 1
+    assert "only=['metrics']" in recovery["call"]
+    assert "cursor=0" in recovery["call"]
+    assert "limit=1" in recovery["call"]
+
+
+@pytest.mark.asyncio
 async def test_get_health_dashboard_surfaces_maintainability(setup_mcp, health_data):
     """The maintainability pillar is surfaced as a co-equal second signal."""
     from repowise.server.mcp_server import get_health
@@ -196,6 +213,44 @@ async def _seed_plans(session, rid, plans):
         ],
     )
     await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_entity_recovery_retains_health_semantics_and_freshness(
+    setup_mcp, health_data, session
+):
+    from repowise.server.mcp_server import get_health
+
+    finding = (await get_health(only=["top_findings"], limit=1))["top_findings"][0]
+    finding_detail = await get_health(finding_id=finding["id"])
+    assert finding_detail["finding"] == finding
+    assert finding_detail["_meta"]["health_semantics"]
+    assert finding_detail["_meta"]["health_analysis"]["recomputed_this_call"] is False
+
+    await _seed_plans(
+        session,
+        health_data,
+        [
+            {
+                "file_path": "src/auth/service.py",
+                "impact_delta": 1.2,
+                "source_biomarker": "complex_method",
+            }
+        ],
+    )
+    plan = (
+        await get_health(
+            targets=["src/auth/service.py"],
+            include=["refactoring"],
+            only=["refactoring_plans"],
+            limit=1,
+        )
+    )["refactoring_plans"][0]
+    plan_detail = await get_health(plan_id=plan["id"])
+    assert plan_detail["plan"]["id"] == plan["id"]
+    assert plan_detail["plan"]["file_path"] == plan["file_path"]
+    assert plan_detail["_meta"]["health_semantics"]
+    assert plan_detail["_meta"]["health_analysis"]["recomputed_this_call"] is False
 
 
 def test_validation_profiles_deduplicate_without_dropping_commands_or_target_tests():
@@ -519,6 +574,12 @@ async def test_get_health_dashboard_leads_with_a_directive(setup_mcp, health_dat
     assert d["fix_first"] == "src/auth/service.py"
     assert d["reason"] == "authenticate has cyclomatic complexity 15"
     assert d["recovers_points"] == 700  # (8.0 - 4.5) * 200
+    assert d["recovers_weighted_deficit_points"] == d["recovers_points"]
+    assert d["recovers_points_compatibility"] == {
+        "deprecated": True,
+        "replacement": "recovers_weighted_deficit_points",
+        "equivalent_value": True,
+    }
     # The only below-target file holds the whole gross deficit (700/700), so
     # the share is 100% by construction — the net gap (675) is not the
     # denominator, since healthy files would cushion it (issue #1437).
@@ -1095,6 +1156,7 @@ async def test_include_names_work_as_only_aliases(setup_mcp, health_data, alias,
     }
     if resolved == "refactoring_plans":
         allowed |= {
+            "refactoring_plans_status",
             "validation_profiles",
             "validation_profiles_total",
             "validation_profiles_emitted",
@@ -1930,6 +1992,106 @@ async def test_meta_omits_the_commit_when_no_row_records_one(setup_mcp, health_d
     meta = (await get_health())["_meta"]
     assert "health_analyzed_commit" not in meta
     assert isinstance(meta["health_analyzed_at"], str)
+    assert meta["health_analysis"]["source"] == "stored_health_analysis"
+    assert meta["health_analysis"]["recomputed_this_call"] is False
+    assert meta["health_analysis"]["live_verification"] == {
+        "basis": "unavailable",
+        "source_bytes_verified": False,
+    }
+    analysis = meta["health_analysis"]
+    assert analysis["status"] == "degraded"
+    assert analysis["reason"] == "analysis_commit_not_recorded"
+    assert analysis["refresh"] == {
+        "command": "repowise update",
+        "precondition": "commit health-relevant working-tree changes first",
+        "required_before_comparison": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_health_semantics_survive_narrow_projection(setup_mcp, health_data):
+    from repowise.server.mcp_server import get_health
+
+    broad = await get_health()
+    narrow = await get_health(only=["directive"])
+    assert narrow["directive"] == broad["directive"]
+    assert narrow["_meta"]["health_semantics"] == broad["_meta"]["health_semantics"]
+    contract = narrow["_meta"]["health_semantics"]["weighted_deficit_points"]
+    assert contract["unit"] == "health_score_points_x_nloc"
+    assert contract["denominator"] == "gap_analysis.weighted_gross_gap_points"
+    assert contract["scale"] == {"minimum": 0, "maximum": None, "normalized": False}
+    assert "not a probability" in contract["interpretation"]
+
+
+@pytest.mark.asyncio
+async def test_requested_empty_plans_explain_real_pipeline_state(setup_mcp, health_data):
+    from repowise.server.mcp_server import get_health
+
+    healthy = await get_health(
+        targets=["src/db/models.py"],
+        include=["refactoring"],
+        only=["metrics", "findings", "refactoring_plans"],
+    )
+    assert healthy["findings_total"] == 0
+    assert healthy["refactoring_plans"] == []
+    assert healthy["refactoring_plans_status"]["reason"] == "no_applicable_findings"
+
+    unsupported = await get_health(
+        targets=["src/auth/service.py"],
+        include=["refactoring"],
+        only=["findings", "refactoring_plans"],
+    )
+    assert unsupported["findings_total"] > 0
+    assert unsupported["refactoring_plans"] == []
+    status = unsupported["refactoring_plans_status"]
+    assert status["state"] == "indeterminate"
+    assert status["reason"] == "plan_analysis_indeterminate"
+    assert status["possible_causes"] == [
+        "no_supported_structured_transformation",
+        "refactoring_detector_disabled_or_failed",
+    ]
+    assert status["next_action"] == {
+        "tool": "get_symbol",
+        "arguments": {"symbol_id": "src/auth/service.py:10-80"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_plan_status_is_omitted_when_projection_did_not_request_plans(
+    setup_mcp, health_data
+):
+    from repowise.server.mcp_server import get_health
+
+    result = await get_health(include=["refactoring"], only=["suggestion_legend"])
+    assert "refactoring_plans" not in result
+    assert "refactoring_plans_status" not in result
+
+
+@pytest.mark.asyncio
+async def test_unresolved_and_missing_analysis_never_read_as_healthy(
+    setup_mcp, populated_db
+):
+    from repowise.server.mcp_server import get_health
+
+    unresolved = await get_health(
+        targets=["does/not/exist.py"],
+        include=["refactoring"],
+        only=["metrics", "refactoring_plans"],
+    )
+    assert unresolved["unresolved"] == [
+        {"target": "does/not/exist.py", "reason": "no_such_path"}
+    ]
+    assert unresolved["refactoring_plans_status"]["reason"] == "no_eligible_targets"
+
+    missing = await get_health(
+        include=["refactoring"],
+        only=["directive", "kpis", "refactoring_plans"],
+    )
+    assert missing["directive"] is None
+    assert missing["kpis"]["average_health"] is None
+    assert missing["kpis"]["analysis_status"] == "unavailable"
+    assert missing["refactoring_plans_status"]["reason"] == "analysis_unavailable"
+    assert missing["_meta"]["health_analysis"]["status"] == "unavailable"
 
 
 def test_only_docstring_does_not_overclaim_the_aliases():
