@@ -38,6 +38,7 @@ from repowise.server.mcp_server._meta import build_meta as _build_meta
 from repowise.server.mcp_server._page_paths import file_candidates, hit_file_path
 from repowise.server.mcp_server._prose_symbols import symbol_backed_pages
 from repowise.server.mcp_server._references import path_identity, symbol_identity
+from repowise.server.mcp_server._retrieval_rank import rerank_by_context_coverage
 from repowise.server.mcp_server.tool_search_symbols import (
     _qual_norm,
     search_paths_single,
@@ -67,6 +68,17 @@ _FRESHNESS_TIEBREAK = 0.03
 _IDENT_QUERY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{1,29}$")
 
 
+def _canonical_symbol_query(query: str) -> tuple[str, str] | None:
+    """Return ``(path, symbol)`` for an exact canonical ``path::Symbol`` query."""
+    stripped = query.strip().replace("\\", "/")
+    if "::" not in stripped:
+        return None
+    path, symbol = stripped.rsplit("::", 1)
+    if not path or not symbol or "/" not in path:
+        return None
+    return path, symbol
+
+
 def _looks_like_exact_token(query: str) -> bool:
     """True when the query is a single identifier-shaped token best served by Grep."""
     stripped = query.strip()
@@ -79,7 +91,9 @@ def _looks_like_exact_token(query: str) -> bool:
 # (≥1 underscore, incl. _UPPER_SNAKE constants) or CamelCase (≥2 humps).
 # Plain English words never match.
 _IDENT_TOKEN_RE = re.compile(
-    r"\b(?:_*[A-Za-z0-9]+_[A-Za-z0-9_]+|[A-Z][a-z][a-z0-9]*(?:[A-Z][a-z0-9]+)+)\b"
+    r"\b(?:_*[A-Za-z0-9]+_[A-Za-z0-9_]+|[A-Z][A-Za-z0-9_]+)"
+    r"(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b"
+    r"|\b(?:_*[A-Za-z0-9]+_[A-Za-z0-9_]+|[A-Z][a-z][a-z0-9]*(?:[A-Z][a-z0-9]+)+)\b"
 )
 
 
@@ -97,10 +111,29 @@ def _identifier_candidates(query: str, mode: str) -> list[str]:
     """
     if mode == "symbol":
         q = query.strip()
-        return [q] if q else []
+        canonical = _canonical_symbol_query(q)
+        return [q, canonical[1]] if canonical else ([q] if q else [])
     if mode == "hybrid":
         return _embedded_identifiers(query)
     return []
+
+
+def _qualified_name_matches(qn: str, wanted: set[str]) -> bool:
+    if not qn:
+        return False
+    if qn in wanted:
+        return True
+    return any("." in candidate and qn.endswith(f".{candidate}") for candidate in wanted)
+
+
+def _symbol_matches_name(item: dict, wanted: set[str]) -> bool:
+    symbol_id = (item.get("symbol_id") or "").strip().lower().replace("\\", "/")
+    if symbol_id and symbol_id in wanted:
+        return True
+    name = (item.get("name") or "").strip().lower()
+    if name and name in wanted:
+        return True
+    return _qualified_name_matches(_qual_norm(item.get("qualified_name")), wanted)
 
 
 def _has_exact_symbol(candidates: list[str], symbols: list[dict]) -> bool:
@@ -115,12 +148,43 @@ def _has_exact_symbol(candidates: list[str], symbols: list[dict]) -> bool:
         return False
     wanted = {c.strip().lower() for c in candidates if c.strip()}
     wanted |= {_qual_norm(c) for c in candidates if c.strip()}
-    for s in symbols:
-        name = (s.get("name") or "").strip().lower()
-        qn = _qual_norm(s.get("qualified_name"))
-        if (name and name in wanted) or (qn and qn in wanted):
-            return True
-    return False
+    return any(_symbol_matches_name(symbol, wanted) for symbol in symbols)
+
+
+def _protect_exact_symbols(query: str, symbols: list[dict]) -> list[dict]:
+    """Stable-partition an exact identifier or ``path::Symbol`` hit to the head."""
+    if not symbols:
+        return symbols
+    canonical = _canonical_symbol_query(query)
+    qnorm = query.strip().lower().replace("\\", "/")
+
+    def exact(item: dict) -> bool:
+        symbol_id = (item.get("symbol_id") or "").lower().replace("\\", "/")
+        if canonical:
+            return symbol_id == qnorm
+        return qnorm in {
+            (item.get("name") or "").lower(),
+            _qual_norm(item.get("qualified_name")),
+        }
+
+    protected = [item for item in symbols if exact(item)]
+    return protected + [item for item in symbols if not exact(item)]
+
+
+def _protect_named_symbols(candidates: list[str], symbols: list[dict]) -> list[dict]:
+    """Stable-partition symbols exactly named by identifiers embedded in prose."""
+    wanted = {candidate.strip().lower() for candidate in candidates if candidate.strip()}
+    wanted |= {_qual_norm(candidate) for candidate in candidates if candidate.strip()}
+
+    protected = [item for item in symbols if _symbol_matches_name(item, wanted)]
+    return protected + [item for item in symbols if not _symbol_matches_name(item, wanted)]
+
+
+def _protect_exact_paths(query: str, files: list[dict]) -> list[dict]:
+    """Stable-partition an exact path hit ahead of basename/fuzzy neighbours."""
+    qnorm = query.strip().lower().replace("\\", "/")
+    protected = [item for item in files if (item.get("file") or "").lower() == qnorm]
+    return protected + [item for item in files if (item.get("file") or "").lower() != qnorm]
 
 
 def _prose_dominates(query: str, identifiers: list[str]) -> bool:
@@ -535,6 +599,15 @@ def _drop_derivable_page_ids(results: list[dict]) -> list[dict]:
     return results
 
 
+def _drop_internal_ranking_fields(results: list[dict]) -> None:
+    """Keep calibration diagnostics internal to the ranking pipeline."""
+    for item in results:
+        item.pop("_coverage", None)
+        item.pop("_coverage_multiplier", None)
+        item.pop("_confidence_score_factor", None)
+        item.pop("_raw_score", None)
+
+
 async def _load_page_info(
     session, output: list[dict], *, with_git: bool = False
 ) -> tuple[dict, set, dict]:
@@ -855,6 +928,8 @@ def _resolve_mode(query: str, mode: str | None) -> str:
         m = "auto"
     if m != "auto":
         return m
+    if _canonical_symbol_query(query):
+        return "symbol"
     if _is_path(query):
         return "path"
     if _looks_like_exact_token(query):
@@ -908,6 +983,9 @@ async def _structured_search(
     # which then never reaches _has_exact_symbol and the response claims the
     # symbol is unindexed. Score symbols on the extracted identifiers instead.
     symbol_query = query
+    canonical_symbol = _canonical_symbol_query(query)
+    if canonical_symbol:
+        symbol_query = canonical_symbol[1]
     if mode == "hybrid":
         _idents = _embedded_identifiers(query)
         if _idents:
@@ -933,11 +1011,17 @@ async def _structured_search(
 
     symbols.sort(key=lambda x: -(x.get("score") or 0.0))
     files.sort(key=lambda x: -(x.get("score") or 0.0))
+    candidates = _identifier_candidates(query, mode)
+    if mode == "symbol":
+        symbols = _protect_exact_symbols(query, symbols)
+    elif mode == "hybrid" and candidates:
+        symbols = _protect_named_symbols(candidates, symbols)
+    if mode == "path":
+        files = _protect_exact_paths(query, files)
 
     # Whether any returned symbol matches the query's identifier(s) exactly.
     # Computed once here so the hybrid interleave and the exact-match note below
     # agree on the same signal.
-    candidates = _identifier_candidates(query, mode)
     exact = _has_exact_symbol(candidates, symbols) if candidates else False
 
     if mode == "symbol":
@@ -1113,6 +1197,12 @@ async def search_codebase(
         # Re-sort by adjusted relevance with retrieval noise (decisions on
         # non-why queries, test pages on non-test queries) hard-demoted, then
         # collapse near-duplicate decisions to one.
+        output = rerank_by_context_coverage(
+            output,
+            query,
+            score_key="relevance_score",
+            floor=0.5,
+        )
         _downweight_test_pages(output, query)
         _sort_demoting_noise(output, query)
         output = _dedup_decisions(output)
@@ -1123,6 +1213,7 @@ async def search_codebase(
     # weakest tail slots. No-op when the symbol leg names nothing new.
     with contextlib.suppress(Exception):
         output = await _append_symbol_backed(ctx, query, output, limit, kind)
+    _drop_internal_ranking_fields(output)
     # The full ranked pool, kept before the caller's cut so ``candidates``
     # below can reach past it. See its comment for why that matters.
     ranked = list(output)
