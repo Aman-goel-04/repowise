@@ -35,6 +35,7 @@ from .c4 import (
     C4SystemResponse,
 )
 from .chat import (
+    ArtifactUpdateRequest,
     ChatMessageResponse,
     ChatRequest,
     ConversationForkRequest,
@@ -237,6 +238,7 @@ __all__ = [
     "ArchitectureGraphResponse",
     "ArchitectureNodeResponse",
     "ArchitectureViewResponse",
+    "ArtifactUpdateRequest",
     "BlastRadiusRequest",
     "BlastRadiusResponse",
     "C4ComponentResponse",
