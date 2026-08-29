@@ -1918,9 +1918,12 @@ class ASTParser:
         for call in calls:
             key = (call.line, call.target_name, call.receiver_name)
             existing = deduplicated.get(key)
-            # Two patterns match a scoped call (one keeps the qualifier, one does
-            # not) and both dedup to this key, so the richer record has to win
-            # whichever order they arrive in.
+            # Two of the three scoped-call patterns can match the same two-part call
+            # (one keeps the qualifier, one does not) and both dedup to this key, so
+            # the richer record has to win whichever order they arrive in. The
+            # three-part pattern (ns::util::fn()) never collides here, it's the
+            # only pattern that can match a nested qualified_identifier, so it
+            # always lands as a fresh key.
             if (
                 existing is None
                 or (existing.receiver_call is None and call.receiver_call is not None)
