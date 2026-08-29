@@ -1,0 +1,143 @@
+"""Typed, language-neutral facts read off one raw performance finding.
+
+Everything downstream works on :class:`ObservationFacts`, never on a row, so
+grouping, actionability, and ranking stay free of the shape a finding arrives
+in: analyzer dataclass, ORM row, or plain dict all reduce here.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any
+
+
+def field(row: Any, name: str, default: Any = None) -> Any:
+    """Read one attribute from a dataclass, an ORM row, or a dict."""
+    if isinstance(row, dict):
+        return row.get(name, default)
+    return getattr(row, name, default)
+
+
+def detail_map(row: Any) -> dict[str, Any]:
+    """The finding's open ``details`` payload, whether stored or in memory."""
+    value = field(row, "details", None)
+    if isinstance(value, dict):
+        return value
+    raw = field(row, "details_json", None)
+    if isinstance(raw, str):
+        try:
+            loaded = json.loads(raw)
+            return loaded if isinstance(loaded, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+    return {}
+
+
+def is_performance(row: Any) -> bool:
+    return field(row, "dimension", None) == "performance"
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationFacts:
+    """One detector-supported cost shape at one location.
+
+    ``details`` stays verbatim: the actionability gates read marker-specific
+    proof keys off it, and closing it into typed fields would drop the keys a
+    new marker adds.
+    """
+
+    finding_id: str
+    file_path: str
+    function_name: Any
+    line_start: Any
+    line_end: Any
+    reason: str
+    raw_marker: Any
+    boundary_kind: str | None
+    path: tuple[str, ...]
+    has_path: bool
+    cross_function: bool
+    resolution_basis: Any
+    reliable_entry_reachability: Any
+    details: dict[str, Any]
+
+    @property
+    def marker(self) -> str:
+        """The identity and ranking view of the biomarker type."""
+        return str(self.raw_marker)
+
+    @property
+    def evidence_marker(self) -> str:
+        """The evidence-row view: a falsy marker renders empty, not ``"None"``."""
+        return str(self.raw_marker or "")
+
+    @property
+    def provenance(self) -> str:
+        return str(self.resolution_basis)
+
+    @property
+    def site(self) -> tuple[str, Any, Any]:
+        return (self.file_path, self.line_start, self.function_name)
+
+    @property
+    def sort_key(self) -> tuple[str, Any, str]:
+        """Deterministic within-group evidence order."""
+        return (self.file_path, self.line_start or 0, str(self.function_name))
+
+
+def observation_facts(row: Any) -> ObservationFacts:
+    details = detail_map(row)
+    raw_path = details.get("path", ())
+    return ObservationFacts(
+        finding_id=str(field(row, "id", "") or ""),
+        file_path=str(field(row, "file_path", "")),
+        function_name=field(row, "function_name", None),
+        line_start=field(row, "line_start", None),
+        line_end=field(row, "line_end", None),
+        reason=str(field(row, "reason", "") or ""),
+        raw_marker=field(row, "biomarker_type", ""),
+        boundary_kind=details.get("boundary_kind") or None,
+        path=tuple(str(node) for node in raw_path if isinstance(node, str)),
+        # Whether a path was offered, which is not whether any of it survived
+        # the string filter above. Both drive real branches.
+        has_path=bool(raw_path),
+        cross_function=bool(details.get("cross_function")),
+        resolution_basis=details.get("resolution_basis", "direct"),
+        reliable_entry_reachability=details.get("reliable_entry_reachability"),
+        details=details,
+    )
+
+
+def performance_facts(rows: list[Any]) -> list[ObservationFacts]:
+    return [observation_facts(row) for row in rows if is_performance(row)]
+
+
+def evidence_row(facts: ObservationFacts) -> dict[str, Any]:
+    """One public evidence entry.
+
+    ``finding_id`` is the storage row id, not a content hash: empty before
+    persistence, a fresh UUID after. It points within one index only.
+    """
+    return {
+        "finding_id": facts.finding_id,
+        "file_path": facts.file_path,
+        "biomarker_type": facts.evidence_marker,
+        "function_name": facts.function_name,
+        "line_start": facts.line_start,
+        "line_end": facts.line_end,
+        "reason": facts.reason,
+        "path": list(facts.details.get("path", ())),
+        "provenance": facts.resolution_basis,
+    }
+
+
+__all__ = [
+    "ObservationFacts",
+    "detail_map",
+    "evidence_row",
+    "field",
+    "is_performance",
+    "observation_facts",
+    "performance_facts",
+]
