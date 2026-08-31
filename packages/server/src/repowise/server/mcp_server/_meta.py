@@ -381,13 +381,20 @@ def finalize_trust_envelope(result: Any, *, evidence_kind: str | None = None) ->
     elif evidence_kind == "generated":
         meta.setdefault("existing_verified_code", False)
 
-    state: dict[str, bool] = {}
+    state: dict[str, Any] = {}
     combined = {**result, **meta}
-    if any(
-        value and (key == "degraded" or key.endswith("_degraded"))
-        for key, value in combined.items()
-    ):
+    # The bool is deliberately coarse. Carry the values behind it, not just the
+    # key names: the producers already hold the answer -- a synthesis reason
+    # string, the list of retrieval legs that broke -- and naming only the key
+    # would discard it.
+    degraded_by = {
+        key: value
+        for key, value in sorted(combined.items())
+        if value and (key == "degraded" or key.endswith("_degraded"))
+    }
+    if degraded_by:
         state["degraded"] = True
+        state["degraded_reasons"] = degraded_by
     if any(
         value and (key == "partial" or key.endswith("_partial")) for key, value in combined.items()
     ):
