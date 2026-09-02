@@ -12,6 +12,7 @@ repowise.core.ingestion.models.Symbol in files that import from both modules.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -33,8 +34,39 @@ def _new_uuid() -> str:
     return uuid4().hex
 
 
+#: The source a decision carries when nothing names one. Shared by the column
+#: default and by the id derivation, which has to agree with it.
+DEFAULT_DECISION_SOURCE = "cli"
+
+
 def _now_utc() -> datetime:
     return datetime.now(UTC)
+
+
+def _derive_decision_id_default(context: Any) -> str:
+    """Derive a ``DecisionRecord`` id from the row being inserted.
+
+    The two callers that build a record explicitly derive the id already. This
+    catches every other construction path, so a record cannot reach the store
+    with a random id merely because it was created somewhere neither covers.
+
+    Imported inside the function because the derivation lives beside the dedupe
+    query it has to agree with, in a module that imports this one. It runs at
+    flush time, by which point both modules are loaded.
+    """
+    from .crud.decisions import derive_decision_id
+
+    params = context.get_current_parameters()
+    # Column defaults are applied in column order and ``id`` comes first, so a
+    # record that left ``source`` to its default has not been given one yet.
+    # This and the column read the same constant, so neither the column order
+    # nor the default's spelling can make them disagree.
+    return derive_decision_id(
+        params["repository_id"],
+        params.get("title") or "",
+        source=params.get("source") or DEFAULT_DECISION_SOURCE,
+        evidence_file=params.get("evidence_file"),
+    )
 
 
 class Base(DeclarativeBase):
@@ -843,7 +875,9 @@ class DecisionRecord(Base):
         ),
     )
 
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_uuid)
+    id: Mapped[str] = mapped_column(
+        String(32), primary_key=True, default=_derive_decision_id_default
+    )
     repository_id: Mapped[str] = mapped_column(
         String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
     )
@@ -870,7 +904,7 @@ class DecisionRecord(Base):
 
     # Provenance
     source: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="cli"
+        String(32), nullable=False, default=DEFAULT_DECISION_SOURCE
     )  # git_archaeology | inline_marker | adr | pr | comment | session | cli
     evidence_file: Mapped[str | None] = mapped_column(Text, nullable=True)
     evidence_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
