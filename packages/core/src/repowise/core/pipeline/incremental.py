@@ -331,6 +331,7 @@ async def rebuild_graph_and_git(
             co_change_sink=co_change_full,
             idle_decay_sink=idle_decay_sink,
             on_warning=log,
+            timings=timings,
         )
         git_meta_map = {m["file_path"]: m for m in updated_meta}
         label_co_change_structure(graph_builder, git_meta_map)
@@ -603,6 +604,31 @@ async def load_stored_coverage_map(
         return {}
 
 
+def _performance_only_config(config: dict | None, performance_only: set[str]) -> dict | None:
+    """Disable every non-performance detector on the closure's files.
+
+    The closure adds files whose call paths reach a changed sink. Only their
+    performance findings survive the filter below; every other detector's
+    output for them is computed and discarded, and on a central helper the
+    closure runs to hundreds of files. The walk still covers them, because the
+    performance detectors read it.
+    """
+    if not performance_only:
+        return config
+    from repowise.core.analysis.health.biomarkers import registered_biomarkers
+    from repowise.core.analysis.health.scoring import dimensions_for
+
+    non_performance = {
+        b.name for b in registered_biomarkers() if "performance" not in dimensions_for(b.name)
+    }
+    out = dict(config or {})
+    per_file = {k: set(v) for k, v in (out.get("per_file_disabled") or {}).items()}
+    for path in performance_only:
+        per_file[path] = per_file.get(path, set()) | non_performance
+    out["per_file_disabled"] = per_file
+    return out
+
+
 def run_partial_analysis(
     repo_path: Any,
     graph_builder: Any,
@@ -699,10 +725,15 @@ def run_partial_analysis(
                 if _hcfg.has_overrides()
                 else None
             )
+            _analyzer_config = _performance_only_config(
+                _analyzer_config, _performance_changed - _health_changed
+            )
             partial_health_report = _health_analyzer.analyze(
                 _analyzer_config,
                 changed_files=_health_scope,
                 repo_function_mod_p80=repo_function_mod_p80,
+                timings=timings,
+                duplication_files=_health_changed,
             )
             # The closure exists only to refresh interprocedural performance.
             # Preserve the historical changed-file scope for every other
@@ -1054,7 +1085,9 @@ async def persist_partial_health(session: Any, repo_id: str, report: Any) -> Non
     await snapshot_health_from_store(session, repo_id)
 
 
-async def persist_incremental_commits(session: Any, repo_id: str, repo_path: Any) -> None:
+async def persist_incremental_commits(
+    session: Any, repo_id: str, repo_path: Any, *, timings: PhaseTimings | None = None
+) -> None:
     """Capture + upsert ``git_commits`` rows for commits new since the last index.
 
     Foundation 1 only populated the per-commit table on the full orchestrator
@@ -1092,14 +1125,17 @@ async def persist_incremental_commits(session: Any, repo_id: str, repo_path: Any
 
         dt = newest if newest.tzinfo is not None else newest.replace(tzinfo=UTC)
         since_ts = int(dt.timestamp())
-    rows = await asyncio.to_thread(indexer.capture_new_commit_rows, since_ts=since_ts)
-    if rows:
-        await upsert_git_commits_bulk(session, repo_id, rows)
+    with timed(timings, "persist.commits.capture"):
+        rows = await asyncio.to_thread(indexer.capture_new_commit_rows, since_ts=since_ts)
+        if rows:
+            await upsert_git_commits_bulk(session, repo_id, rows)
 
-    await reconcile_commit_experience(session, repo_id, indexer)
+    with timed(timings, "persist.commits.experience"):
+        await reconcile_commit_experience(session, repo_id, indexer)
     # Fills the commit-offset column on indexes written before it existed, so a
     # new capture never needs a re-index to become useful.
-    await reconcile_commit_offsets(session, repo_id, indexer)
+    with timed(timings, "persist.commits.offsets"):
+        await reconcile_commit_offsets(session, repo_id, indexer)
 
     # Refresh the repo-level whole-history totals so age / commit / contributor
     # counts keep growing between full re-indexes (#730). Cheap git calls, and
@@ -1108,7 +1144,8 @@ async def persist_incremental_commits(session: Any, repo_id: str, repo_path: Any
     # was stored last time lets it add only the range since, and it re-proves
     # that range is safe to add before doing so.
     prior = _churn_prior(await get_repository(session, repo_id))
-    totals = await asyncio.to_thread(indexer.capture_repo_totals, prior)
+    with timed(timings, "persist.commits.totals"):
+        totals = await asyncio.to_thread(indexer.capture_repo_totals, prior)
     await update_repo_git_totals(
         session,
         repo_id,
@@ -1122,7 +1159,8 @@ async def persist_incremental_commits(session: Any, repo_id: str, repo_path: Any
         churn_anchor_sha=totals.churn_anchor_sha,
     )
 
-    await persist_incremental_fix_events(session, repo_id, indexer)
+    with timed(timings, "persist.commits.fix_events"):
+        await persist_incremental_fix_events(session, repo_id, indexer)
 
 
 def _churn_prior(repo_row: Any) -> Any:
@@ -1589,7 +1627,9 @@ async def persist_incremental_index(
 
                 try:
                     with timed(timings, "persist.commits"):
-                        await persist_incremental_commits(session, repo_id, repo_path)
+                        await persist_incremental_commits(
+                            session, repo_id, repo_path, timings=timings
+                        )
                 except Exception as exc:
                     _skip("Commit capture", exc)
 
@@ -1631,7 +1671,7 @@ async def persist_incremental_index(
                 from repowise.core.pipeline.persist import persist_graph_nodes
 
                 with timed(timings, "persist.graph_nodes"):
-                    await persist_graph_nodes(session, repo_id, graph_builder)
+                    await persist_graph_nodes(session, repo_id, graph_builder, timings=timings)
             except Exception as exc:
                 _skip("Graph nodes persist", exc)
 
