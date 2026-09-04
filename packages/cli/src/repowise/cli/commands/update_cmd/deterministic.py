@@ -20,6 +20,9 @@ from pathlib import Path
 from typing import Any
 
 from repowise.cli.helpers import console, run_async
+from repowise.core.persistence import (
+    load_stale_structural_file_paths as load_stale_structural_file_paths,
+)
 
 
 def deterministic_embedder_name(cfg: dict) -> str:

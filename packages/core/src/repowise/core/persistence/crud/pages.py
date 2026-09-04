@@ -661,6 +661,110 @@ async def get_stale_pages(
     return list(result.scalars().all())
 
 
+#: Page types a scoped ``update`` can re-render for one file. Every other
+#: structural type (cycle, layer, contract, infra) describes the whole
+#: repository and is only written by a full run, so a stale row of those types
+#: is not something an update can clear and must not make it think it can.
+_FILE_SCOPED_PAGE_TYPES = frozenset({"file_page", "symbol_spotlight"})
+
+
+async def get_stale_structural_file_paths(
+    session: AsyncSession,
+    repository_id: str,
+) -> list[str]:
+    """File paths whose file-scoped pages are marked ``stale`` or ``expired``.
+
+    Covers ``file_page`` rows (``target_path`` is the file) and
+    ``symbol_spotlight`` rows (``target_path`` is ``<file>::<symbol>``), which
+    are the two page kinds a scoped ``update`` re-renders for a file. The
+    caller feeds these paths into the same regeneration list the renderer
+    staleness path uses, so an already-stale page is reconciled even when HEAD
+    has not moved.
+    """
+    result = await session.execute(
+        select(Page.target_path).where(
+            Page.repository_id == repository_id,
+            Page.page_type.in_(sorted(_FILE_SCOPED_PAGE_TYPES)),
+            Page.freshness_status.in_(["stale", "expired"]),
+        )
+    )
+    stale_paths: list[str] = []
+    for (target_path,) in result:
+        file_path = (target_path or "").split("::", 1)[0]
+        if file_path:
+            stale_paths.append(file_path)
+    return list(dict.fromkeys(stale_paths))
+
+
+def load_stale_structural_file_paths(repo_path: Any) -> list[str]:
+    """Sync entry point for :func:`_load_stale_structural_file_paths_async`.
+
+    Called from synchronous CLI code and from ``check_repo_staleness``, which
+    the async workspace update calls from inside a running loop. ``asyncio.run``
+    refuses to nest, so that one caller gets its own loop on a worker thread.
+    """
+    import asyncio
+    import concurrent.futures
+    from pathlib import Path
+
+    path_obj = Path(repo_path)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(
+                lambda: asyncio.run(_load_stale_structural_file_paths_async(path_obj))
+            ).result()
+    return asyncio.run(_load_stale_structural_file_paths_async(path_obj))
+
+
+async def _load_stale_structural_file_paths_async(repo_path: Any) -> list[str]:
+    """Load the stale file-scoped page paths for *repo_path* from its store.
+
+    Returns ``[]`` when no store is reachable: no configured database URL and
+    no local ``wiki.db``. A store that is reachable but fails to answer raises,
+    because reading that as "nothing is stale" would silently retire the
+    reconciliation this exists for.
+    """
+    from pathlib import Path
+
+    import structlog
+
+    from ..database import (
+        create_engine,
+        create_session_factory,
+        get_configured_db_url,
+        get_repo_db_path,
+        get_session,
+        resolve_db_url,
+    )
+    from .repository import get_repository_by_path
+
+    logger = structlog.get_logger(__name__)
+    path_obj = Path(repo_path)
+
+    if get_configured_db_url() is None and not get_repo_db_path(path_obj).exists():
+        return []
+
+    url = resolve_db_url(path_obj)
+    engine = create_engine(url)
+    try:
+        sf = create_session_factory(engine)
+        async with get_session(sf) as session:
+            repo = await get_repository_by_path(session, str(path_obj))
+            if repo is None:
+                return []
+            return await get_stale_structural_file_paths(session, repo.id)
+    except Exception as exc:
+        logger.warning("load_stale_structural_file_paths_failed", error=str(exc))
+        raise
+    finally:
+        await engine.dispose()
+
+
 async def get_stale_file_page_ages(
     session: AsyncSession,
     repository_id: str,

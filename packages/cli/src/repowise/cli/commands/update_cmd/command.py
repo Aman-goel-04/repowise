@@ -874,13 +874,25 @@ def run_update(
     if not dry_run:
         _repair_module_attribution(repo_path)
 
-    if (
+    git_is_current = bool(
         head
         and head == base_ref
         and not config_changed
         and not renderer_changed
         and not working_tree_diffs
-    ):
+    )
+    # A page can be stale for a reason no commit explains: a cascade that ran
+    # out of budget, an interrupted run, an expiry. Git says nothing changed,
+    # so the shortcut below is the only place such a page could be skipped
+    # forever, and the store is asked only once the git checks would otherwise
+    # have exited, so the common case stays free of a store read.
+    stale_db_paths: list[str] = []
+    if git_is_current:
+        from repowise.core.persistence import load_stale_structural_file_paths
+
+        stale_db_paths = load_stale_structural_file_paths(repo_path)
+
+    if git_is_current and not stale_db_paths:
         console.print("[green]Already up to date.[/green]")
         # D7: on a template (index-only) wiki, "up to date" is true of the code
         # but the pages are still unwritten. Point at the command that writes
@@ -1096,7 +1108,31 @@ def run_update(
             working_tree_diffs,
         )
 
-    if not file_diffs and not config_changed and not renderer_changed:
+    # A stale page whose file is gone is a deletion the diff walk never saw
+    # (the file left in a range an earlier run did not cover, or was never
+    # committed). Re-rendering cannot clear it, so hand it to the same
+    # tombstone and prune steps a diffed deletion goes through. The pages
+    # whose files still exist stay on the regeneration list below.
+    if stale_db_paths:
+        from repowise.core.ingestion.change_detector import FileDiff
+
+        present, absent = [], []
+        for path in stale_db_paths:
+            (present if (repo_path / path).exists() else absent).append(path)
+        stale_db_paths = present
+        known = {fd.path for fd in file_diffs}
+        file_diffs = [
+            *file_diffs,
+            *(
+                FileDiff(path, "deleted", None, None, None, None)
+                for path in absent
+                if path not in known
+            ),
+        ]
+        if absent:
+            console.print(f"Stale pages for deleted files: [cyan]{len(absent)}[/cyan]")
+
+    if not file_diffs and not config_changed and not renderer_changed and not stale_db_paths:
         console.print("[green]No changed files detected.[/green]")
         # Always advance the sync pointer so the on-disk freshness marker stays
         # current on no-op syncs. In docs mode, no changed files means no docs
@@ -1262,8 +1298,18 @@ def run_update(
     stale_renderer_paths = _stale_renderer_paths(repo_path, parsed_files)
     timings.stop("plan_pages")
     if stale_renderer_paths:
-        affected.regenerate = list(dict.fromkeys([*affected.regenerate, *stale_renderer_paths]))
         console.print(f"Pages from an older renderer: [cyan]{len(stale_renderer_paths)}[/cyan]")
+    # Pages already marked stale in the store, on the same list for the same
+    # reason: nothing else re-renders a file page whose file did not change.
+    # Ceiling: a stale page for a file that exists but is no longer indexed
+    # (excluded since, or unsupported) is not in parsed_files, so the render
+    # skips it and it stays stale; it costs a full reparse on every idle run
+    # until it is retired.
+    if stale_db_paths:
+        console.print(f"Reconciling stale structural pages: [cyan]{len(stale_db_paths)}[/cyan]")
+    stale_extra = list(dict.fromkeys([*stale_renderer_paths, *stale_db_paths]))
+    if stale_extra:
+        affected.regenerate = list(dict.fromkeys([*affected.regenerate, *stale_extra]))
 
     if affected.stale_due_to_budget > 0:
         console.print(
