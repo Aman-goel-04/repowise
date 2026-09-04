@@ -1,6 +1,6 @@
 # Language Support
 
-**20 languages parsed to a full AST · 37 on the five-rung ladder ·
+**21 languages parsed to a full AST · 38 on the five-rung ladder ·
 framework-aware across all of them.** "Do you support X" has five useful answers
 rather than two, so every language lands on a rung and the rung says what it
 buys you. Everything else in your repo still appears in the wiki and is tracked
@@ -30,6 +30,7 @@ reference.
   <img src="https://img.shields.io/badge/PHP-777BB4?style=flat-square&logo=php&logoColor=white" alt="PHP" />
   <img src="https://img.shields.io/badge/Dart-0175C2?style=flat-square&logo=dart&logoColor=white" alt="Dart" />
   <img src="https://img.shields.io/badge/Delphi-EE1F35?style=flat-square&logo=delphi&logoColor=white" alt="Object Pascal / Delphi" />
+  <img src="https://img.shields.io/badge/GDScript-478CBF?style=flat-square&logo=godotengine&logoColor=white" alt="GDScript / Godot" />
   &nbsp;<strong>· Partial &nbsp;</strong>
   <img src="https://img.shields.io/badge/Luau-00A2FF?style=flat-square&logo=lua&logoColor=white" alt="Luau" />
   <img src="https://img.shields.io/badge/Razor-512BD4?style=flat-square&logo=blazor&logoColor=white" alt="Razor / Blazor" />
@@ -53,14 +54,14 @@ produce meaningful output.
 | Tier | Languages | What you get |
 |------|-----------|--------------|
 | **Full** (13) | Python · TypeScript · JavaScript · Svelte · Vue · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby | The whole pipeline: AST symbols, import resolution, a resolved call graph, heritage, docstrings, framework edges, **and code-health markers** |
-| **Good** (5) | C · Swift · PHP · Dart · Object Pascal | Everything above except the full health suite. Dart and Object Pascal *do* get health markers; C, Swift and PHP don't yet |
+| **Good** (6) | C · Swift · PHP · Dart · Object Pascal · GDScript | Everything above except the full health suite. Dart and Object Pascal *do* get health markers; C, Swift, PHP and GDScript don't yet. GDScript has a dedicated import resolver but no framework edges or named bindings (see [Known gaps](#gdscript-known-gaps)) |
 | **Partial** (2) | Luau / Roblox · Razor / Blazor | Luau: AST symbols and `require()` resolution (Rojo / `.luaurc` aware), no health markers yet. Razor: a component symbol per file, call edges from `@code` blocks and component tags, C# health markers; no import resolution yet |
 | | | ⎯⎯ *tree-sitter parsing stops here. The rungs below are derived from git and imports, not from an AST.* ⎯⎯ |
 | **Lightweight** (8) | Elixir · Clojure · Haskell · Lean 4 · Erlang · F# · HTML · QML | A real file-to-file import graph, no symbol-level claims |
 | **Structural** (9) | Objective-C · R · Zig · Julia · Elm · OCaml · Crystal · Nim · D | Git history only: blame, hotspots, co-change. No AST parsing |
 
-The first three rungs are the **20 languages parsed to a full AST**; all five are
-the **37** on the ladder. Both numbers are worth stating and neither is worth
+The first three rungs are the **21 languages parsed to a full AST**; all five are
+the **38** on the ladder. Both numbers are worth stating and neither is worth
 stating alone, so if you only take one thing from this page, take the rung your
 language sits on rather than either count.
 
@@ -270,6 +271,78 @@ bindings and heritage, with a dedicated workspace resolver per language.
 | **PHP** | `.php` | `use Foo\Bar\Baz` with composer.json PSR-4 longest-prefix resolution; Laravel, TYPO3 edges |
 | **Dart** | `.dart` | `import` / `export` / `part` URIs, `package:` via every `pubspec.yaml`, Flutter route tables and `runApp()` edges. **Health markers included** |
 | **Object Pascal** | `.pas` `.pp` `.dpr` `.dpk` `.lpr` `.inc` | `uses` clauses via the generic unit-name → file-stem fallback; project files as entry points. **Health markers included** |
+| **GDScript** | `.gd` | `preload(...)` / `load(...)` / `extends "res://..."` resolved as absolute paths from the nearest `project.godot`, so a repo holding many Godot projects keeps each project's `res://` namespace separate |
+
+### GDScript known gaps
+
+Both dialects parse: GDScript 4 (`@export var`) and GDScript 3 (`export var`,
+`.method()` parent calls). On godotengine/godot-demo-projects, 459 of 461
+`.gd` files parse with no error node and every `res://` path naming an indexed
+script resolves; the two failures are the `$%UniqueName` form below.
+
+- **A script without `class_name` gets no class symbol**, so its `extends`
+  produces no symbol-level heritage edge. Synthesizing a name from the file
+  stem would point the edge at a node that isn't in the graph. The
+  `extends "res://..."` import edge is unaffected and carries the dependency.
+- **`extends "res://base.gd"` is an import, not heritage.** A path is not a
+  type name.
+- **Engine methods on implicit `self`** (`get_node`, `emit_signal`, `connect`)
+  are unresolved targets; only Godot's *global* scope is filtered as builtin.
+  Same tradeoff as Pascal's framework calls. Note the builtin filter is
+  receiver-blind, so a project method sharing a global's name (`hash`, `seed`,
+  `str`) loses its call edge. `load` is excluded from the filter for exactly
+  this reason, and the common engine API is listed separately so a bare
+  `load(...)` or `queue_free()` is refused by the bare-name tier instead of
+  binding to a lone project function of the same name.
+- **`uid://` paths and `load(some_variable)` stay external.** The first needs
+  the excluded `.uid` sidecars, the second needs dataflow. Neither is guessed.
+  For the same reason, a scene's `[ext_resource]` that carries only a `uid://`
+  and no `path` cannot be followed back to the script it names.
+- **Signals share the `variable` kind** (no `signal` member in `SymbolKind`).
+- **No framework edges and no named bindings.** Unlike C / Swift / PHP / Dart
+  at this tier, there is no Godot framework-edge handler and no binding
+  extractor, so every `Import` carries `bindings=[]`.
+- **String and annotation dispatch is invisible**: `@rpc` methods invoked via
+  `rpc("name")`, `connect(..., "method_name")`, GDScript 3 `setget` accessor
+  names, and `$NodePath` / `%UniqueName` lookups produce no edges, so those
+  methods read as unreferenced.
+- **Annotation arguments are not imports.** `@icon("res://…")` and
+  `class_name X, "res://icon.png"` reference real files that are not recorded.
+- **Setter/getter bodies are not symbols**, so a call made inside one is
+  attributed to the enclosing `variable` symbol: a `recompute()` in a setter
+  leaves a call edge from the property, not from an accessor of its own.
+- **Lambdas are not symbols.** A `lambda` is its own node type and may be a
+  variable's value or a call argument, so callback-heavy code
+  (`tween.finished.connect(func(): ...)`) is invisible to the symbol layer.
+  A lambda bound to a variable still yields the *variable* as a symbol.
+- **Code health: duplication markers DO run** (the clone tokenizer needs only a
+  grammar), but complexity, performance and dataflow dialects are not
+  registered, and that gap is what keeps GDScript at Good rather than Full.
+- **Dead code reads Godot's wiring, not only imports.** A script registered
+  under `[autoload]` in project.godot counts as an entry point, and a script a
+  `.tscn` attaches to a node is never flagged, because neither reference is an
+  import. Without that, 384 of the 461 `.gd` files in
+  godotengine/godot-demo-projects read as unreachable; with it, 29 do. A file
+  reached that way is exempt from the symbol-level passes too: a scene wires
+  handlers by name (`[connection ... method="_on_pressed"]`) and that name
+  appears in no script, which accounted for 522 of the 1,547 symbol findings
+  on that corpus. **A script reached only through a `.tres` resource, an editor
+  plugin manifest or `load()` on a computed path is still reported**, so the
+  remaining output is narrower than the ladder tier implies.
+- **Upstream grammar gap, reserved words:** calling a function named `export`
+  or `onready` as a bare statement (`export()`) fails to parse, because the
+  grammar still reserves those words at statement position for the GDScript 3
+  `export var` / `onready var` forms. GDScript 4 respells those `@export` /
+  `@onready`, making both legal identifiers again. `self.export()`,
+  `var x = export()` and `func export()` all parse; only the bare call
+  statement fails. Contained to
+  the one file by tree-sitter error recovery. Seen once in 651 corpus files
+  (Pixelorama's `ExportDialog.gd`).
+- **Upstream grammar gap, `$%UniqueName`:** Godot accepts `$%Name` as shorthand
+  for a scene-unique node lookup, but the grammar takes `$` and `%` as
+  separate node-path forms and rejects the pair. `$Name`, `$Path/To/Node`
+  and `%Name` all parse. Two occurrences in the 461-file corpus, in two
+  files, and error recovery keeps the damage to the enclosing statement.
 
 ---
 
