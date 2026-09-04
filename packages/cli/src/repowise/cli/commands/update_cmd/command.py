@@ -1223,7 +1223,8 @@ def run_update(
         emitter.stage("plan_pages")
 
     # Determine affected pages (auto-scale budget if not explicitly set)
-    if cascade_budget is None:
+    cascade_budget_is_auto = cascade_budget is None
+    if cascade_budget_is_auto:
         from repowise.core.ingestion.change_detector import compute_adaptive_budget
 
         cascade_budget = compute_adaptive_budget(file_diffs, file_count)
@@ -1247,6 +1248,16 @@ def run_update(
     if stale_renderer_paths:
         affected.regenerate = list(dict.fromkeys([*affected.regenerate, *stale_renderer_paths]))
         console.print(f"Pages from an older renderer: [cyan]{len(stale_renderer_paths)}[/cyan]")
+
+    if affected.stale_due_to_budget > 0:
+        console.print(
+            f"\n[yellow]⚠ Cascade budget of {cascade_budget} pages was reached. "
+            f"{affected.stale_due_to_budget} dependent pages were skipped and marked stale.[/yellow]"
+        )
+        console.print(
+            f"[yellow]  Pass `--cascade-budget {cascade_budget + affected.stale_due_to_budget}` "
+            f"to regenerate them all.[/yellow]\n"
+        )
 
     console.print(f"Pages to regenerate: [cyan]{len(affected.regenerate)}[/cyan]")
     if affected.decay_only:
