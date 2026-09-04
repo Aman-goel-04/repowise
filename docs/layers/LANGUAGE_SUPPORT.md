@@ -1,6 +1,6 @@
 # Language Support
 
-**19 languages parsed to a full AST · 35 on the five-rung ladder ·
+**20 languages parsed to a full AST · 36 on the five-rung ladder ·
 framework-aware across all of them.** "Do you support X" has five useful answers
 rather than two, so every language lands on a rung and the rung says what it
 buys you. Everything else in your repo still appears in the wiki and is tracked
@@ -32,6 +32,7 @@ reference.
   <img src="https://img.shields.io/badge/Delphi-EE1F35?style=flat-square&logo=delphi&logoColor=white" alt="Object Pascal / Delphi" />
   &nbsp;<strong>· Partial &nbsp;</strong>
   <img src="https://img.shields.io/badge/Luau-00A2FF?style=flat-square&logo=lua&logoColor=white" alt="Luau" />
+  <img src="https://img.shields.io/badge/Razor-512BD4?style=flat-square&logo=blazor&logoColor=white" alt="Razor / Blazor" />
 </p>
 
 **Contents:** [Tiers](#tiers) ·
@@ -53,13 +54,13 @@ produce meaningful output.
 |------|-----------|--------------|
 | **Full** (13) | Python · TypeScript · JavaScript · Svelte · Vue · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby | The whole pipeline: AST symbols, import resolution, a resolved call graph, heritage, docstrings, framework edges, **and code-health markers** |
 | **Good** (5) | C · Swift · PHP · Dart · Object Pascal | Everything above except the full health suite. Dart and Object Pascal *do* get health markers; C, Swift and PHP don't yet |
-| **Partial** (1) | Luau / Roblox | AST symbols and `require()` resolution (Rojo / `.luaurc` aware). No health markers yet |
+| **Partial** (2) | Luau / Roblox · Razor / Blazor | Luau: AST symbols and `require()` resolution (Rojo / `.luaurc` aware), no health markers yet. Razor: a component symbol per file, call edges from `@code` blocks and component tags, C# health markers; no import resolution yet |
 | | | ⎯⎯ *tree-sitter parsing stops here. The rungs below are derived from git and imports, not from an AST.* ⎯⎯ |
 | **Lightweight** (7) | Elixir · Clojure · Haskell · Lean 4 · Erlang · F# · HTML | A real file-to-file import graph, no symbol-level claims |
 | **Structural** (9) | Objective-C · R · Zig · Julia · Elm · OCaml · Crystal · Nim · D | Git history only: blame, hotspots, co-change. No AST parsing |
 
-The first three rungs are the **19 languages parsed to a full AST**; all five are
-the **35** on the ladder. Both numbers are worth stating and neither is worth
+The first three rungs are the **20 languages parsed to a full AST**; all five are
+the **36** on the ladder. Both numbers are worth stating and neither is worth
 stating alone, so if you only take one thing from this page, take the rung your
 language sits on rather than either count.
 
@@ -78,17 +79,19 @@ meaningless for a script invoked by name. See
 |-------|:----:|:----:|:-------:|:-----------:|:----------:|
 | File discovery & git history | ✅ | ✅ | ✅ | ✅ | ✅ |
 | AST symbol extraction | ✅ | ✅ | ✅ | — | — |
-| Import resolution | ✅ | ✅ | ✅ | file-level | — |
+| Import resolution | ✅ | ✅ | Luau | file-level | — |
 | Call graph edges | ✅ | ✅ | ✅ | — | — |
 | Heritage (extends / implements) | ✅ | ✅ | — | — | — |
 | Named bindings | ✅ | ✅ | — | — | — |
-| Code-health markers | ✅ | Dart, Pascal | — | — | — |
+| Code-health markers | ✅ | Dart, Pascal | Razor | — | — |
 | Dead code detection | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Semantic search & wiki pages | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 Scala's import resolution is partial: it shares the JVM index with Java and
 Kotlin and falls back to parsing SBT / Mill build files. Every other Full and
-Good language resolves imports outright.
+Good language resolves imports outright. On the Partial rung the two languages
+split: Luau resolves `require()` and has no health markers, Razor has C#
+health markers and no import edges yet.
 
 ---
 
@@ -228,6 +231,31 @@ what a parent actually writes), `<Foo />` in markup mints a call edge, and a
 handler referenced only from `on:click={inc}` or `@click="inc"` carries an edge
 instead of reading as dead code.
 
+### Razor / Blazor markup (`.razor`, `.cshtml`)
+
+Razor is the same one-file-two-languages shape, with one difference: there is
+no usable `tree-sitter-razor` on PyPI, and an HTML grammar actively mis-parses
+it (`List<Order>` reads as an HTML element). So the locator in
+`sfc_source.py` **byte-scans** instead: `@code { }`, `@functions { }` and
+`@{ }` interiors are brace-matched and projected into a C# buffer at
+byte-identical offsets, PascalCase markup tags (`<RadzenDataGrid />`) mint
+component call edges, and the file itself becomes a symbol named after the
+filename. The C# queries, `LanguageConfig`, complexity map and perf dialect
+all apply verbatim. Razor comments (`@* *@`) and HTML comments are skipped, so
+commented-out code and tags mint nothing.
+
+Razor sits on the **Partial** rung, not with Svelte and Vue, because two rows
+of the tier table are still open. The C# body is projected at top level, so
+`@code` members land as call edges but not as symbols, and a top-level
+`[Parameter]` property is a recoverable parse error rather than a member.
+`@using`, `@inject`, `@bind`, `@model` and the `@Html.Partial` family are
+blanked, so a Razor file has no import edges and its calls resolve through the
+repo-wide tiers only. Attribute-bound handlers (`Click="@Save"`) carry no edge
+yet, the same binding-form ceiling Svelte's `{#each}` heads and Vue's `v-for`
+get. Component tags resolve when the name is unique in the repo, and `@inject`
+receivers resolve when the property is named after its implementation, which
+is the Blazor convention.
+
 ---
 
 ## Good tier
@@ -331,12 +359,15 @@ map before markers fire. This table is why a language is Full rather than Good.
 | Ruby | ✅ | ✅ | ✅ | later | ✅ |
 | Dart | ✅ | n/a | ✅ | later | ✅ |
 | Object Pascal | ✅ | n/a | later | later | n/a |
+| Razor | ✅ | n/a | n/a | later | ✅ |
 | Shell | ✅ | n/a | n/a | n/a | n/a |
 
 Every cell is a deliberate call, not an oversight. Go and Object Pascal have no
 class metrics because neither language nests a type's method *bodies* inside the
 type; mapping them anyway would emit a class with `method_count == 0` for every
-class in the repo. Kotlin's Extract Method is **blocked on the grammar**, not
+class in the repo. Razor has none either: its `@code` members are projected at
+C# top level with no enclosing class, and its test files are `.cs`, so the
+assertion smells never apply. Kotlin's Extract Method is **blocked on the grammar**, not
 unscheduled: tree-sitter-kotlin parses a bare `break` as a plain identifier, and
 a slicer that cannot see a jump would propose an extraction that silently changes
 control flow. Rust and C++ omit `string_concat_in_loop` because both append in
