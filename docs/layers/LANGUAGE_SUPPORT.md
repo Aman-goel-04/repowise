@@ -1,6 +1,6 @@
 # Language Support
 
-**21 languages parsed to a full AST · 38 on the five-rung ladder ·
+**22 languages parsed to a full AST · 39 on the five-rung ladder ·
 framework-aware across all of them.** "Do you support X" has five useful answers
 rather than two, so every language lands on a rung and the rung says what it
 buys you. Everything else in your repo still appears in the wiki and is tracked
@@ -31,6 +31,7 @@ reference.
   <img src="https://img.shields.io/badge/Dart-0175C2?style=flat-square&logo=dart&logoColor=white" alt="Dart" />
   <img src="https://img.shields.io/badge/Delphi-EE1F35?style=flat-square&logo=delphi&logoColor=white" alt="Object Pascal / Delphi" />
   <img src="https://img.shields.io/badge/GDScript-478CBF?style=flat-square&logo=godotengine&logoColor=white" alt="GDScript / Godot" />
+  <img src="https://img.shields.io/badge/VB.NET-945DB7?style=flat-square&logo=dotnet&logoColor=white" alt="VB.NET" />
   &nbsp;<strong>· Partial &nbsp;</strong>
   <img src="https://img.shields.io/badge/Luau-00A2FF?style=flat-square&logo=lua&logoColor=white" alt="Luau" />
   <img src="https://img.shields.io/badge/Razor-512BD4?style=flat-square&logo=blazor&logoColor=white" alt="Razor / Blazor" />
@@ -54,14 +55,14 @@ produce meaningful output.
 | Tier | Languages | What you get |
 |------|-----------|--------------|
 | **Full** (13) | Python · TypeScript · JavaScript · Svelte · Vue · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby | The whole pipeline: AST symbols, import resolution, a resolved call graph, heritage, docstrings, framework edges, **and code-health markers** |
-| **Good** (6) | C · Swift · PHP · Dart · Object Pascal · GDScript | Everything above except the full health suite. Dart and Object Pascal *do* get health markers; C, Swift, PHP and GDScript don't yet. GDScript has a dedicated import resolver but no framework edges or named bindings (see [Known gaps](#gdscript-known-gaps)) |
+| **Good** (7) | C · Swift · PHP · Dart · Object Pascal · GDScript · VB.NET | Everything above except the full health suite. Dart and Object Pascal *do* get health markers; C, Swift, PHP, GDScript and VB.NET don't yet. GDScript has a dedicated import resolver but no framework edges or named bindings (see [Known gaps](#gdscript-known-gaps)) |
 | **Partial** (2) | Luau / Roblox · Razor / Blazor | Luau: AST symbols and `require()` resolution (Rojo / `.luaurc` aware), no health markers yet. Razor: a component symbol per file, call edges from `@code` blocks and component tags, C# health markers; no import resolution yet |
 | | | ⎯⎯ *tree-sitter parsing stops here. The rungs below are derived from git and imports, not from an AST.* ⎯⎯ |
 | **Lightweight** (8) | Elixir · Clojure · Haskell · Lean 4 · Erlang · F# · HTML · QML | A real file-to-file import graph, no symbol-level claims |
 | **Structural** (9) | Objective-C · R · Zig · Julia · Elm · OCaml · Crystal · Nim · D | Git history only: blame, hotspots, co-change. No AST parsing |
 
-The first three rungs are the **21 languages parsed to a full AST**; all five are
-the **38** on the ladder. Both numbers are worth stating and neither is worth
+The first three rungs are the **22 languages parsed to a full AST**; all five are
+the **39** on the ladder. Both numbers are worth stating and neither is worth
 stating alone, so if you only take one thing from this page, take the rung your
 language sits on rather than either count.
 
@@ -272,6 +273,7 @@ bindings and heritage, with a dedicated workspace resolver per language.
 | **Dart** | `.dart` | `import` / `export` / `part` URIs, `package:` via every `pubspec.yaml`, Flutter route tables and `runApp()` edges. **Health markers included** |
 | **Object Pascal** | `.pas` `.pp` `.dpr` `.dpk` `.lpr` `.inc` | `uses` clauses via the generic unit-name → file-stem fallback; project files as entry points. **Health markers included** |
 | **GDScript** | `.gd` | `preload(...)` / `load(...)` / `extends "res://..."` resolved as absolute paths from the nearest `project.godot`, so a repo holding many Godot projects keeps each project's `res://` namespace separate |
+| **VB.NET** | `.vb` | `Imports` through the same MSBuild project index C# uses: `.vbproj` / `.sln` parsing, `<RootNamespace>`-aware namespace lookup, NuGet package references |
 
 ### GDScript known gaps
 
@@ -343,6 +345,27 @@ script resolves; the two failures are the `$%UniqueName` form below.
   separate node-path forms and rejects the pair. `$Name`, `$Path/To/Node`
   and `%Name` all parse. Two occurrences in the 461-file corpus, in two
   files, and error recovery keeps the damage to the enclosing statement.
+
+### VB.NET known ceilings
+
+On the 0.3.0 grammar two validation repositories parse almost clean:
+AAndyProgram/SCrawler (293 `.vb` files, 15 of which still carry a parse error)
+and Lake1059/FFmpegFreeUI (197 `.vb` files, 24 of which still carry one).
+
+- **Remaining grammar gaps**: XML literals, tuple literals used as expressions,
+  a nested double quote inside an interpolation hole, an omitted argument in a
+  call that also carries type arguments, and some multi-line LINQ layouts.
+  tree-sitter recovers from each of them, so the symbols around such a
+  construct are still read and only the construct itself is lost.
+- **Imports resolve through the .NET project graph, not a file stem.** A
+  `.vbproj` is indexed alongside the `.csproj` files, so an `Imports` directive
+  is matched against the namespace its owning project declares through
+  `<RootNamespace>` and against the namespaces that project's references bring
+  in. The same-namespace and partial-class links are shared with C#, so a
+  VB.NET type and a C# type sitting in one namespace see each other.
+- **Generated VB is treated the way generated C# is.** The `.vb` never-flag
+  globs mirror the C# ones: designer files, `AssemblyInfo`, everything under
+  `My Project`, and the `ApplicationEvents` runtime hooks.
 
 ---
 
@@ -510,6 +533,7 @@ cannot check.
 | C# | Full (health) | Dataflow dialect |
 | Dart | Good | riverpod / get_it dynamic hints, dataflow dialect |
 | Object Pascal | Good | Assertion and performance markers, a dedicated `uses` resolver |
+| VB.NET | Good | Health markers, project-level `<Import Include=...>` as implicit imports |
 | Elixir · F# | Good | AST upgrade (both grammars are available on PyPI) |
 | SQL / dbt | — | Column-level blast radius |
 | Shell | — | Shebang detection for extensionless executables |
