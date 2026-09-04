@@ -179,6 +179,9 @@ _PARTIAL = {
     # rather than full because template dialects (Django, Jinja, Go templates,
     # ERB, Handlebars) are invisible to an HTML grammar and yield nothing.
     "html",
+    # import QtQuick / import "components": module specs via the qmldir
+    # index, quoted references relative to the importing file (#727).
+    "qml",
 }
 
 
@@ -197,6 +200,25 @@ class TestImportSupportTiers:
 
     def test_unknown_language_reports_none(self) -> None:
         assert REGISTRY.import_support_for("klingon") == "none"
+
+
+class TestLanguageTagParity:
+    def test_every_spec_tag_is_a_language_tag(self) -> None:
+        # EXTENSION_TO_LANGUAGE keeps only extensions whose tag is in the
+        # LanguageTag literal, so a spec whose tag is missing there is
+        # registered but never traversed: its files index as nothing while
+        # the parser tests, which bypass the traverser, stay green.
+        from repowise.core.ingestion.models import _LANGUAGE_TAG_VALUES
+
+        spec_tags = {spec.tag for spec in REGISTRY.all_specs()}
+        assert spec_tags == _LANGUAGE_TAG_VALUES
+
+    def test_every_spec_extension_is_routed(self) -> None:
+        from repowise.core.ingestion.models import EXTENSION_TO_LANGUAGE
+
+        for spec in REGISTRY.all_specs():
+            for ext in spec.extensions:
+                assert EXTENSION_TO_LANGUAGE.get(ext) == spec.tag, (spec.tag, ext)
 
 
 # ---------------------------------------------------------------------------

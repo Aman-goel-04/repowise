@@ -1,6 +1,6 @@
 # Language Support
 
-**20 languages parsed to a full AST · 36 on the five-rung ladder ·
+**20 languages parsed to a full AST · 37 on the five-rung ladder ·
 framework-aware across all of them.** "Do you support X" has five useful answers
 rather than two, so every language lands on a rung and the rung says what it
 buys you. Everything else in your repo still appears in the wiki and is tracked
@@ -56,11 +56,11 @@ produce meaningful output.
 | **Good** (5) | C · Swift · PHP · Dart · Object Pascal | Everything above except the full health suite. Dart and Object Pascal *do* get health markers; C, Swift and PHP don't yet |
 | **Partial** (2) | Luau / Roblox · Razor / Blazor | Luau: AST symbols and `require()` resolution (Rojo / `.luaurc` aware), no health markers yet. Razor: a component symbol per file, call edges from `@code` blocks and component tags, C# health markers; no import resolution yet |
 | | | ⎯⎯ *tree-sitter parsing stops here. The rungs below are derived from git and imports, not from an AST.* ⎯⎯ |
-| **Lightweight** (7) | Elixir · Clojure · Haskell · Lean 4 · Erlang · F# · HTML | A real file-to-file import graph, no symbol-level claims |
+| **Lightweight** (8) | Elixir · Clojure · Haskell · Lean 4 · Erlang · F# · HTML · QML | A real file-to-file import graph, no symbol-level claims |
 | **Structural** (9) | Objective-C · R · Zig · Julia · Elm · OCaml · Crystal · Nim · D | Git history only: blame, hotspots, co-change. No AST parsing |
 
 The first three rungs are the **20 languages parsed to a full AST**; all five are
-the **36** on the ladder. Both numbers are worth stating and neither is worth
+the **37** on the ladder. Both numbers are worth stating and neither is worth
 stating alone, so if you only take one thing from this page, take the rung your
 language sits on rather than either count.
 
@@ -321,6 +321,24 @@ import graph: imports extracted per language and resolved against a declared
 module-name index. The knowledge graph runs in flow/sparse mode on the result:
 honest file-to-file dependencies, no symbol-level claims. F# additionally honours
 the fsproj `<Compile Include>` compile order.
+
+**QML** joins the lightweight tier with imports only. A grammar exists
+(`tree-sitter-qmljs` on PyPI), but the AST rung needs queries for QML's `id:`
+object tree (component, property, signal, function, alias) and a grammar-aware
+resolver, which is a separate climb. The tier still delivers the reporter's
+core ask from #727, an agent that "doesn't know where to look", as real
+file-to-file edges: `import QtQuick`/`import org.kde.kirigami` module specs
+resolve against a `qmldir`-declared module index (Qt's own modules resolve
+external), and quoted references (`import "components"`,
+`import "js/app.js" as S`) resolve relative to the importing file, with a
+directory import linking its `qmldir` manifest. Two stated ceilings: a directory
+import only links a directory that carries a `qmldir`, so an implicit module (a
+directory of `.qml` files with no manifest) gets no edge, and a module name
+declared by two `qmldir` files gets no edge either rather than a guessed one.
+`.qml` files are **never flagged as dead code**: a component is instantiated by
+type name and loaded by the Qt runtime through qrc, `Loader` and
+`qmlRegisterType`, none of which is an import, so file reachability says nothing
+about it.
 
 **HTML** is import-tier on purpose. It has no functions, classes or calls, so
 there are no symbols to claim, but its `<script src>` and `<link href>` become
