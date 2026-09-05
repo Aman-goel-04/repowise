@@ -26,15 +26,15 @@ sys.path.insert(0, str(REPO_ROOT))
 
 
 async def _load_inputs(repo_path: Path):
-    from repowise.cli._repo_session import open_repo_db
-    from repowise.core.generation.scope import build_dependencies, load_page_records
-    from repowise.core.persistence import get_session
-    from repowise.core.pipeline import rehydrate_graph_builder
-    from repowise.core.repo_config import load_repo_config
-    from repowise.core.generation import GenerationConfig
-    from repowise.core.pipeline import run_pipeline
     from sqlalchemy import select
+
+    from repowise.cli._repo_session import open_repo_db
+    from repowise.core.generation import GenerationConfig
+    from repowise.core.generation.scope import load_page_records
+    from repowise.core.persistence import get_session
     from repowise.core.persistence.models import Page
+    from repowise.core.pipeline import run_pipeline
+    from repowise.core.repo_config import load_repo_config
 
     engine, sf, repo_id = await open_repo_db(repo_path, repo_name=repo_path.name)
     try:
