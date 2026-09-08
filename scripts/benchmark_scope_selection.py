@@ -53,17 +53,18 @@ async def _load_inputs(repo_path: Path):
         "parsed_files": result.parsed_files,
         "config": cfg,
         "repo_name": repo_path.name,
+        "repo_path": repo_path,
     }
 
 
 def _build_inputs(payload: dict):
     from repowise.core.generation.scope import build_dependencies
     from repowise.core.generation.selection.selector import SelectionInputs, select_pages
+    from repowise.core.pipeline.scoped_generation import load_kg_context
 
     graph_builder = payload["graph_builder"]
     parsed_files = payload["parsed_files"]
     cfg = payload["config"]
-    # The selector needs the same in-memory graph features the scope builder uses.
     inputs = SelectionInputs(
         parsed_files=parsed_files,
         pagerank=graph_builder.pagerank(),
@@ -79,17 +80,23 @@ def _build_inputs(payload: dict):
     selection = select_pages(inputs)
     select_secs = time.perf_counter() - t0
 
+    # On the real update path this is stat'd/opened on every hook-driven run;
+    # it wasn't in the original numbers, so it's timed and reported separately.
+    t_kg0 = time.perf_counter()
+    kg_ctx = load_kg_context(payload["repo_path"])
+    kg_secs = time.perf_counter() - t_kg0
+
     t1 = time.perf_counter()
     deps = build_dependencies(
         parsed_files=parsed_files,
         graph_builder=graph_builder,
         config=cfg,
-        kg_ctx=None,
+        kg_ctx=kg_ctx,
         records=payload["records"],
         repo_name=payload["repo_name"],
     )
     deps_secs = time.perf_counter() - t1
-    return select_secs, deps_secs, len(selection.module_groups), len(selection.scc_groups), deps
+    return select_secs, kg_secs, deps_secs, len(selection.module_groups), len(selection.scc_groups), deps
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -102,15 +109,17 @@ def main(argv: list[str] | None = None) -> int:
     payload = asyncio.run(_load_inputs(repo_path))
 
     select_samples: list[float] = []
+    kg_samples: list[float] = []
     deps_samples: list[float] = []
     module_count = scc_count = 0
 
     for i in range(args.runs + 1):
-        select_secs, deps_secs, module_count, scc_count, _deps = _build_inputs(payload)
+        select_secs, kg_secs, deps_secs, module_count, scc_count, _deps = _build_inputs(payload)
         # Warm-up run is discarded.
         if i == 0:
             continue
         select_samples.append(select_secs)
+        kg_samples.append(kg_secs)
         deps_samples.append(deps_secs)
 
     def _summary(samples: list[float]) -> tuple[float, float, float]:
@@ -121,11 +130,13 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     sel_med, sel_max, sel_min = _summary(select_samples)
+    kg_med, kg_max, kg_min = _summary(kg_samples)
     dep_med, dep_max, dep_min = _summary(deps_samples)
 
     print(f"repo: {repo_path}")
     print(f"module_groups: {module_count}  scc_groups: {scc_count}")
     print(f"select_pages(select_all=True): median {sel_med:.2f} ms  min {sel_min:.2f} ms  max {sel_max:.2f} ms")
+    print(f"load_kg_context():              median {kg_med:.2f} ms  min {kg_min:.2f} ms  max {kg_max:.2f} ms")
     print(f"build_dependencies():           median {dep_med:.2f} ms  min {dep_min:.2f} ms  max {dep_max:.2f} ms")
     return 0
 

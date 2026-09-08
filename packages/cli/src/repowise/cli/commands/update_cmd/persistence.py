@@ -156,33 +156,6 @@ async def _persist_partial_health(session: Any, repo_id: str, report: Any) -> No
     await persist_partial_health(session, repo_id, report)
 
 
-async def _load_page_rows(session: Any, repo_id: str) -> list[Any]:
-    """Lightweight page rows used to derive stale structural dependents."""
-    from sqlalchemy import select
-    from sqlalchemy.orm import load_only
-
-    from repowise.core.persistence.models import Page
-
-    result = await session.execute(
-        select(Page)
-        .options(
-            load_only(
-                Page.id,
-                Page.page_type,
-                Page.target_path,
-                Page.provider_name,
-                Page.metadata_json,
-                Page.freshness_status,
-            )
-        )
-        .where(
-            Page.repository_id == repo_id,
-            Page.freshness_status != "tombstone",
-        )
-    )
-    return list(result.scalars())
-
-
 async def _persist_incremental_commits(session: Any, repo_id: str, repo_path: Any) -> None:
     """Capture + upsert ``git_commits`` rows for commits new since the last index.
 
@@ -797,7 +770,10 @@ async def _persist_full_update_async(
                     load_page_records,
                 )
                 from repowise.core.pipeline.persist import mark_page_ids_stale
-                from repowise.core.pipeline.scoped_generation import load_kg_context
+                from repowise.core.pipeline.scoped_generation import (
+                    _load_page_rows,
+                    load_kg_context,
+                )
                 from repowise.core.repo_config import load_repo_config
 
                 with timed(timings, "persist.stale_pages"):
@@ -822,7 +798,7 @@ async def _persist_full_update_async(
                         # free; the operator opts into the spend explicitly via
                         # `generate --stale`.
                         cascade = expand_cascade(seed_ids, "none", deps)
-                        await mark_page_ids_stale(session, repo_id, cascade.stale_ids)
+                        await mark_page_ids_stale(session, repo_id, cascade.stale_ids | seed_ids)
             except Exception as exc:
                 _skip("Stale-page decay", exc)
 
