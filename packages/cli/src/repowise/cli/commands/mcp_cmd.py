@@ -188,14 +188,19 @@ def mcp_command(
         pass
 
     from repowise.server.mcp_server import run_mcp
+    from repowise.server.mcp_server._server import StoreUnavailableError
 
     tools_override: str | None = "all" if all_tools else tools
 
-    run_mcp(
-        transport=transport,
-        repo_path=str(repo_path),
-        host=resolved_host,
-        port=port,
-        tools=tools_override,
-        workspace_mode=not no_workspace,
-    )
+    try:
+        run_mcp(
+            transport=transport,
+            repo_path=str(repo_path),
+            host=resolved_host,
+            port=port,
+            tools=tools_override,
+            workspace_mode=not no_workspace,
+        )
+    except StoreUnavailableError as exc:
+        # One line on stderr and exit 1, not a traceback the host respawns on.
+        raise click.ClickException(str(exc)) from exc
