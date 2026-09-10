@@ -23,7 +23,6 @@
 
 import {
   bandForScore,
-  HEALTH_BAND_LABEL,
   type DefectAccuracy,
   type HealthDistribution,
   type HealthOverviewSummary,
@@ -31,7 +30,7 @@ import {
 import { PageLede } from "../shared/page-lede";
 import { StatRibbon, type RibbonStat } from "../stats/stat-ribbon";
 import { formatNumber } from "../lib/format";
-import { healthBandColor, scoreTextColor } from "./tokens";
+import { healthBand, healthBandColor, scoreTextColor } from "./tokens";
 import { HealthDistributionBar } from "./health-distribution-bar";
 
 const HEALTH_HINT =
@@ -97,12 +96,6 @@ function windowLabel(days: number): string {
   return months === 1 ? "month" : `${months} months`;
 }
 
-/** A score as a canonical three-band chip. */
-function bandChip(score: number): { label: string; color: string } {
-  const band = bandForScore(score);
-  return { label: HEALTH_BAND_LABEL[band], color: healthBandColor(band) };
-}
-
 export function CodeHealthLede({
   summary,
   accuracy,
@@ -133,9 +126,9 @@ export function CodeHealthLede({
       : Math.round((historyDeduction / deduction) * 100);
   // The band words were fitted against the full, bug-predicting score, so
   // they are not a verdict this projection has earned: clamp(10 - structure)
-  // reads systematically higher, and almost every repo would print "Healthy"
+  // reads systematically higher, and almost every repo would print "Excellent"
   // under it. The figure and the spread still say where the repo sits.
-  const healthChip = codeShape ? undefined : bandChip(health);
+  const healthChip = codeShape ? undefined : healthBand(health);
 
   const stats: RibbonStat[] = [
     { label: "Files", value: formatNumber(summary.file_count), hint: FILES_HINT },
@@ -220,7 +213,7 @@ export function CodeHealthLede({
           for code health, weighted by lines of code and built from complexity,
           duplication, coverage
           {codeShape ? "" : ", churn and ownership"}.
-          {healthChip ? <> We rate that {healthChip.label.toLowerCase()}.</> : null}
+          {healthChip ? <> That puts it in the {healthChip.label} band.</> : null}
           {perf != null && (
             <>
               {" "}

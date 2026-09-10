@@ -195,8 +195,20 @@ and `search_codebase` (`kind`).
 
 `get_dead_code`'s `min_confidence` additionally accepts the tier names the
 response is organised by — `"high"` (0.8), `"medium"` (0.5), `"low"` (0.0) — as
-well as a float. `get_health` reports the same thing under its own older name,
-`unknown_only_keys`, for the `only` projection.
+well as a float.
+
+`get_health` is the exception to the shape. It reports a misspelled `only` key
+under its own older name, `unknown_only_keys`, and everything else —
+`refactoring_*` and `performance_*` filters, `scope`, `counts` — in
+`ignored_arguments` as a flat map of argument to the value that was dropped:
+
+```jsonc
+"ignored_arguments": { "counts": "code-shape", "refactoring_effort": "tiny" }
+```
+
+A detail lookup (`finding_id`, `plan_id`, `opportunity_id`) reports `scope` and
+`counts` there too: it answers about one stored row, so a population control has
+nothing to act on.
 
 ---
 
@@ -881,6 +893,12 @@ representations of the same work in one response. The `include` **dimension** na
 | `performance_boundary` | string | No | `db` / `network` / `filesystem` / `subprocess` / `lock` / `none`. |
 | `performance_confidence` | string | No | Evidence confidence: `high` / `medium` / `low`. Fix safety and actionability are separate facets. |
 | `performance_sort` | string | No | `rank` (default) / `leverage` / `observations`. |
+| `scope` | string | No | Which files every figure describes: `all` (default) or `production`. Narrowing drops test files from the headline, the distribution and every ranked list. Tests score higher than production code, so `production` lowers the number without a defect having been found. |
+| `counts` | string | No | What the score counts: `everything` (default, the calibrated number) or `code_shape`, which removes the git-derived half. Change history rises as a file is worked on, so it answers what a repository has been through rather than what its code is like — `code_shape` is the reading that answers "is this code getting better". Files with no stored split are reported in `unscored_files` rather than counted. Findings from history are dropped, not re-scored. |
+
+An unrecognized `scope` or `counts` falls back to the default and is named in
+`ignored_arguments`, so a misspelling never answers a different question under
+the name you asked for. Both are echoed on the response.
 
 **Returns:** Dashboard mode (no `targets`) returns a `directive`, repo-level KPIs
 (hotspot health, average health, worst performer, maintainability / performance
@@ -904,7 +922,8 @@ window; `recovers_points_compatibility` names its replacement.
 
 **Nothing is dropped silently.** Any `targets` entry that matched nothing is
 named in `unresolved` with a reason (`not_indexed` → run `repowise update`,
-`no_such_path`, `excluded`, `no_such_module`; a missed module name also returns
+`no_such_path`, `excluded`, `not_measured` → indexed, but carrying no stored
+split for the reading `counts` asked for, `no_such_module`; a missed module name also returns
 `known_modules`). Missing stored analysis is explicitly unavailable rather than
 fabricated as a healthy score. A
 target set that resolves to nothing still answers in targeted mode rather than
@@ -959,7 +978,7 @@ make that actionable rather than a mystery:
   `kpis.average_health_weighting` is `"nloc"`. When the weighted and unweighted
   numbers diverge, the gap is telling you to chase *big* files, not the long tail.
 - `gap_analysis` (dashboard mode) reports the net weighted points the average must
-  recover to reach the Healthy floor (8.0), how many files sit below it, and how
+  recover to reach the target score (8.0), how many files sit below it, and how
   few of them carry the whole gap (`files_to_reach_target`) or half of it
   (`files_for_half_gap`). This reframes a repo-wide number as a short worklist.
 - Every metric row carries `weighted_deficit = (8 - score) x nloc`: how much the
