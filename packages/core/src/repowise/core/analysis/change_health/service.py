@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from ..health import HEALTH_ANALYZER_VERSION, HealthFindingData
 from ..health.perf.causal import PERFORMANCE_MODEL_VERSION
+from ..health.scoring import ADVISORY_DIMENSION, is_advisory
 from .analyzer import RevisionHealthAnalyzer, language_for, language_of
 from .attribution import FindingAttributor, changed_symbols_for
 from .identity import change_finding_id, finding_key, severity_rank
@@ -48,7 +49,7 @@ _WAIT_TIMEOUT_SECONDS = 30
 #: Wait-then-retry rounds before a caller stops queueing and computes.
 _CLAIM_ATTEMPTS = 2
 
-_DIMENSION_ORDER = {"defect": 0, "maintainability": 1, "performance": 2}
+_DIMENSION_ORDER = {"defect": 0, "maintainability": 1, "performance": 2, ADVISORY_DIMENSION: 3}
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,10 +259,19 @@ class ChangeHealthDeltaService:
         matcher = FindingMatcher(rename)
         # Both sides are restricted to the same comparable set, so an excluded
         # file cannot contribute a one-sided "introduced" or "resolved".
+        # Advisory markers deduct nothing, so adding one is not a regression
+        # and removing one is not a fix. Dropped from BOTH sides before
+        # matching, so every counter derived from the match agrees.
         base_findings = [
-            f for f in base_run.findings if rename.get(f.file_path, f.file_path) in subject
+            f
+            for f in base_run.findings
+            if rename.get(f.file_path, f.file_path) in subject
+            and not is_advisory(f.biomarker_type)
         ]
-        match = matcher.match(base_findings, head_run.findings_for(subject))
+        head_findings = [
+            f for f in head_run.findings_for(subject) if not is_advisory(f.biomarker_type)
+        ]
+        match = matcher.match(base_findings, head_findings)
 
         by_file: dict[str, list[HealthFindingData]] = {}
         for finding in head_run.findings_for(subject):
