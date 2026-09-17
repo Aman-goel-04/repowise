@@ -8,6 +8,7 @@ complete from a configured limit or from the absence of a finding.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from copy import deepcopy
@@ -175,6 +176,140 @@ def resolve_index_scope(
             "next_command": _string(search.get("next_command")),
         },
     }
+
+
+#: What a routine response says instead of the whole canonical scope. The full
+#: object is roughly 900 characters, which on a small ``get_symbol`` response
+#: was about a third of everything the agent received — paid for on every call
+#: to answer a question almost none of them asked.
+COMPACT_INDEX_SCOPE_PROJECTION = "compact"
+CANONICAL_INDEX_SCOPE_PROJECTION = "full"
+
+#: Set to ``full`` to serve the canonical scope everywhere, as builds before
+#: the compact projection did. The compatibility window for a reader that
+#: parses the whole object and cannot yet ask for it by name.
+INDEX_SCOPE_ENV = "REPOWISE_MCP_INDEX_SCOPE"
+
+
+#: Upgrade states that mean the index is still being built. Reported ahead of
+#: everything else: they explain the rest and they resolve on their own.
+_UPGRADE_IN_FLIGHT = frozenset({"pending", "running", "resumable"})
+
+#: Search legs. A leg that is "pending" is not usable yet, which is a smaller
+#: problem than one that failed but is not nothing.
+_SEARCH_LEGS = ("full_text", "semantic")
+
+
+def _section(scope: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    """One sub-block of a scope, or an empty one when it is missing or junk."""
+    section = scope.get(name)
+    return section if isinstance(section, Mapping) else {}
+
+
+def _is_degraded(upgrade: Mapping[str, Any], scope: Mapping[str, Any]) -> bool:
+    """Whether some part of the index was meant to exist and does not."""
+    search = _section(scope, "search")
+    return (
+        upgrade.get("status") == "failed"
+        or bool(_section(scope, "analysis").get("unavailable"))
+        or any(search.get(leg) == "unavailable" for leg in _SEARCH_LEGS)
+    )
+
+
+def _is_partial(scope: Mapping[str, Any]) -> bool:
+    """Whether the index is sound but does not yet cover everything."""
+    search = _section(scope, "search")
+    return (
+        bool(_number(_section(scope, "file_pages").get("omitted")))
+        or bool(_section(scope, "analysis").get("skipped"))
+        or any(search.get(leg) == "pending" for leg in _SEARCH_LEGS)
+    )
+
+
+def _is_unexamined(scope: Mapping[str, Any]) -> bool:
+    """Whether the evidence that would tell complete from partial is missing.
+
+    A legacy index, or any state with no ``index_scope`` key, projects every
+    one of these as ``unknown``/``None``. Reading that as "nothing is wrong"
+    would turn absence of evidence into a claim of completeness, which is the
+    one thing this module promises never to do.
+    """
+    search = _section(scope, "search")
+    return _number(_section(scope, "file_pages").get("omitted")) is None or any(
+        search.get(leg) == "unknown" for leg in _SEARCH_LEGS
+    )
+
+
+def _scope_status(scope: Mapping[str, Any]) -> str:
+    """One word for how much of the intended index actually exists.
+
+    Ordered worst-first on purpose: an index that is both mid-upgrade and
+    missing pages reports the upgrade, because that is the condition that
+    explains the rest and the one that will change on its own. ``complete``
+    is last and is reached only when the evidence exists and is clean, so it
+    never stands in for evidence that was merely never recorded — that is
+    ``unknown``, which is a different answer and says so.
+    """
+    upgrade = _section(scope, "upgrade")
+    if upgrade.get("status") in _UPGRADE_IN_FLIGHT:
+        return "upgrading"
+    if _is_degraded(upgrade, scope):
+        return "degraded"
+    if _is_partial(scope):
+        return "partial"
+    if _is_unexamined(scope):
+        return "unknown"
+    return "complete"
+
+
+def index_scope_fingerprint(scope: Mapping[str, Any]) -> str:
+    """A short stable digest of one canonical scope.
+
+    Two responses carrying the same fingerprint were built against the same
+    scope, so a caller holding the full object from an earlier call knows its
+    copy still describes this one — without either side resending it.
+
+    sha256 over the canonical JSON, first 12 hex characters. No ``default``
+    serializer: every field here is JSON-derived or passed through
+    :func:`_number`/:func:`_string`/:func:`_choice`, and a fallback would let a
+    future plain object stringify to its address and churn the digest every
+    process while still looking valid. Raising is the better failure.
+    """
+    canonical = json.dumps(scope, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
+def compact_index_scope(
+    scope: Mapping[str, Any] | None, *, full_hint: str = "get_overview()"
+) -> dict[str, Any] | None:
+    """The routine-response projection of a canonical scope.
+
+    Keeps what changes how an answer should be read — the run mode, where the
+    prose came from, how much git there is, and whether the index is whole —
+    plus a fingerprint identifying the full object and the call that returns
+    it. Everything else is a diagnostic, and a diagnostic that rides on every
+    response is a tax, not a disclosure.
+
+    The one exception is ``degraded_analyses``, carried only when non-empty:
+    which analysis is missing changes what an answer means, and "health failed"
+    and "the graph failed" are not the same warning.
+    """
+    if not isinstance(scope, Mapping):
+        return None
+    compact: dict[str, Any] = {
+        "version": scope.get("version", INDEX_SCOPE_VERSION),
+        "projection": COMPACT_INDEX_SCOPE_PROJECTION,
+        "run_mode": scope.get("run_mode", "unknown"),
+        "content_provenance": scope.get("content_provenance", "unknown"),
+        "git_tier": scope.get("git_tier", "unknown"),
+        "status": _scope_status(scope),
+        "fingerprint": index_scope_fingerprint(scope),
+        "full": full_hint,
+    }
+    unavailable = _section(scope, "analysis").get("unavailable")
+    if unavailable:
+        compact["degraded_analyses"] = list(unavailable)
+    return compact
 
 
 def stamp_index_scope(
