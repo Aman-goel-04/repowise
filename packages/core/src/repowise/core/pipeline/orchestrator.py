@@ -662,6 +662,10 @@ async def run_pipeline(
     # complete, so an interrupt during the long generation phase below can
     # resume past analysis instead of recomputing it. Skipped when we already
     # rehydrated analysis (it's by definition persisted) — best-effort.
+    #
+    # The store goes with them: this is where a decision record is first
+    # written, so it is the only pass that can fold a paraphrase into an
+    # existing one. By the end-of-run persist every group matches on title.
     if resume_controller is not None and not skip_analysis:
         await resume_controller.checkpoint_analysis(
             parsed_files=parsed_files,
@@ -670,6 +674,7 @@ async def run_pipeline(
             decision_report=decision_report,
             doc_drift_report=doc_drift_report,
             git_metadata_list=git_metadata_list,
+            vector_store=vector_store,
             progress=progress,
         )
 

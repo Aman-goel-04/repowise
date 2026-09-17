@@ -238,20 +238,11 @@ def _run_deterministic_generation_phase(
     Returns the embedder actually used, which the caller persists so a later
     ``repowise update`` embeds the same way rather than re-deciding.
     """
+    from repowise.cli.providers import template_run_embedder
     from repowise.core.generation import GenerationConfig
     from repowise.core.providers.llm.template import TemplateProvider
 
-    # This mode is sold as "no key, no spend", and embedding 2000+ pages
-    # through a hosted embedder is a real bill. ``resolve_embedder`` infers one
-    # from any LLM key it finds in the environment, which is the right default
-    # for a run that is already paying a model and the wrong one here: nobody
-    # who typed --index-only asked to be charged. So a hosted embedder is used
-    # only when the user named it, through --embedder or REPOWISE_EMBEDDER.
-    # Anything else falls back to the mock, which keeps full-text search
-    # working and leaves semantic search to be built later with
-    # ``repowise reindex``.
-    hosted = embedder_name_resolved not in ("mock", "ollama")
-    embedder = "mock" if hosted and not embedder_was_requested else embedder_name_resolved
+    embedder = template_run_embedder(embedder_name_resolved, embedder_was_requested)
 
     print_phase_header(
         console,
@@ -1412,6 +1403,25 @@ def init_command(
 
     orchestrator_mode = OrchestratorMode.FAST if run_mode == "fast" else OrchestratorMode.STANDARD
 
+    # The store generation would build anyway, hoisted so the analysis
+    # checkpoint inside the pipeline can dedup decisions against it;
+    # ``run_repo_generation`` reuses this object. Never more than that store,
+    # so the exclusions are the runs that build none: a dry run, and index-only
+    # fast mode, which also pins no embedder for a table to be read back with.
+    # Keyless is dropped rather than handed to a matcher that refuses it.
+    index_vector_store = None
+    if not dry_run and not (index_only and run_mode == "fast"):
+        from repowise.cli.providers import build_embedder, build_vector_store, template_run_embedder
+        from repowise.core.providers.embedding import store_has_semantic_vectors
+
+        _store_embedder = (
+            template_run_embedder(embedder_name_resolved, embedder_was_requested)
+            if index_only or no_provider
+            else embedder_name_resolved
+        )
+        _candidate = build_vector_store(repo_path, build_embedder(_store_embedder, repo_path))
+        index_vector_store = _candidate if store_has_semantic_vectors(_candidate) else None
+
     index_columns: list[Any] = [
         SpinnerColumn(spinner_name=OWL_SPINNER, style=BRAND_STYLE),
         TextColumn("[progress.description]{task.description}"),
@@ -1466,6 +1476,7 @@ def init_command(
                     include_submodules=include_submodules,
                     generate_docs=False,
                     llm_client=llm_client,
+                    vector_store=index_vector_store,
                     concurrency=concurrency,
                     test_run=test_run,
                     mode=orchestrator_mode,
