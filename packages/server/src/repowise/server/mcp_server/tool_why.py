@@ -490,6 +490,8 @@ async def _why_health_dashboard(repo: str | None) -> dict:
         stale = health["stale_decisions"]
         proposed = health["proposed_awaiting_review"]
         ungoverned = health["ungoverned_hotspots"]
+        retired = health["retired_decisions"]
+        unscoped = health["unscoped_decisions"]
 
         result_data = {
             "mode": "health",
@@ -522,6 +524,17 @@ async def _why_health_dashboard(repo: str | None) -> dict:
             ],
             "ungoverned_hotspots": ungoverned,
             "conflicts": list(health.get("conflicts", [])),
+            # Lanes ``counts`` reported as a number with no list. Query and
+            # path mode do reach these records, but only if you already know
+            # the question or the path — no mode enumerates either lane, which
+            # is what an orientation call is for. ``active`` stays count-only:
+            # it is the lane every other mode exists to serve.
+            "retired_decisions": [
+                {"id": d.id, "title": d.title, "lane": lane} for lane, d in retired
+            ],
+            "unscoped_decisions": [
+                {"id": d.id, "title": d.title, "confidence": d.confidence} for d in unscoped
+            ],
             "_meta": _build_meta(repository=repository),
         }
         for entry in result_data["stale_decisions"]:
@@ -545,6 +558,8 @@ async def _why_health_dashboard(repo: str | None) -> dict:
             ("proposed_awaiting_review", _MAX_HEALTH_PROPOSED),
             ("ungoverned_hotspots", _MAX_HEALTH_UNGOVERNED),
             ("conflicts", 10),
+            ("retired_decisions", _MAX_HEALTH_RETIRED),
+            ("unscoped_decisions", _MAX_HEALTH_RETIRED),
         ):
             cap_collection(
                 result_data,
@@ -651,10 +666,18 @@ _KEYWORD_POOL = 24
 #: verdict. Halved now that ``get_decision_health_summary`` ranks what it
 #: returns: cutting an unranked list only makes a list nobody reads shorter,
 #: cutting a ranked one keeps the part that is worth reading. The full sizes stay
-#: legible in ``counts`` and in the summary line, so nothing is silently dropped.
+#: legible in ``counts`` and in the summary line, and every row cut here is
+#: recoverable through the omission collector, so nothing is silently dropped.
+#:
+#: That clause needs a list to be true of: for a count-only lane there was
+#: nothing to recover, which is why the two below exist.
 _MAX_HEALTH_STALE = 5
 _MAX_HEALTH_PROPOSED = 5
 _MAX_HEALTH_UNGOVERNED = 8
+
+#: Retired records and accepted records naming no file. Same 5 as its peers:
+#: a pointer into history, not a place to read it from.
+_MAX_HEALTH_RETIRED = 5
 
 
 def _authority_of(decision_id: str, accepted: set[str]) -> str:

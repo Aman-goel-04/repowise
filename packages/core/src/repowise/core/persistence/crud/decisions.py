@@ -16,7 +16,7 @@ from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core import __version__
-from repowise.core.analysis.decisions.lifecycle import DECISION_STATUS_ORDER
+from repowise.core.analysis.decisions.lifecycle import DECISION_STATUS_ORDER, status_rank
 from repowise.core.analysis.decisions.provenance import (
     SOURCE_RANK,
     compute_confidence,
@@ -1559,10 +1559,14 @@ async def get_decision_health_summary(
 ) -> dict:
     """Return decision health: counts by lane, stale decisions, ungoverned hotspots.
 
-    The three list fields are returned ranked worst-first: stale by staleness,
-    proposed by confidence, ungoverned hotspots by temporal hotspot score. A
+    The five list fields are returned ranked worst-first: stale by staleness,
+    proposed by confidence, ungoverned hotspots by temporal hotspot score,
+    retired by lane (history before tombstone) and unscoped by confidence. A
     caller that shows only the first few shows the few that matter.
     Callers may truncate; they must not re-order.
+
+    ``retired_decisions`` holds ``(lane, record)`` pairs: the lane is derived
+    from the acceptance, which the ``status`` column may disagree with.
 
     Counts the acceptance, not the status column. The key names are the ones
     every caller already renders, and they keep their product meaning:
@@ -1598,6 +1602,12 @@ async def get_decision_health_summary(
     }
     stale_decisions: list[DecisionRecord] = []
     proposed_decisions: list[DecisionRecord] = []
+    # Counted-only lanes. The record is in hand at the ``continue`` that drops
+    # it, so naming it costs no query. ``retired`` carries its lane because
+    # that lane is derived from the acceptance where there is one, and a
+    # record's ``status`` column may disagree with it.
+    retired_decisions: list[tuple[str, DecisionRecord]] = []
+    unscoped_decisions: list[DecisionRecord] = []
 
     # Files an *accepted* decision names. A candidate naming a hotspot does not
     # make it governed, and counting one did: it removed the file from
@@ -1613,15 +1623,18 @@ async def get_decision_health_summary(
             # never be counted as.
             if d.status in ("dismissed", "deprecated", "superseded"):
                 counts[d.status] = counts.get(d.status, 0) + 1
+                retired_decisions.append((d.status, d))
             else:
                 counts["proposed"] += 1
                 proposed_decisions.append(d)
             continue
         if currency == "superseded":
             counts["superseded"] += 1
+            retired_decisions.append(("superseded", d))
             continue
         if currency == "dismissed":
             counts["dismissed"] += 1
+            retired_decisions.append(("dismissed", d))
             continue
         counts["active"] += 1
         if currency == "needs_review":
@@ -1629,6 +1642,7 @@ async def get_decision_health_summary(
             stale_decisions.append(d)
         if currency == "uncheckable":
             counts["unscoped"] += 1
+            unscoped_decisions.append(d)
         for fp in json.loads(d.affected_files_json):
             governed_files.add(fp)
 
@@ -1670,6 +1684,11 @@ async def get_decision_health_summary(
     # back-filled; the id tiebreak makes the key total, so two runs agree.
     stale_decisions.sort(key=lambda d: (-(d.staleness_score or 0.0), d.id))
     proposed_decisions.sort(key=lambda d: (-(d.confidence or 0.0), d.id))
+    # Retired by lane, history before tombstone. Not by ``updated_at``: it
+    # moves on any write, so it does not say when a record was retired.
+    # ``unscoped`` by confidence, the key ``proposed`` already uses.
+    retired_decisions.sort(key=lambda pair: (status_rank(pair[0]), pair[1].id))
+    unscoped_decisions.sort(key=lambda d: (-(d.confidence or 0.0), d.id))
 
     # Phase 3B: surface contradictory active decisions (conflicts_with edges).
     from ..decision_graph import list_conflict_edges
@@ -1697,4 +1716,6 @@ async def get_decision_health_summary(
         "proposed_awaiting_review": proposed_decisions,
         "ungoverned_hotspots": ungoverned,
         "conflicts": conflicts,
+        "retired_decisions": retired_decisions,
+        "unscoped_decisions": unscoped_decisions,
     }
