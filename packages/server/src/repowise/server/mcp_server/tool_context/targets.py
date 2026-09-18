@@ -18,7 +18,10 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.generation.page_selection import STALE_STATUSES
-from repowise.core.ingestion.models import NON_DEPENDENCY_EDGE_TYPES
+from repowise.core.ingestion.models import (
+    NON_DEPENDENCY_EDGE_TYPES,
+    SYMBOL_USE_EDGE_TYPES,
+)
 from repowise.core.persistence.crud import get_kg_layers, get_kg_tour_steps
 from repowise.core.persistence.decision_graph import get_governing_decisions
 from repowise.core.persistence.models import (
@@ -62,6 +65,10 @@ from repowise.server.mcp_server.tool_risk.assessment import fix_annotation
 #: all, and nothing in the code or its history says whether that is a decision
 #: or an omission. This constant only names the cut that already existed.
 _MAX_USED_BY = 20
+
+#: Bound parameters per rank lookup. SQLite's ceiling is 999 before 3.32 and
+#: 32,766 after, and which applies depends on the libsqlite3 linked at runtime.
+_RANK_LOOKUP_CHUNK = 500
 
 # Skeleton-by-default is GONE; ``include=["skeleton"]`` still serves it in full.
 #
@@ -822,19 +829,24 @@ async def _resolve_one_target(
                 docs["file_summary"] = sym_page.summary or ""
                 if want_full_doc:
                     docs["documentation"] = sym_page.content
-            # Used by — same requirement as ``imported_by`` above, plus the one
-            # ``imported_by`` does not have: this list is cut at
-            # ``_MAX_USED_BY`` and the agent never learns what fell off. Left
-            # unordered, the survivors were whichever rows the table handed
-            # back: on the 42-index corpus 4,743 symbol targets carry more than
-            # ``_MAX_USED_BY`` users, and ranking moves the kept set on 4,447 of
-            # them, a median of 7 of the 20 and up to all 20. Rank by the source
-            # file's PageRank, path breaking ties. Distinct sources, because two
-            # files joined by both an import and a call are one user of this
-            # symbol — that is a guard, not a fix: the same corpus holds zero
-            # duplicate rows, so it costs nothing and prevents nothing today.
+            # Used by: the files that use THIS symbol. Keyed on the symbol's
+            # own node id, because a ``calls`` edge is symbol-to-symbol and
+            # targets a ``path::Name``; keyed on the file path, as it was until
+            # now, it could only match edges into the whole file and answered
+            # "who imports this symbol's file" instead. Positive vocabulary
+            # rather than a negative filter, for the reason #1905 gave the
+            # sibling path in get_risk: an untyped edge must not become a use.
+            #
+            # Sources fold to their file, which keeps one row per using file and
+            # keeps this distinct from ``callers`` (symbol-grained, calls-only,
+            # opt-in). The list is cut at ``_MAX_USED_BY`` and the agent never
+            # learns what fell off, so which twenty survive is the whole of what
+            # it says: on the 42-index corpus ranking moves the kept set on
+            # 4,447 of the 4,743 targets over the cap, a median of 7 of the 20.
+            # Rank by the source file's PageRank, path breaking ties.
+            sym_node_id = getattr(sym, "symbol_id", None) or getattr(sym, "node_id", None)
             res = await session.execute(
-                select(GraphEdge.source_node_id, GraphNode.pagerank)
+                select(GraphEdge.source_node_id, GraphNode.file_path)
                 .outerjoin(
                     GraphNode,
                     (GraphNode.repository_id == GraphEdge.repository_id)
@@ -842,15 +854,33 @@ async def _resolve_one_target(
                 )
                 .where(
                     GraphEdge.repository_id == repo_id,
-                    GraphEdge.target_node_id == sym.file_path,
-                    GraphEdge.edge_type.notin_(NON_DEPENDENCY_EDGE_TYPES),
+                    GraphEdge.target_node_id == sym_node_id,
+                    GraphEdge.edge_type.in_(SYMBOL_USE_EDGE_TYPES),
                 )
             )
-            best_rank: dict[str, float] = {}
-            for source_node_id, pagerank in res.all():
-                rank = float(pagerank or 0.0)
-                if rank > best_rank.get(source_node_id, -1.0):
-                    best_rank[source_node_id] = rank
+            # An id the graph no longer holds still names its file, so fall
+            # back to the path half rather than dropping a real user.
+            user_files = {
+                file_path or source_node_id.split("::", 1)[0]
+                for source_node_id, file_path in res.all()
+            }
+            # A same-file caller is a real use, but naming the file already
+            # being read spends a capped row; ``callers`` has it at symbol grain.
+            user_files.discard(sym.file_path)
+            # Looked up by the folded path, not joined above: a source whose
+            # symbol node is missing has no file to join through and would rank
+            # 0.0. Chunked because this binds one parameter per using file.
+            best_rank: dict[str, float] = {p: 0.0 for p in user_files}
+            ordered = sorted(user_files)
+            for start in range(0, len(ordered), _RANK_LOOKUP_CHUNK):
+                rank_rows = await session.execute(
+                    select(GraphNode.node_id, GraphNode.pagerank).where(
+                        GraphNode.repository_id == repo_id,
+                        GraphNode.node_id.in_(ordered[start : start + _RANK_LOOKUP_CHUNK]),
+                    )
+                )
+                for node_id, pagerank in rank_rows.all():
+                    best_rank[node_id] = float(pagerank or 0.0)
             used_by = filter_path_list(
                 sorted(best_rank, key=lambda p: (-best_rank[p], p)), exclude_spec
             )
