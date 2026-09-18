@@ -368,13 +368,6 @@
   )
 )
 
-; Bare type argument: Box<MyType>, Vec<MyType>, Arc<MyType> -- the generic's
-; own head (e.g. "Box") is filtered as a builtin, so the inner type needs its
-; own capture to reach the resolver at all.
-(type_arguments
-  (type_identifier) @param.type
-)
-
 ; Type argument in turbofish: func::<MyType>(...), Channel::<MyType>::new()
 (generic_function
   type_arguments: (type_arguments
