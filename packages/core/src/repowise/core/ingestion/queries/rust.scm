@@ -387,6 +387,26 @@
   )
 )
 
+; Type argument: Option<MyType>, Vec<super::MyType>, HashMap<K, MyType>.
+; One pattern for every shape: the Rust head extractor unwraps
+; ``scoped_type_identifier`` / ``reference_type`` / ``generic_type`` and
+; filters the builtins, so widening the capture costs nothing.
+(type_arguments
+  (_) @param.type
+)
+
+; Field type: struct Foo { bar: MyType }, including ``&T``, ``super::T`` and
+; ``Option<T>``. ``enum_variant`` reuses ``field_declaration`` for struct-like
+; variant bodies (``Received { state: MyType }``), so this covers those too.
+;
+; Rust intra-crate field references need no ``use`` -- path-qualified or
+; same-module access is legal without importing -- so without this capture the
+; reference never becomes a graph edge and the field's type reads as having no
+; importers.
+(field_declaration
+  type: (_) @param.type
+)
+
 ; ---------------------------------------------------------------------------
 ; Fields
 ; ---------------------------------------------------------------------------

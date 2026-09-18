@@ -108,6 +108,7 @@ from .parser_helpers import (
     _qualified_cpp_parent,
     _qualified_pascal_parent,
     _run_query,
+    _rust_shadowed_by_type_param,
 )
 from .python_local_refs import extract_python_local_refs
 from .sfc_source import component_call_sites, prepare_source
@@ -2387,6 +2388,13 @@ class ASTParser:
             for type_node in type_nodes:
                 head = head_of(type_node, src)
                 if not head:
+                    continue
+                # ``struct Wrapper<Item> { value: Item }`` binds Item as a type
+                # parameter, and the capture cannot tell that from a reference
+                # to a real ``struct Item``. The head extractor drops a
+                # single-letter ``T`` but not a named one, so the shadow has to
+                # be read off the enclosing item's ``type_parameters``.
+                if lang == "rust" and _rust_shadowed_by_type_param(type_node, head, src):
                     continue
                 line = type_node.start_point[0] + 1
                 key = (head, line)
