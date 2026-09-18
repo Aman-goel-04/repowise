@@ -29,6 +29,12 @@ class FileContext:
     # Map symbol-name → complexity metrics for functions/methods in this
     # file. Symbols without a complexity row default to CCN=1, nesting=0.
     function_metrics: dict[str, FunctionComplexity] = field(default_factory=dict)
+    # Every walked function, in document order and NOT keyed by name, because
+    # name-keying drops all but one of a file's anonymous ``it`` callbacks.
+    # Read only by ``mock_saturated_test``, which is advisory: re-keying
+    # ``function_metrics`` is the real fix and would change what every
+    # calibrated marker sees, so it needs its own defect-corpus evidence.
+    all_functions: tuple[FunctionComplexity, ...] = ()
     # Per-class aggregate metrics (LCOM4, method count, size). Empty for
     # languages whose walker map doesn't opt into class-level analysis
     # (see ``complexity.languages``). Consumed by ``low_cohesion`` /
