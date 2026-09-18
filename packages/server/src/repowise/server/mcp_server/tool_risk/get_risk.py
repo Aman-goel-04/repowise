@@ -276,21 +276,25 @@ async def get_risk(
             analyzer = PRBlastRadiusAnalyzer(session, repo_id, repository_alias=ctx.alias)
             pr_blast_radius = await analyzer.analyze_files(changed_files, exclude_spec=exclude_spec)
 
+    # Enrichers key on a path prefix, so they will bind signal to a card that
+    # resolved nothing. Mutation is in place, so ``results`` keeps its order.
+    scored = [r for r in results if r.get("resolved") is not False]
+
     # Cross-repo blast radius enrichment (Phase 3 + 4)
     await _enrich_cross_repo(
-        results, ctx.alias, collector, include_graph="graph" in include_set
+        scored, ctx.alias, collector, include_graph="graph" in include_set
     )
 
     # ---- Code-health enrichment --------------------------------------------
     # Attach per-file health_score + top_biomarkers (up to 3) drawn from the
     # health tables. Conservative: missing data → no field, never invented.
-    await _enrich_health(results, ctx, repo_id)
+    await _enrich_health(scored, ctx, repo_id)
 
     # ---- Precedent enrichment ----------------------------------------------
     # One integer per target: how many dated episodes are bound here. A number
     # invites a follow-up get_why; a paragraph would spend the budget of every
     # caller that only wanted the risk card. Absent rather than zero.
-    await asyncio.to_thread(_enrich_episodes, results, ctx.path)
+    await asyncio.to_thread(_enrich_episodes, scored, ctx.path)
 
     response: dict = {
         "targets": {r["target"]: r for r in results},
