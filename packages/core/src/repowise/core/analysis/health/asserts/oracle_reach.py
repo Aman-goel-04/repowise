@@ -1,7 +1,8 @@
 """Cross-file oracle resolution for ``assertion_free_test``.
 
-A test whose own assertion count is zero has still checked something if it
-handed the job to a helper that asserts. ``_asserting_names`` resolves that
+A test with no oracle of its own -- ``asserts/predicate.checks_something``
+answers that, and it is four questions rather than an assertion count -- has
+still checked something if it handed the job to a helper that has one. ``_asserting_names`` resolves that
 within one file; a JS/TS suite keeps its helpers in another module and a
 class-based suite inherits them from a base class, so the same delegation is
 invisible to a same-file rule by construction.
@@ -22,6 +23,13 @@ its call edges are attributed to it. A JS/TS test case is an anonymous callback
 handed to ``it(...)``; the graph has **no node for it at all**, and the calls
 inside it are attributed to the enclosing module. Resolving from the module node
 would make one delegating test suppress every other test in its file, so:
+
+Resolution asks for the function, never for whatever encloses it:
+``resolve_function``'s containment fallback exists to tolerate a decorator
+offset, and read as identity it would answer one wrapper symbol for every
+callback inside it. Declining falls through to the file lane, which is
+per-function. The sentence above is therefore true of the shapes that reach the
+file lane *because* of that bound, not independently of it.
 
 * **call-edge** -- the test resolves to a symbol; walk its own outgoing edges.
   Precise attribution, bounded depth. Python, Go, Java.
@@ -84,6 +92,7 @@ from typing import TYPE_CHECKING, Any
 from ....test_paths import is_test_related_path
 from ...execution_graph import ExecutionGraphIndex, file_of_symbol, reachable_to_sink
 from ..coverage import is_test_file
+from .predicate import checks_something
 
 if TYPE_CHECKING:
     from ..complexity import FileComplexity
@@ -189,9 +198,9 @@ def collect_cross_file_oracles(
         if not is_test_related_path(path, pf.file_info.language):
             continue
         for fn in fcx.functions:
-            if not (fn.assertion_count or fn.verification_count):
+            if not checks_something(fn):
                 continue
-            sid = index.resolve_function(path, fn.start_line)
+            sid = index.resolve_function(path, fn.start_line, func_end=fn.end_line)
             if sid is not None:
                 oracle_name.setdefault(sid, fn.name)
     if not oracle_name:
@@ -223,7 +232,13 @@ def _resolve_one(
     oracle_name: dict[str, str],
     by_file_name: dict[str, dict[str, set[str]]],
 ) -> OracleReach | None:
-    sid = index.resolve_function(path, fn.start_line)
+    # ``func_end`` asks for this function rather than for whatever encloses it.
+    # The containment fallback answers the innermost symbol spanning the start
+    # line, and a symbol wrapped around several test callbacks spans all of
+    # them, so without the bound one delegating test would resolve to the same
+    # node as its silent siblings and suppress them. Unresolved here falls
+    # through to the file-edge lane, whose two conjuncts are per-function.
+    sid = index.resolve_function(path, fn.start_line, func_end=fn.end_line)
     if sid is not None:
         info = reach.get(sid)
         # ``distance == 0`` means this node IS an oracle, which happens when a
@@ -311,8 +326,4 @@ def _candidates(pf: Any, fcx: FileComplexity) -> list[Any]:
     """Test cases in a test file that check nothing themselves."""
     if not is_test_file(pf.file_info.path):
         return []
-    return [
-        fn
-        for fn in fcx.functions
-        if fn.is_test_case and not (fn.assertion_count or fn.verification_count)
-    ]
+    return [fn for fn in fcx.functions if fn.is_test_case and not checks_something(fn)]

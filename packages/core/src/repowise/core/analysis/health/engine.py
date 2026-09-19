@@ -110,6 +110,37 @@ log = structlog.get_logger(__name__)
 # walk itself is unchanged, but this stamp keys the walk and duplication-token
 # caches, so bumping it re-walks and re-tokenizes anyway.
 #
+# v20: ``assertion_free_test`` stops reading a containing symbol as the test.
+# ``ExecutionGraphIndex.resolve_function`` falls back to the innermost symbol
+# whose range holds the start line, which tolerates a decorator offset but also
+# answers a wrapper declaration -- a TS ``const suite = describe(...)`` spans
+# every callback inside it -- for every test in it at once. One delegating test
+# then suppressed its silent siblings through that wrapper's edge. The oracle
+# pass now asks for the function rather than its enclosure, so those findings
+# come back, and nothing re-mints the rows a v19 store suppressed except this
+# stamp.
+#
+# v20 also reads a hand-rolled ``raise`` / ``throw`` as an oracle, for which the
+# walker records one new ``FunctionComplexity`` field, ``raise_count``, that a
+# cached v19 walk does not carry at all. It is its own field rather than a term
+# in ``assertion_count`` precisely so that it moves nothing calibrated:
+# ``mock_saturated_test`` and ``large_assertion_block`` read ``assertion_count``
+# and ``assertion_blocks`` directly and are untouched. Only
+# ``assertion_free_test`` and the oracle pass behind it read the new field, both
+# through ``asserts/lexicon.checks_something``, and both as a boolean.
+#
+# v20 finally reads an assertion call from a position ``_assertion_tier`` never
+# classifies, because that pass classifies statements: a ``const e =
+# expect(x)`` is a declaration and a ``return expect(x).toBe(1)`` is a return,
+# and neither reaches it. ``checks_something`` asks ``called_names`` for a
+# callee under ``NARROW_PREFIXES`` as a floor under the count, and the walker
+# now collects those names through nested function bodies rather than stopping
+# at them -- a function nested in an already-collected one is never collected
+# as an entry of its own, so its calls were recorded nowhere at all. The
+# *counts* still stop at a nested function, so ``assertion_count`` is
+# bit-identical to v19; only the name sets widen, and a cached v19 walk carries
+# the narrower ones. No score moves; the marker is advisory.
+#
 # v19: ``assertion_free_test`` resolves a test's oracle across file
 # boundaries, on a call edge rather than by name, so a test that delegates its
 # checks to a helper in another module is no longer called assertion-free. The
@@ -182,7 +213,7 @@ log = structlog.get_logger(__name__)
 # forms. Files that were counted untested and are not become tested, which
 # moves untested-hotspot findings and the scores that carry them, on every
 # language with a prefix or spec convention rather than Ruby alone.
-HEALTH_ANALYZER_VERSION = 19
+HEALTH_ANALYZER_VERSION = 20
 
 
 def walked_functions(

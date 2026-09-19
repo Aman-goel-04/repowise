@@ -7,7 +7,9 @@ never fails the refactor it was written to protect. Meszaros names the smell
 
 It is the one marker in this family that is objectively decidable. The others
 ask a question of degree and need a threshold nobody has calibrated; this one
-asks whether a count is zero.
+asks whether the test has an oracle at all. That is four questions rather than
+one count -- ``asserts/predicate.checks_something`` -- but every one of them is
+yes or no, and none of them is a threshold.
 
 **A mock verification counts as an assertion here, and this is deliberately the
 opposite of ``mock_saturated_test``.** Zhu et al. (FSE 2025,
@@ -20,6 +22,14 @@ marker measures verification itself and so must exclude it from its denominator.
 Same call, opposite treatment, two different questions. The tiers that keep them
 apart are in ``complexity/assertions.py``.
 
+**A hand-rolled ``throw`` counts as an oracle too.** A test that ends
+``if (!ok) throw new Error(...)``, and a wait helper that gives up by throwing
+rather than by asserting, both fail their test on the property the author named.
+No assertion vocabulary reaches either, because a ``throw`` is a statement and
+the vocabularies match callee names. ``asserts/lexicon.checks_something`` is the
+predicate; it is deliberately not folded into ``assertion_count``, which is
+calibrated.
+
 **This marker is advisory and never deducts.** See ``ADVISORY_DIMENSION`` in
 ``scoring.py``, and LANGUAGE_SUPPORT.md#code-health-coverage for the measured
 per-language precision and the false positives it does not separate.
@@ -27,6 +37,7 @@ per-language precision and the false positives it does not separate.
 
 from __future__ import annotations
 
+from ..asserts.predicate import checks_something
 from ..coverage import is_test_file
 from ..models import Severity
 from .base import BiomarkerResult, FileContext
@@ -61,7 +72,7 @@ class AssertionFreeTestDetector:
             # is asking precisely the functions that have none.
             if not fn.is_test_case:
                 continue
-            if fn.assertion_count or fn.verification_count:
+            if checks_something(fn):
                 continue
             if fn.called_names & oracles:
                 continue
@@ -97,8 +108,10 @@ def _asserting_names(ctx: FileContext) -> frozenset[str]:
     method on a test-local double suppresses against a module-level function of
     that name. Both directions hide a real finding rather than invent one,
     which is the tolerable way round for an advisory marker, but neither is
-    free. A helper nested inside the test body is not collected as a function
-    at all, so it suppresses nothing.
+    free. A helper nested inside the test body is still not collected as a
+    function at all, so it suppresses nothing *by name* -- but its calls now
+    roll up into the enclosing test's own ``called_names``, so the test it
+    sits in is answered directly rather than through this set.
 
     Same file only, and by name. The cross-file half of the same question --
     a shared JS fixture, an inherited base-class helper -- is answered from the
@@ -107,11 +120,7 @@ def _asserting_names(ctx: FileContext) -> frozenset[str]:
     still cannot see it lists itself; ``super().test_x(...)`` is one of them,
     the resolver having no ``super()`` receiver handling.
     """
-    return frozenset(
-        fn.name.lower()
-        for fn in ctx.all_functions
-        if fn.assertion_count or fn.verification_count
-    )
+    return frozenset(fn.name.lower() for fn in ctx.all_functions if checks_something(fn))
 
 
 BIOMARKER = AssertionFreeTestDetector()

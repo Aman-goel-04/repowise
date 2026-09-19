@@ -197,6 +197,137 @@ def test_a_receiver_qualified_call_does_not_borrow_a_sibling_test_s_edge(
     assert 7 not in lines, f"a qualified call must not borrow the file's edge: {lines}"
 
 
+_WRAPPED_SUITE = {
+    "tests/helpers.ts": ("export function checkOk(v: string) {\n  expect(v).toBe('ok');\n}\n"),
+    # ``const suite = describe(...)`` is a named declaration, so the graph holds
+    # one symbol spanning every callback inside it. Both ``it`` bodies sit in
+    # its line range and the import edge is attributed to it, not to either of
+    # them.
+    "tests/thing.test.ts": (
+        "import { checkOk } from './helpers';\n"
+        "export const suite = describe('outer', () => {\n"
+        "  it('delegates', () => {\n"
+        "    checkOk(run());\n"
+        "  });\n"
+        "  it('checks nothing', () => {\n"
+        "    run();\n"
+        "  });\n"
+        "});\n"
+    ),
+}
+
+
+def test_a_symbol_wrapped_around_the_suite_does_not_answer_for_a_test_inside_it(
+    tmp_path: Path,
+) -> None:
+    """A containing symbol is not the test, and must not speak for it.
+
+    ``resolve_function`` falls back to the innermost symbol whose range
+    contains the start line, which exists to tolerate a decorator offset. A
+    wrapper around the whole suite contains every callback in it, so reading
+    that fallback as identity would let the wrapper's one edge to an asserting
+    helper suppress every test beside the one that made it -- the same
+    one-test-licenses-its-siblings failure the file lane's two conjuncts
+    prevent, arriving through the other lane.
+    """
+    _require("typescript")
+    walked, graph = _build(tmp_path, _WRAPPED_SUITE)
+    resolved = collect_cross_file_oracles(walked, graph)
+    lines = resolved.get("tests/thing.test.ts", {})
+    assert 6 not in lines, f"the silent callback borrowed the wrapper's edge: {lines}"
+    assert _flagged(walked, graph, "tests/thing.test.ts") == ["it callback"]
+
+
+def test_a_delegating_test_inside_such_a_wrapper_still_resolves(tmp_path: Path) -> None:
+    """The mirror: rejecting the wrapper must not cost the real delegation.
+
+    Declining the containing symbol has to fall through to the file-edge lane
+    rather than answer ``None``. Without that, tightening the call-edge lane
+    would trade a false suppression for a false finding on the very test the
+    feature exists for.
+    """
+    _require("typescript")
+    walked, graph = _build(tmp_path, _WRAPPED_SUITE)
+    resolved = collect_cross_file_oracles(walked, graph)
+    lines = resolved.get("tests/thing.test.ts", {})
+    assert 3 in lines, f"the delegating callback resolved nothing: {lines}"
+    assert lines[3].basis == "file-edge"
+    assert lines[3].oracle == "tests/helpers.ts::checkOk"
+
+
+def test_a_wait_helper_that_gives_up_by_throwing_is_an_oracle(tmp_path: Path) -> None:
+    """A helper that fails its caller by throwing checks as much as one that
+    asserts. ``waitFor(events, p)`` that throws when the predicate never
+    matches is the common shape, and no assertion vocabulary names ``throw``,
+    so without counting it the helper reads as checking nothing and every test
+    delegating to it is reported."""
+    _require("typescript")
+    walked, graph = _build(
+        tmp_path,
+        {
+            "tests/wait.ts": (
+                "export function waitForEvent(events: string[], want: string) {\n"
+                "  if (!events.includes(want)) {\n"
+                "    throw new Error(`never saw ${want}`);\n"
+                "  }\n"
+                "}\n"
+            ),
+            "tests/thing.test.ts": (
+                "import { waitForEvent } from './wait';\n"
+                "\n"
+                "it('waits', () => {\n"
+                "  waitForEvent(collect(), 'done');\n"
+                "});\n"
+                "\n"
+                "it('checks nothing', () => {\n"
+                "  run();\n"
+                "});\n"
+            ),
+        },
+    )
+    resolved = collect_cross_file_oracles(walked, graph)
+    lines = resolved.get("tests/thing.test.ts", {})
+    assert 3 in lines, f"the throwing helper was not read as an oracle: {lines}"
+    assert lines[3].oracle == "tests/wait.ts::waitForEvent"
+    assert 7 not in lines
+    assert _flagged(walked, graph, "tests/thing.test.ts") == ["it callback"]
+
+
+def test_a_wrapper_sharing_a_start_line_with_its_first_callback_is_still_declined(
+    tmp_path: Path,
+) -> None:
+    """The bound has to cover the exact lookup, not only the fallback.
+
+    ``resolve_function`` answers an exact start-line match before it reaches
+    the containment scan. Put the wrapper and its first callback on one
+    physical line and the wrapper wins that match, so without the same bound
+    on it the fix would be defeated by formatting alone.
+    """
+    _require("typescript")
+    walked, graph = _build(
+        tmp_path,
+        {
+            "tests/helpers.ts": (
+                "export function checkOk(v: string) {\n  expect(v).toBe('ok');\n}\n"
+            ),
+            "tests/thing.test.ts": (
+                "import { checkOk } from './helpers';\n"
+                "export const suite = describe('outer', () => "
+                "{ it('delegates', () => { checkOk(run()); });\n"
+                "  it('checks nothing', () => {\n"
+                "    run();\n"
+                "  });\n"
+                "});\n"
+            ),
+        },
+    )
+    resolved = collect_cross_file_oracles(walked, graph)
+    lines = resolved.get("tests/thing.test.ts", {})
+    assert 3 not in lines, f"the silent callback borrowed the wrapper's edge: {lines}"
+    assert 2 in lines, f"the delegating callback resolved nothing: {lines}"
+    assert lines[2].basis == "file-edge"
+
+
 # --------------------------------------------------------------------------
 # The negative cases: what must still fire
 # --------------------------------------------------------------------------
