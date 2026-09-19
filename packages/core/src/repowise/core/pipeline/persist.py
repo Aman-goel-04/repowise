@@ -2064,9 +2064,20 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
     # with half the surfaces reading each. Idempotent, and it never reopens a
     # review action somebody already performed.
     try:
-        from repowise.core.persistence.decision_migration import apply_migration
+        from repowise.core.persistence.decision_migration import (
+            apply_migration,
+            backfill_scope_basis,
+            backfill_session_scope_basis,
+            prune_unindexed_scope_files,
+        )
 
         await apply_migration(session, repo_id)
+        # Beside it, and for the same reason: these repair rows written before
+        # the rule existed, and nothing re-extracts them. The prune runs first
+        # so the two basis repairs judge the file list they will leave behind.
+        await prune_unindexed_scope_files(session, repo_id)
+        await backfill_scope_basis(session, repo_id)
+        await backfill_session_scope_basis(session, repo_id)
     except Exception as _migrate_err:
         logger.debug("decision_entity_migration_skipped", error=str(_migrate_err))
 

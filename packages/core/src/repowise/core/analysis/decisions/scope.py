@@ -15,10 +15,19 @@ from repowise.core.support_paths import file_population
 from repowise.core.test_paths import is_test_related_path
 
 __all__ = [
+    "MAX_GOVERNING_FILES",
+    "NON_BINDING_SCOPE_BASES",
+    "SCOPE_BASIS_FOOTPRINT",
+    "SCOPE_BASIS_PROXIMITY",
+    "SCOPE_BASIS_REPOSITORY",
+    "SCOPE_BASIS_STATED",
     "bind_scope_files",
+    "binds_to_paths",
+    "commit_scope_basis",
     "commit_scope_files",
     "derive_decision_scope",
     "resolve_module_nodes",
+    "session_scope_basis",
 ]
 
 #: Upper bound on the directories one record may claim. A record naming files
@@ -39,6 +48,45 @@ _MAX_MODULES = 12
 #: session-mined record, through :func:`bind_scope_files`: a decision made in
 #: one conversation is not about every file that conversation happened to open.
 _MAX_FILES = 20
+
+
+#: The basis value marking a scope that is a commit's footprint rather than a
+#: claim about particular files. Stored on the record, read wherever a file is
+#: asked what governs it. Any other value (including the empty default) binds.
+SCOPE_BASIS_FOOTPRINT = "commit_footprint"
+
+#: The basis value marking files a session merely had open around the moment a
+#: decision was stated. A session candidate takes the paths it was near --
+#: the last few touched, plus what the next few events touch -- so the list is
+#: proximity and not a claim, and a decision that spans unrelated parts of the
+#: tree is usually a working rule that the session happened to restate while
+#: editing them.
+SCOPE_BASIS_PROXIMITY = "session_proximity"
+
+#: The basis value for a record whose scope is the repository itself. A
+#: working agreement governs how the work is conducted, so it is true
+#: everywhere and specific nowhere; :data:`AGREEMENT_SCOPE` is the same claim
+#: on the acceptance row.
+SCOPE_BASIS_REPOSITORY = "repository"
+
+#: The basis value marking a scope a person stated: typed at the CLI, written
+#: into the manifest, or confirmed on review. It binds, like the empty default
+#: does; the difference is that the backfill repairs an empty basis and never
+#: touches this one, so a hand-narrowed scope is not re-marked as a footprint
+#: on the next index.
+SCOPE_BASIS_STATED = "stated"
+
+#: Above this many files, a commit-derived list stops being a claim about
+#: files and becomes the footprint of the change it was mined from. The miner
+#: reads one decision out of one commit body and has no per-file evidence, so
+#: it takes the commit's whole list: true about the commit, false about most
+#: of the files in it.
+#:
+#: A breadth rule rather than a relevance one because relevance was tried and
+#: does not work. Overlap between a decision's text and a file's own diff hunk
+#: scores the worst answers highest, since lexical similarity tracks the
+#: subsystem a file sits in and not whether the decision governs it.
+MAX_GOVERNING_FILES = 10
 
 
 #: Which population a scope entry is ranked under, narrowest claim first. A
@@ -64,6 +112,67 @@ def commit_scope_files(files: Sequence[str] | None) -> list[str]:
     rather than depending on the order git happened to list them in.
     """
     return sorted(_normalized(files))[:_MAX_FILES]
+
+
+def commit_scope_basis(files: Sequence[str] | None) -> str:
+    """The scope basis for a record mined from one commit's file list.
+
+    Takes the commit's *whole* list, before :func:`commit_scope_files` caps
+    it, so that a large commit stored as a capped list is still a footprint.
+    """
+    return SCOPE_BASIS_FOOTPRINT if len(_normalized(files)) > MAX_GOVERNING_FILES else ""
+
+
+#: Every basis that answers "these files are not what this record is about".
+#: One set so a new one is added in a single place and every surface honours
+#: it at once.
+NON_BINDING_SCOPE_BASES: frozenset[str] = frozenset(
+    {SCOPE_BASIS_FOOTPRINT, SCOPE_BASIS_PROXIMITY, SCOPE_BASIS_REPOSITORY}
+)
+
+
+def session_scope_basis(files: Sequence[str] | None, *, is_agreement: bool) -> str:
+    """The scope basis for a record mined from a session transcript.
+
+    Session scope is not a footprint -- ``bind_scope_files`` already caps and
+    orders it -- so breadth in files is the wrong measure and does not
+    separate. What separates is whether the files sit together. Measured over
+    32 labelled file/decision pairs: a record whose files share one directory
+    governs them 67% of the time, one spanning two or more governs 19%, and
+    one spanning three or more top-level packages governs none of them.
+
+    That is the same distinction :func:`derive_decision_scope` already draws,
+    so it is drawn with the same rule rather than a second threshold: a
+    session record that is cross-module is a rule the session restated while
+    working, not a claim about the files it was working on.
+    """
+    if is_agreement:
+        return SCOPE_BASIS_REPOSITORY
+    kept = _normalized(files)
+    if len(kept) <= 1:
+        return ""
+    return (
+        SCOPE_BASIS_PROXIMITY
+        if len(resolve_module_nodes(kept)) > 1
+        else ""
+    )
+
+
+def binds_to_paths(scope_basis: str | None) -> bool:
+    """Whether a record with this basis may answer "what governs this path".
+
+    The one predicate every path-scoped surface asks, so the wiki pages, the
+    ``get_why`` lanes, ``get_context``, the decision graph and the health
+    findings agree on which records are specific enough to name a path. A
+    record that fails it keeps its files and its place in repository-wide
+    answers -- search, the overview, a lookup by id.
+
+    Modules are gated with files. A record's module list is
+    :func:`resolve_module_nodes` over the same file list, so it is no better
+    evidenced, and gating one without the other would leave the surfaces
+    reading this column disagreeing with the ones reading the graph.
+    """
+    return scope_basis not in NON_BINDING_SCOPE_BASES
 
 
 def bind_scope_files(

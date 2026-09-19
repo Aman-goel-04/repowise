@@ -28,6 +28,7 @@ from repowise.core.analysis.decisions.manifest import (
     write_manifest,
 )
 from repowise.core.analysis.decisions.provenance import compute_confidence, rank_for_source
+from repowise.core.analysis.decisions.scope import SCOPE_BASIS_STATED
 
 from .crud.authority import (
     accepted_decision_ids,
@@ -228,6 +229,9 @@ async def _apply_entry(
         record.confidence = _entry_confidence(entry)
     record.kind = entry.kind or ARCHITECTURAL_KIND
     record.affected_files_json = json.dumps(sorted(_scope_files(entry.scope)))
+    # The file is hand-authored and version controlled, so its scope is
+    # stated: a record narrowed here binds to what the file says.
+    record.scope_basis = SCOPE_BASIS_STATED
     # The successor is an id the file wrote down, and the file can be older
     # than the store it is being read into. Storing it unresolved would put a
     # retired id back into the column.
@@ -307,6 +311,7 @@ async def import_manifest(
                 source=entry.source or "cli",
                 kind=entry.kind or ARCHITECTURAL_KIND,
                 affected_files_json=json.dumps(sorted(_scope_files(entry.scope))),
+                scope_basis=SCOPE_BASIS_STATED,
                 evidence_commits_json=json.dumps(sorted(entry.evidence)),
                 superseded_by=entry.superseded_by or None,
                 confidence=_entry_confidence(entry),

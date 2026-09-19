@@ -953,6 +953,14 @@ class DecisionRecord(Base):
     identity_quote: Mapped[str] = mapped_column(
         Text, nullable=False, default="", server_default=""
     )
+    #: How ``affected_files_json`` was arrived at, and so whether this record
+    #: may answer "what governs this path". ``commit_footprint`` means the
+    #: files are the file list of the commit the record was mined from: kept
+    #: for provenance and staleness, skipped by every path-scoped surface.
+    #: See :func:`~repowise.core.analysis.decisions.scope.binds_to_paths`.
+    scope_basis: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", server_default=""
+    )
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
 
     # Verification (anti-hallucination gate, Phase 1D). Aggregate over the

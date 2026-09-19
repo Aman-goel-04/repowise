@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from repowise.core.analysis.decisions.scope import binds_to_paths
 from repowise.core.ingestion.languages.registry import REGISTRY as _LANG_REGISTRY
 from repowise.core.ingestion.models import ParsedFile
 
@@ -331,6 +332,12 @@ def build_decision_maps(
                 "status": status,
             }
             decisions_all.append(payload)
+            # Repo-wide lists keep every record; the per-file index does
+            # not. A footprint would otherwise print on every file its commit
+            # touched. It still reaches the overview, where a claim about a
+            # whole change belongs.
+            if not binds_to_paths(getattr(d, "scope_basis", "")):
+                continue
             for fp in d.affected_files or []:
                 decisions_by_file.setdefault(fp, []).append(payload)
     return decisions_by_file, decisions_all

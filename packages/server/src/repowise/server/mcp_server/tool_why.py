@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from repowise.core.analysis.decision_semantic_match import DECISION_VECTOR_PREFIX
 from repowise.core.analysis.decisions.lifecycle import is_governing, status_rank
+from repowise.core.analysis.decisions.scope import binds_to_paths
 from repowise.core.persistence.crud.authority import (
     accepted_decision_ids,
     decision_currencies,
@@ -1022,11 +1023,17 @@ async def _why_path(query: str, repo: str | None) -> dict:
         )
         all_git_meta = all_git_res.scalars().all()
 
+        # A record whose file list is the footprint of the commit it was
+        # mined from does not answer "what governs this file". It keeps its
+        # files and its place in search; it stops claiming to be specific.
         matched = [
             d
             for d in all_decisions
-            if query in json.loads(d.affected_files_json)
-            or query in json.loads(d.affected_modules_json)
+            if binds_to_paths(d.scope_basis)
+            and (
+                query in json.loads(d.affected_files_json)
+                or query in json.loads(d.affected_modules_json)
+            )
         ]
         # The authority split, and the only test that makes it: a record with
         # no acceptance row is a candidate whatever its status column says.
@@ -1604,6 +1611,9 @@ async def _build_target_context(
         for t in targets:
             governing_records = []
             for d in all_decisions:
+                # Same gate as ``_why_path``, which one target routes to.
+                if not binds_to_paths(d.scope_basis):
+                    continue
                 affected = json.loads(d.affected_files_json)
                 affected_mods = json.loads(d.affected_modules_json)
                 if t in affected or any(t.startswith(m + "/") for m in affected_mods):

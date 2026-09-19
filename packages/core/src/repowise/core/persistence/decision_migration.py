@@ -20,13 +20,19 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.analysis.decisions.kinds import classify_kind
 from repowise.core.analysis.decisions.lifecycle import (
     AGREEMENT_KIND,
     currency_for_legacy_status,
+)
+from repowise.core.analysis.decisions.scope import (
+    MAX_GOVERNING_FILES,
+    SCOPE_BASIS_FOOTPRINT,
+    resolve_module_nodes,
+    session_scope_basis,
 )
 
 from .crud.authority import (
@@ -36,14 +42,18 @@ from .crud.authority import (
     record_acceptance,
     upsert_candidate_meta,
 )
-from .models import DecisionCandidateMeta, DecisionRecord
+from .decision_graph import DecisionNodeLink
+from .models import DecisionCandidateMeta, DecisionRecord, GraphNode
 
 __all__ = [
     "MigrationPlan",
     "RowPlan",
     "apply_migration",
+    "backfill_scope_basis",
+    "backfill_session_scope_basis",
     "plan_json",
     "plan_migration",
+    "prune_unindexed_scope_files",
     "render_plan",
 ]
 
@@ -402,6 +412,180 @@ async def apply_migration(
 
     await session.flush()
     return plan
+
+
+#: Sources whose file list was only ever a commit's whole file list. Neither
+#: miner ever chose a file. Every other source names files it saw, so none of
+#: them is repaired here.
+_COMMIT_FOOTPRINT_SOURCES: frozenset[str] = frozenset({"pr", "git_archaeology"})
+
+
+async def backfill_scope_basis(session: AsyncSession, repository_id: str) -> int:
+    """Mark legacy commit-derived records whose files are a footprint.
+
+    Returns the number of records changed. A runtime repair for the same
+    reason as the rest of this module: the rows predate the column, and only
+    code that runs on an existing store can fix them.
+
+    Only rows with an **empty** basis are touched, which makes this idempotent
+    and leaves a scope somebody set by hand alone.
+
+    The record keeps its files and loses its decision-graph links. Those are
+    dropped here rather than left to the next ``bulk_upsert_decisions``: a
+    record nothing re-extracts is never rewritten, and would keep answering
+    path questions from the graph forever.
+    """
+    rows = (
+        (
+            await session.execute(
+                select(DecisionRecord).where(
+                    DecisionRecord.repository_id == repository_id,
+                    DecisionRecord.source.in_(tuple(_COMMIT_FOOTPRINT_SOURCES)),
+                    DecisionRecord.scope_basis == "",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    changed = 0
+    for rec in rows:
+        try:
+            files = json.loads(rec.affected_files_json or "[]")
+        except ValueError:
+            continue
+        if len(files) <= MAX_GOVERNING_FILES:
+            continue
+        rec.scope_basis = SCOPE_BASIS_FOOTPRINT
+        await session.execute(
+            delete(DecisionNodeLink).where(DecisionNodeLink.decision_id == rec.id)
+        )
+        changed += 1
+    if changed:
+        await session.flush()
+    return changed
+
+
+async def backfill_session_scope_basis(
+    session: AsyncSession, repository_id: str
+) -> int:
+    """Mark legacy session-mined records whose files are proximity, not scope.
+
+    Returns the number of records changed. The companion to
+    :func:`backfill_scope_basis` for the other miner, and empty-basis-only for
+    the same reason: it repairs what the old code wrote and leaves a scope
+    somebody set by hand alone.
+
+    A session record's files are the paths the transcript was near when the
+    decision was stated, so a working rule restated while editing four
+    packages claims all four. Measured over 32 labelled pairs, a record whose
+    files share one directory governs them 67% of the time and one spanning
+    more governs 19%, which is the line :func:`session_scope_basis` draws.
+    """
+    rows = (
+        (
+            await session.execute(
+                select(DecisionRecord).where(
+                    DecisionRecord.repository_id == repository_id,
+                    DecisionRecord.source == "session",
+                    DecisionRecord.scope_basis == "",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    changed = 0
+    for rec in rows:
+        try:
+            files = json.loads(rec.affected_files_json or "[]")
+        except ValueError:
+            continue
+        basis = session_scope_basis(files, is_agreement=rec.kind == AGREEMENT_KIND)
+        if not basis:
+            continue
+        rec.scope_basis = basis
+        await session.execute(
+            delete(DecisionNodeLink).where(DecisionNodeLink.decision_id == rec.id)
+        )
+        changed += 1
+    if changed:
+        await session.flush()
+    return changed
+
+
+#: Below this many indexed file nodes, the graph is treated as unbuilt rather
+#: than as evidence that a scope is wrong. Pruning against a graph that failed
+#: to build would empty every scope in the store, which is the one outcome
+#: worse than the stale entries this removes.
+_MIN_GRAPH_NODES_TO_PRUNE = 50
+
+
+async def prune_unindexed_scope_files(
+    session: AsyncSession, repository_id: str
+) -> int:
+    """Drop scope entries naming a file this repository does not index.
+
+    Returns the number of records changed. Repairs rows written before the
+    indexed-set filter reached the session miner: a transcript names plan
+    docs, scratch files, sibling checkouts and throwaway worktrees, and every
+    one of those resolved on disk and was bound as though it were this
+    codebase.
+
+    Validates against the graph's own file nodes, which is the set
+    ``decision_node_links`` points into, so an entry this drops could never
+    have been a valid link. Skipped entirely when the graph looks unbuilt.
+
+    Rewriting the file list moves the record's identity, which the id
+    migration at the head of the next index settles and leaves an alias for,
+    exactly as it does for a scope edited through the manifest or an
+    acceptance.
+    """
+    indexed = {
+        node_id
+        for (node_id,) in await session.execute(
+            select(GraphNode.node_id).where(
+                GraphNode.repository_id == repository_id,
+                GraphNode.node_type == "file",
+            )
+        )
+    }
+    if len(indexed) < _MIN_GRAPH_NODES_TO_PRUNE:
+        return 0
+
+    rows = (
+        (
+            await session.execute(
+                select(DecisionRecord).where(
+                    DecisionRecord.repository_id == repository_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    changed = 0
+    for rec in rows:
+        try:
+            files = json.loads(rec.affected_files_json or "[]")
+        except ValueError:
+            continue
+        kept = [f for f in files if f in indexed]
+        if len(kept) == len(files):
+            continue
+        rec.affected_files_json = json.dumps(kept)
+        rec.affected_modules_json = json.dumps(resolve_module_nodes(kept))
+        for dropped in set(files) - set(kept):
+            await session.execute(
+                delete(DecisionNodeLink).where(
+                    DecisionNodeLink.decision_id == rec.id,
+                    DecisionNodeLink.node_id == dropped,
+                )
+            )
+        changed += 1
+    if changed:
+        await session.flush()
+    return changed
 
 
 def render_plan(plan: MigrationPlan, *, limit: int = 10) -> str:
