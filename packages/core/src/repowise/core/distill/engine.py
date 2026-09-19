@@ -103,12 +103,21 @@ def _record_event(
     """
     from repowise.core.savings import recorder
     from repowise.core.savings.correlation import new_event_id, scoped_idempotency_key
+    from repowise.core.savings.pricing import resolve_pricing_snapshot
 
     try:
         repo_root = store.db_path.parents[2]
         if store.db_path != recorder.sidecar_path(repo_root) or repo_root == Path.home():
             return
         event_id = new_event_id()
+        surface = "hook" if source.startswith("hook") else "distill"
+        # A hook-sourced run is not a CLI command a human typed: the rewrite
+        # hook turns the agent's own Bash call into `repowise distill`, so this
+        # runs synchronously inside that tool call. Detecting the model scans
+        # the local transcripts -- seconds, on a repository with no Codex
+        # history -- so the hook reads the cache and never fills it, exactly as
+        # the PostToolUse hook does. A direct `repowise distill` may scan.
+        pricing = resolve_pricing_snapshot(repo_root, allow_scan=surface != "hook")
         recorder.record_event_in(
             store,
             repo_root,
@@ -117,7 +126,7 @@ def _record_event(
                 "idempotency_key": scoped_idempotency_key(str(repo_root), "distill", event_id),
                 "occurred_at": datetime.now(UTC),
                 # The rewrite hook tags its shell; everything else is the CLI.
-                "surface": "hook" if source.startswith("hook") else "distill",
+                "surface": surface,
                 "integration": "unknown",
                 "agent": "unknown",
                 "operation": filter_name,
@@ -132,6 +141,7 @@ def _record_event(
                 "pre_budget_input_tokens": raw_tokens,
                 "delivered_input_tokens": distilled_tokens,
                 "omission_refs": (ref,),
+                **(pricing.as_payload() if pricing else {}),
             },
         )
     except Exception:
