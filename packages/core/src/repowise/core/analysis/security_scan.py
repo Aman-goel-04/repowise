@@ -29,6 +29,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from repowise.core.support_paths import DOC_EXTENSIONS
 from repowise.core.test_paths import is_test_related_path
 
 logger = logging.getLogger(__name__)
@@ -265,7 +266,7 @@ _MASKED_KINDS = frozenset({"pickle_loads", "subprocess_shell_true", "os_system"}
 
 # Prose is documentation, not executable code. Only secret kinds scan it,
 # because a key pasted into a README is still a leak.
-_PROSE_EXTENSIONS = (".md", ".mdx", ".rst", ".txt", ".adoc")
+_PROSE_EXTENSIONS = tuple(DOC_EXTENSIONS)
 
 # Patterns whose matches are genuine leaked credentials (as opposed to the
 # broader "code smell" patterns like os.system/eval). Full-history scans
