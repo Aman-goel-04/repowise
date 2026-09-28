@@ -170,6 +170,7 @@ def _emit(
     *,
     gate: GateResult | None = None,
     report: DocDriftReport | None = None,
+    accepted: frozenset[str] = frozenset(),
 ) -> None:
     """Write *payload* in *fmt*; *gate* and *report* exist only under ``--check``."""
     from repowise.core.analysis.doc_drift import render
@@ -181,7 +182,11 @@ def _emit(
         from repowise.cli import __version__
 
         fail_on = gate.fail_on if gate is not None else HIGH_CONFIDENCE_THRESHOLD
-        emit_json(render.render_sarif(findings, tool_version=__version__, fail_on=fail_on))
+        emit_json(
+            render.render_sarif(
+                findings, tool_version=__version__, fail_on=fail_on, accepted=accepted
+            )
+        )
     elif fmt in ("markdown", "github"):
         markdown = render.render_markdown(
             findings,
@@ -285,7 +290,7 @@ def _run_check(
         suppressed=report.suppressed,
         gate=gate.to_dict(),
     )
-    _emit(fmt, payload, gate=gate, report=report)
+    _emit(fmt, payload, gate=gate, report=report, accepted=baseline or frozenset())
     if not gate.passed:
         raise click.exceptions.Exit(EXIT_GATE_FAILED)
 

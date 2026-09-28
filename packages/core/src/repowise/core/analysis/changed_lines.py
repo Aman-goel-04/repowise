@@ -31,6 +31,11 @@ from .change_risk.features import _git, split_revspec
 # count of 0 means "nothing on that side" (pure insertion / pure deletion).
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
+#: Pinned header prefixes: ``diff.noprefix`` or a custom prefix in the user's
+#: config would otherwise make :func:`_header_path` strip a real ``a/`` or
+#: ``b/`` directory, or keep a prefix that names no file.
+DIFF_PREFIXES = ("--src-prefix=a/", "--dst-prefix=b/")
+
 
 @dataclass
 class FileDiff:
@@ -53,14 +58,36 @@ class FileDiff:
     added: list[str] = field(default_factory=list)
 
 
+_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13}
+
+
+def _c_unquote(text: str) -> str:
+    """Undo git's C-style path quoting: ``caf\\303\\251.py`` -> ``café.py``."""
+    out = bytearray()
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt in "01234567":
+                out.append(int(text[i + 1 : i + 4], 8) & 0xFF)
+                i += 4
+                continue
+            out += bytes([_C_ESCAPES[nxt]]) if nxt in _C_ESCAPES else nxt.encode("utf-8")
+            i += 2
+            continue
+        out += text[i].encode("utf-8")
+        i += 1
+    return out.decode("utf-8", errors="replace")
+
+
 def _header_path(raw: str) -> str | None:
     """Normalize a ``--- a/x`` / ``+++ b/x`` header path. ``None`` for /dev/null."""
     path = raw.strip()
-    # git quotes paths with special chars ("b/pa\tth"); strip the quotes so the
-    # common (unquoted) key still resolves. Rare enough to accept the imperfect
-    # unescaping.
+    # git quotes a path holding a non-ASCII byte, a tab, a quote or a backslash
+    # ("b/caf\303\251.py"); left escaped it names no file, and a reader that
+    # looks the file up would skip it.
     if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
-        path = path[1:-1]
+        path = _c_unquote(path[1:-1])
     if path == "/dev/null":
         return None
     return path[2:] if path[:2] in ("a/", "b/") else path
@@ -168,11 +195,11 @@ def changed_lines(
     if working_tree:
         # Untracked files are absent by design: they are new, so neither caller
         # (prior fixes, per-test coverage) has a row to find for them anyway.
-        diff = _git(["diff", "--unified=0", "HEAD"], repo_path)
+        diff = _git(["diff", "--unified=0", *DIFF_PREFIXES, "HEAD"], repo_path)
         return _parse_unified_diff(diff), "working tree"
 
     if staged or not revspec:
-        diff = _git(["diff", "--cached", "--unified=0"], repo_path)
+        diff = _git(["diff", "--cached", "--unified=0", *DIFF_PREFIXES], repo_path)
         return _parse_unified_diff(diff), "staged changes"
 
     if (parts := split_revspec(revspec)) is not None:
@@ -182,7 +209,8 @@ def changed_lines(
         _verify_ref(repo_path, base)
         _verify_ref(repo_path, head)
         label = f"{base}{sep}{head}"
-        return _parse_unified_diff(_diff(repo_path, ["diff", "--unified=0", label])), label
+        diff = _diff(repo_path, ["diff", "--unified=0", *DIFF_PREFIXES, label])
+        return _parse_unified_diff(diff), label
 
     _verify_ref(repo_path, revspec)
     if _is_shallow_root(repo_path, revspec):
@@ -192,7 +220,7 @@ def changed_lines(
     # --format= drops the commit message so only the diff body is parsed.
     # -m --first-parent matches what change risk counts on a merge; without it
     # git's combined diff emits nothing at all and a merged PR reads as empty.
-    args = ["show", "--unified=0", "--format=", "-m", "--first-parent", revspec]
+    args = ["show", "--unified=0", *DIFF_PREFIXES, "--format=", "-m", "--first-parent", revspec]
     return _parse_unified_diff(_diff(repo_path, args)), revspec
 
 
