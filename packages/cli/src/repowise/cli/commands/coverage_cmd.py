@@ -15,6 +15,7 @@ from pathlib import Path
 import click
 
 from repowise.cli._setup import configure_cli_logging
+from repowise.cli.commands.coverage_check_cmd import coverage_check
 from repowise.cli.helpers import (
     console,
     ensure_repowise_dir,
@@ -23,6 +24,7 @@ from repowise.cli.helpers import (
     run_async,
 )
 from repowise.cli.output import emit_json, format_option, notice_console
+from repowise.core.analysis.health.coverage import PARSERS as COVERAGE_PARSERS
 from repowise.core.workspace.update import get_head_commit
 
 
@@ -53,7 +55,10 @@ async def _repo_file_keys(session, repo_id: str) -> set[str]:
 
 @click.group("coverage")
 def coverage_group() -> None:
-    """Ingest and inspect test-coverage reports."""
+    """Ingest and inspect test-coverage reports, and gate changes on them in CI."""
+
+
+coverage_group.add_command(coverage_check)
 
 
 @coverage_group.command("add")
@@ -64,7 +69,7 @@ def coverage_group() -> None:
 @click.option(
     "--format",
     "coverage_format",
-    type=click.Choice(["lcov", "cobertura", "clover", "repowise-json"]),
+    type=click.Choice(list(COVERAGE_PARSERS)),
     default=None,
     help="Force a parser instead of auto-detecting from content.",
 )
@@ -190,7 +195,7 @@ def coverage_add(
                 or getattr(repo_row, "head_commit", None)
             )
 
-            # --- Per-file aggregate coverage (lcov / cobertura / clover / json).
+            # --- Per-file aggregate coverage (any format in COVERAGE_PARSERS).
             agg_matched = 0
             unmapped = 0
             mapping_partial = False
@@ -348,7 +353,7 @@ def _discover_context_reports(repo_path: Path) -> list[Path]:
     "--path", "repo", default=None, help="Repo path (defaults to cwd / workspace primary)."
 )
 # Safe to spell this ``--format`` here: the ``--format`` that names an *input*
-# parser (lcov / cobertura / clover) lives on ``coverage add``, not on the
+# parser (a COVERAGE_PARSERS key) lives on ``coverage add``, not on the
 # group, so the two never meet on one command line.
 @format_option()
 def coverage_status(repo: str | None, fmt: str) -> None:
