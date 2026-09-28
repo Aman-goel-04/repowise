@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...models import CoverageFile, _new_uuid
+
+if TYPE_CHECKING:
+    from repowise.core.analysis.health.coverage.model import FileCoverage
 from .._shared import _BATCH_SIZE
 
 
@@ -37,23 +40,7 @@ async def save_coverage_files(
     await session.flush()
 
     for i in range(0, len(files), _BATCH_SIZE):
-        batch = files[i : i + _BATCH_SIZE]
-        for f in batch:
-            if hasattr(f, "file_path"):
-                data = {
-                    "file_path": f.file_path,
-                    "line_coverage_pct": float(f.line_coverage_pct),
-                    "branch_coverage_pct": (
-                        float(f.branch_coverage_pct) if f.branch_coverage_pct is not None else None
-                    ),
-                    "covered_lines_json": json.dumps(list(f.covered_lines or [])),
-                    "total_coverable_lines": int(f.total_coverable_lines or 0),
-                }
-            else:
-                data = dict(f)
-                if "covered_lines" in data:
-                    data["covered_lines_json"] = json.dumps(list(data.pop("covered_lines") or []))
-
+        for f in files[i : i + _BATCH_SIZE]:
             session.add(
                 CoverageFile(
                     id=_new_uuid(),
@@ -61,28 +48,44 @@ async def save_coverage_files(
                     source_format=source_format,
                     ingested_commit_sha=ingested_commit_sha,
                     mapping_partial=mapping_partial,
-                    **{
-                        k: v
-                        for k, v in data.items()
-                        if k
-                        not in (
-                            "id",
-                            "repository_id",
-                            "source_format",
-                            "ingested_commit_sha",
-                            "mapping_partial",
-                        )
-                        and hasattr(CoverageFile, k)
-                    },
+                    **_row_columns(f),
                 )
             )
         await session.flush()
 
 
-#: Every column of ``CoverageFile`` except ``covered_lines_json``. That blob is
-#: the per-file set of covered line numbers, and it dominates the table: 467 KB
-#: of the 549 KB stored for this repo's 1,401 rows. Only the single-file detail
-#: view reads it, so every repo-wide caller was hydrating it to throw it away.
+#: Columns the ingest sets for every row, so a per-file input never overrides them.
+_INGEST_COLUMNS = frozenset(
+    {"id", "repository_id", "source_format", "ingested_commit_sha", "mapping_partial"}
+)
+
+
+def _row_columns(f: Any) -> dict[str, Any]:
+    """Per-file column values from a ``FileCoverage`` or a dict of the same shape."""
+    if hasattr(f, "file_path"):
+        return {
+            "file_path": f.file_path,
+            "line_coverage_pct": float(f.line_coverage_pct),
+            "branch_coverage_pct": (
+                float(f.branch_coverage_pct) if f.branch_coverage_pct is not None else None
+            ),
+            "covered_lines_json": json.dumps(list(f.covered_lines or [])),
+            "total_coverable_lines": int(f.total_coverable_lines or 0),
+            "coverable_lines_json": json.dumps(list(getattr(f, "coverable_lines", None) or [])),
+        }
+    data = dict(f)
+    for key in ("covered_lines", "coverable_lines"):
+        if key in data:
+            data[f"{key}_json"] = json.dumps(list(data.pop(key) or []))
+    return {
+        k: v for k, v in data.items() if k not in _INGEST_COLUMNS and hasattr(CoverageFile, k)
+    }
+
+
+#: Every column of ``CoverageFile`` except the two line-set blobs
+#: (``covered_lines_json``, ``coverable_lines_json``). They dominate the table:
+#: the covered set alone was 467 KB of the 549 KB stored for this repo's 1,401
+#: rows, and only line-level readers need them.
 _COVERAGE_SCALAR_COLUMNS = (
     CoverageFile.file_path,
     CoverageFile.source_format,
@@ -125,9 +128,10 @@ async def load_coverage_for_repo(
     """Coverage rows for a repo, optionally scoped to *file_paths*.
 
     ``include_covered_lines=False`` returns ``Row`` objects carrying every
-    column except ``covered_lines_json``. They are attribute-accessed exactly
+    column except the two line-set blobs. They are attribute-accessed exactly
     like the ORM entities, so a caller that reads named fields needs no change
-    — but a caller that touches ``covered_lines_json`` must ask for it.
+    — but a caller that touches ``covered_lines_json`` or
+    ``coverable_lines_json`` must ask for them.
     """
     q = (
         select(CoverageFile)
@@ -140,6 +144,55 @@ async def load_coverage_for_repo(
     if include_covered_lines:
         return list(result.scalars().all())
     return list(result.all())
+
+
+def _line_list(raw: str | None) -> list[int]:
+    try:
+        return [int(n) for n in json.loads(raw)] if raw else []
+    except (ValueError, TypeError):
+        return []
+
+
+def file_coverage_from_row(row: Any) -> FileCoverage:
+    """A stored row as the parsers' ``FileCoverage``, the one row-to-model conversion."""
+    from repowise.core.analysis.health.coverage.model import FileCoverage
+
+    return FileCoverage(
+        file_path=row.file_path,
+        line_coverage_pct=row.line_coverage_pct,
+        branch_coverage_pct=row.branch_coverage_pct,
+        covered_lines=_line_list(row.covered_lines_json),
+        total_coverable_lines=row.total_coverable_lines or 0,
+        coverable_lines=_line_list(getattr(row, "coverable_lines_json", None)),
+    )
+
+
+async def load_file_coverage(
+    session: AsyncSession,
+    repository_id: str,
+    *,
+    file_paths: list[str] | None = None,
+) -> dict[str, FileCoverage]:
+    """Stored coverage as ``{path: FileCoverage}``, line sets included."""
+    rows = await load_coverage_for_repo(session, repository_id, file_paths=file_paths)
+    return {row.file_path: file_coverage_from_row(row) for row in rows}
+
+
+async def load_coverage_map(session: AsyncSession, repository_id: str) -> dict[str, dict]:
+    """Stored coverage in the shape ``HealthAnalyzer`` takes as ``coverage_map``."""
+    from repowise.core.analysis.health.coverage.model import coverage_map_entry
+
+    # Health scoring never reads the executable-line set, so its blob is not
+    # loaded (it is at least as large as the covered set).
+    result = await session.execute(
+        select(*_COVERAGE_SCALAR_COLUMNS, CoverageFile.covered_lines_json).where(
+            CoverageFile.repository_id == repository_id
+        )
+    )
+    return {
+        row.file_path: coverage_map_entry(file_coverage_from_row(row), row.source_format)
+        for row in result.all()
+    }
 
 
 async def get_coverage_summary(
