@@ -59,8 +59,9 @@ def primary_finding(findings: Sequence[Any]) -> Any | None:
     ``coverage_gradient``.
     """
     from .biomarkers.registry import continuous_biomarkers
+    from .governance import GOVERNANCE_BIOMARKERS
     from .rows import field as row_field
-    from .scoring import is_advisory
+    from .scoring import HISTORY_CATEGORY, biomarker_category, is_advisory
 
     if not findings:
         return None
@@ -72,6 +73,19 @@ def primary_finding(findings: Sequence[Any]) -> Any | None:
     ]
     if not candidates:
         return None
+    # A history marker is measured from git, so it names a file's context, not
+    # something an edit changes. When the file also carries a code-shape
+    # finding, that one leads: the Findings list put `change_entropy` at the
+    # head of four of its top five rows and asked an agent to fix it.
+    # Governance markers share the category but are work: writing or updating
+    # a decision clears them, so they stay eligible to lead.
+    shaped = [
+        item
+        for item in candidates
+        if biomarker_category(row_field(item, "biomarker_type")) != HISTORY_CATEGORY
+        or row_field(item, "biomarker_type") in GOVERNANCE_BIOMARKERS
+    ]
+    candidates = shaped or candidates
     continuous = continuous_biomarkers()
     discrete = [
         item for item in candidates if row_field(item, "biomarker_type") not in continuous
