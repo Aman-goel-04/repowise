@@ -350,6 +350,21 @@ terminal table the same, and each GitHub annotation ends with the same phrase.
 Hints are advice: a missing or unreadable index leaves them `null` and never
 changes the verdict.
 
+### Project coverage and coverage outside the change
+
+Patch coverage cannot see a change that deletes a test, or removes a code path
+that ran other files. `--base-report PATH` takes a report measured at the
+change's base commit and adds `project`: coverage at the base and the head,
+gated by `--max-drop P` (or `coverage.max_drop`), and `outside_change`, the
+files whose coverage changed on lines the change did not touch, each loss with
+the changed files that explain it. Without a base report, an index's ingest at
+the base commit gives the totals alone, as `get_change_risk` and the REST
+endpoint do (never gated). See
+[Project coverage and coverage outside the change](../start/CI.md#project-coverage-and-coverage-outside-the-change)
+for recipes and the
+[`coverage check` reference](../reference/CLI_REFERENCE.md#repowise-coverage-check-revspec)
+for the fields.
+
 A coverage.py `.coverage` database is not a text report: export it with
 `coverage lcov` or `coverage xml` first.
 
@@ -667,6 +682,7 @@ coverage:
   reingest_on_update: false
   fail_under: 80                 # patch-coverage gate for `coverage check` (0-100)
   min_coverable_lines: 5         # small-change tolerance for that gate
+  max_drop: 0.5                  # most project coverage may fall from the base, in points
   gates:                         # path-scoped gates, judged on the files they match
     - {name: api, paths: ["/services/api/"], fail_under: 85}
     - {name: scripts, paths: ["/scripts/"], fail_under: 50, informational: true}
@@ -683,7 +699,7 @@ Note that `--coverage-report` is test coverage, while `--coverage` controls
 |---------|--------------|
 | `repowise coverage add [PATHS...]` | Ingest reports. Auto-discovers when no path is given, merges multiple, builds the per-test map when contexts are present. Flags: `--path`, `--format`, `--verbose` |
 | `repowise coverage status` | Coverage summary plus test-to-code map counts. Flag: `--path` |
-| `repowise coverage check [REVSPEC]` | Patch-coverage gate for CI, no index needed. Flags: `--report`, `--report-format`, `--fail-under`, `--min-coverable-lines`, `--path`, `--format` |
+| `repowise coverage check [REVSPEC]` | Patch-coverage gate for CI, no index needed. Flags: `--report`, `--report-format`, `--fail-under`, `--min-coverable-lines`, `--fail-under-risky`, `--base-report`, `--max-drop`, `--path`, `--format` |
 | `repowise coverage suggest-gates` | Propose path-scoped gates for `coverage.gates` as YAML to paste below `coverage:`; writes nothing. Flags: `--path`, `--format` |
 | `repowise impacted-tests [REVSPEC]` | The tests a change exercises. Flags: `--path`, `--staged`, `--format` |
 

@@ -6,6 +6,7 @@ the whole repository's past:
 | Gate | Question | Needs | History |
 |------|----------|-------|---------|
 | `repowise coverage check` | Did the tests run the lines this change touched? | git and a coverage report | the merge-base with the target branch |
+| `repowise coverage check --max-drop P` | Did this change lower project coverage by more than P points? | git, a coverage report, and one measured at the change's base | the merge-base with the target branch |
 | `repowise doc-drift --check` | Does the documentation still describe files, links and commands that exist? | git | none (full history only improves rename suggestions) |
 | `repowise security check` | Did this change add a secret or a risky call? | git | every commit of the change |
 | `repowise risk --fail-above-percentile P` | Is this change bigger and more spread out than P% of this repository's recent commits? | git | recent commits to rank against (at least 8) |
@@ -121,6 +122,8 @@ release the action installs.
 | `coverage-fail-under` | `coverage.fail_under` | Minimum patch coverage percent. |
 | `coverage-min-coverable-lines` | `coverage.min_coverable_lines` | Small-change tolerance: a change with fewer changed executable lines than this never fails. |
 | `coverage-fail-under-risky` | `coverage.fail_under_risky` | Minimum patch coverage percent over risky files only: hotspots or bug magnets from the index; on git alone, the top quartile of files with bug-fix history. |
+| `coverage-base-report` | none | Reports measured at the change's base commit, one per line. See [Project coverage](#project-coverage-and-coverage-outside-the-change). |
+| `coverage-max-drop` | `coverage.max_drop` | Most project coverage may fall from the base, in percentage points. |
 | `doc-drift-baseline` | none | Committed baseline file. |
 | `security-fail-on` | `high` | Lowest severity that fails: `high`, `med`, `low`. |
 | `security-baseline` | none | Committed baseline file. |
@@ -192,7 +195,9 @@ has no change to judge.
 `REPOWISE_COVERAGE_REPORT` is space separated and may hold globs and
 `path=prefix` entries; Repowise expands the globs, not the shell. Other
 variables: `REPOWISE_VERSION`, `REPOWISE_COVERAGE_MIN_COVERABLE_LINES`,
-`REPOWISE_COVERAGE_FAIL_UNDER_RISKY`, `REPOWISE_DOC_DRIFT_BASELINE`,
+`REPOWISE_COVERAGE_FAIL_UNDER_RISKY`, `REPOWISE_COVERAGE_BASE_REPORT` (space
+separated, like the report list), `REPOWISE_COVERAGE_MAX_DROP`,
+`REPOWISE_DOC_DRIFT_BASELINE`,
 `REPOWISE_SECURITY_BASELINE`, `REPOWISE_SECURITY_FAIL_ON`. Override any job's
 `image`, `rules` or `needs` in your own file as usual.
 
@@ -444,6 +449,81 @@ clone, or a measured file whose risk could not be read (no git history and no
 index row), exits `2`, unless the whole-change or a path-scoped gate already
 failed: that failure is reported.
 
+### Project coverage and coverage outside the change
+
+Patch coverage cannot see a change that deletes a test or a code path other
+files relied on. Given a report measured at the change's base commit, the check
+adds project coverage at the base and the head, and lists files whose coverage
+changed outside the change with the changed test or dependent that explains it.
+
+```bash
+repowise coverage check origin/main...HEAD --report coverage/lcov.info \
+  --base-report base/lcov.info --max-drop 0.5
+```
+
+- `--max-drop P` fails when project coverage falls more than `P` points. The
+  small-change tolerance does not apply.
+- The base report must be measured at the merge-base (`A` for `A..B`). Files
+  whose lines do not line up are left out, and a note says how many.
+- Both sides must be measured the same way: the same reports of each format,
+  the same `coverage.ignore`, neither mapping fewer than half its files.
+- A base the check cannot use exits `2` under the `--max-drop` or
+  `--base-report` flag (the action's inputs), and is a note with exit `0` when
+  the gate comes from `coverage.max_drop` alone.
+
+On GitHub Actions, in a job that runs on pushes to the default branch and on
+pull requests, checked out with `fetch-depth: 0`:
+
+```yaml
+- run: pytest --cov=src --cov-report=lcov:coverage/lcov.info
+- if: github.event_name == 'push'
+  run: mkdir -p base-coverage && cp coverage/lcov.info base-coverage/
+- if: github.event_name == 'push'
+  uses: actions/cache/save@v4
+  with: {path: base-coverage, key: "coverage-${{ github.sha }}"}
+- if: github.event_name == 'pull_request'
+  id: merge-base
+  run: echo "sha=$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)" >> "$GITHUB_OUTPUT"
+- if: github.event_name == 'pull_request'
+  id: base
+  uses: actions/cache/restore@v4
+  with: {path: base-coverage, key: "coverage-${{ steps.merge-base.outputs.sha }}"}
+- if: github.event_name == 'pull_request'
+  uses: repowise-dev/repowise@main
+  with:
+    checks: coverage
+    coverage-report: coverage/lcov.info
+    # Only when the base's report was found; a missing file exits 2.
+    coverage-base-report: ${{ steps.base.outputs.cache-hit == 'true' && 'base-coverage/lcov.info' || '' }}
+    coverage-max-drop: ${{ steps.base.outputs.cache-hit == 'true' && '0.5' || '' }}
+```
+
+On GitLab, the merge request job uses the target branch's latest `test`
+artifact only when it was measured at the merge-base (a rebased merge request,
+or merged-results pipelines); otherwise the check runs without a base:
+
+```yaml
+test:
+  script:
+    - pytest --cov=src --cov-report=lcov:coverage/lcov.info
+    - echo "$CI_COMMIT_SHA" > coverage/commit.txt
+  artifacts: {paths: [coverage/]}
+
+repowise-coverage:
+  needs: [test]
+  before_script:
+    - !reference [.repowise, before_script]
+    - |
+      url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/artifacts/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME/download?job=test"
+      if curl -sfL --header "JOB-TOKEN: $CI_JOB_TOKEN" -o base.zip "$url" \
+        && python -m zipfile -e base.zip base \
+        && [ "$(cat base/coverage/commit.txt)" = \
+             "$(git merge-base "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" HEAD)" ]; then
+        export REPOWISE_COVERAGE_BASE_REPORT=base/coverage/lcov.info
+        export REPOWISE_COVERAGE_MAX_DROP=0.5
+      fi
+```
+
 ## When a gate exits 2
 
 | Message | Fix |
@@ -460,3 +540,6 @@ failed: that failure is reported.
 | "The change-risk gate ranks the change against recent commits, and --baseline 0 turns that off." | drop `--baseline 0` |
 | "The risky-file gate reads bug-fix history, and this clone is shallow." | fetch full history |
 | "Could not read the risk of N changed files, so the risky-file gate cannot run." | fetch full history, or index the repository |
+| "The max-drop gate needs coverage measured at the change's base ..." | pass `--base-report`, or ingest a report at the base commit |
+| "Project coverage cannot be compared ..." | measure the base and the head the same way (same full reports, same `coverage.ignore`) |
+| "Base report: No report path matched a file in this repository." | the base report must name files the base commit tracked; check its prefix |
