@@ -697,3 +697,25 @@ class TestPostCommitHookRemoval:
         assert hook_row["action"] == "kept"
         assert str(repo) in hook_row["reason"]
         assert hooks.status(repo).startswith("installed")
+
+    def test_an_unreadable_hook_is_named_rather_than_crashing_the_plan(self, repo: Path) -> None:
+        """Regression: binary/non-UTF-8 hook content used to raise while building the plan.
+
+        `hooks.status` decoded the whole file as UTF-8 with no guard, so a
+        valid executable hook holding arbitrary bytes (or one merely unreadable)
+        took the entire `uninstall` inventory down with it instead of being
+        reported and left alone.
+        """
+        from repowise.cli import hooks
+
+        _git("init", "-q", cwd=repo)
+        hooks_dir = hooks._hooks_dir(repo)
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        (hooks_dir / "post-commit").write_bytes(b"#!/bin/sh\n\xff\xfe\x00binary garbage")
+
+        payload = _payload(["uninstall", str(repo), "--all"])
+
+        hook_row = next(r for r in payload["results"] if "hook" in r["label"])
+        assert hook_row["action"] == "kept"
+        assert "could not be read" in hook_row["reason"]
+        assert (hooks_dir / "post-commit").exists()

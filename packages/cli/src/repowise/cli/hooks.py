@@ -172,7 +172,7 @@ def removal_blocked_reason(repo_path: Path, hooks_dir: Path) -> str | None:
     root = _git_root(repo_path)
     if root is not None:
         try:
-            hooks_dir.resolve().relative_to((root / ".git").resolve())
+            hooks_dir.resolve().relative_to(root.resolve())
             return None
         except (OSError, ValueError):
             pass
@@ -407,7 +407,10 @@ def uninstall(repo_path: Path) -> str:
     if not hook_path.exists():
         return "no post-commit hook found"
 
-    content = hook_path.read_text(encoding="utf-8")
+    try:
+        content = hook_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"could not read post-commit hook: {exc}"
     if _HOOK_MARKER not in content:
         return "repowise hook not found in post-commit"
 
@@ -439,7 +442,10 @@ def status(repo_path: Path) -> str:
     if not hook_path.exists():
         return "not installed"
 
-    content = hook_path.read_text(encoding="utf-8")
+    try:
+        content = hook_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "unreadable"
     if _HOOK_MARKER in content:
         pending = husky_pending_reason(hook_path.parent)
         return f"installed ({pending})" if pending else "installed"
