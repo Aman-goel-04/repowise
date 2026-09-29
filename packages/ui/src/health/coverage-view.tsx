@@ -383,7 +383,12 @@ function CoverageBody({
 
   return (
     <div className="flex flex-col gap-6 sm:gap-8">
-      <CoverageLede summary={summary} files={files} moduleCount={moduleCount} />
+      <CoverageLede
+        summary={summary}
+        files={files}
+        moduleCount={moduleCount}
+        history={data.history}
+      />
 
       <OverviewSection
         title="Health against coverage"
