@@ -29,6 +29,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from repowise.core.support_paths import DOC_EXTENSIONS
 from repowise.core.test_paths import is_test_related_path
 
 logger = logging.getLogger(__name__)
@@ -257,6 +258,15 @@ _SPANNING_PATTERNS: list[tuple[re.Pattern, str, str]] = [
 
 # Symbol names that are informational security hotspots
 _SYMBOL_KEYWORDS = re.compile(r"\b(auth|token|password|jwt|session|crypto)\b", re.IGNORECASE)
+
+# Kinds that name a dangerous call. They are matched against source with
+# comments and string literals blanked, so a docstring, a comment or a regex
+# literal that merely mentions the call does not fire.
+_MASKED_KINDS = frozenset({"pickle_loads", "subprocess_shell_true", "os_system"})
+
+# Prose is documentation, not executable code. Only secret kinds scan it,
+# because a key pasted into a README is still a leak.
+_PROSE_EXTENSIONS = tuple(DOC_EXTENSIONS)
 
 # Patterns whose matches are genuine leaked credentials (as opposed to the
 # broader "code smell" patterns like os.system/eval). Full-history scans
@@ -617,21 +627,29 @@ def scan_source(file_path: str, source: str, symbols: Iterable[Any] = ()) -> lis
     """Scan *source* text and symbol names; return finding dicts. No I/O."""
     findings: list[dict] = []
     lines = source_lines(source)
+    is_prose = file_path.lower().endswith(_PROSE_EXTENSIONS)
 
-    findings.extend(_call_findings(file_path, source))
+    if not is_prose:
+        findings.extend(_call_findings(file_path, source))
+
+    masked = "" if is_prose else _mask_comments_and_strings(source)
+    masked_lines = source_lines(masked)
 
     # Line-by-line pattern scan
     is_low_sev_file = _is_low_severity_path(file_path)
     for lineno, line in enumerate(lines, start=1):
         if not _ANY_PATTERN.search(line):
             continue
+        code_line = masked_lines[lineno - 1] if lineno <= len(masked_lines) else line
         snippet: str | None = None
         keyword_hits: list[tuple[dict, str]] = []
         vendor_values: list[str] = []
         for pattern, kind, severity in _PATTERNS:
             if kind in _CALL_KINDS:
                 continue
-            match = pattern.search(line)
+            if is_prose and kind not in SECRET_KINDS:
+                continue
+            match = pattern.search(code_line if kind in _MASKED_KINDS else line)
             if match:
                 value = line[slice(*_value_span(kind, match, line))] if match.groups() else ""
                 if kind in SECRET_KINDS:
@@ -661,7 +679,9 @@ def scan_source(file_path: str, source: str, symbols: Iterable[Any] = ()) -> lis
     # on the opening line, unless the per-line pass already did.
     pem_body_lines: set[int] = set()
     for pattern, kind, severity in _SPANNING_PATTERNS:
-        for match in pattern.finditer(source):
+        if is_prose and kind not in SECRET_KINDS:
+            continue
+        for match in pattern.finditer(masked if kind in _MASKED_KINDS else source):
             if kind in SECRET_KINDS:
                 val = match.group(1) if match.groups() else ""
                 if not _is_secret_value(kind, val):
@@ -709,6 +729,11 @@ def scan_source(file_path: str, source: str, symbols: Iterable[Any] = ()) -> lis
     for finding in findings:
         if finding["line"] in pem_body_lines:
             finding["snippet"] = _redaction(lines[finding["line"] - 1].strip())
+
+    # Test and fixture material never carries a shipped sink, whatever the kind.
+    if is_low_sev_file:
+        for finding in findings:
+            finding["severity"] = "low"
 
     # Symbol-name scan (informational / low)
     for sym in symbols:
