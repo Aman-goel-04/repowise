@@ -298,6 +298,32 @@ commit, so fetch the full history; the gate exits 2 rather than guess. The
 GitHub Action, the GitLab template and the SARIF upload are in
 [Repowise in CI](../start/CI.md).
 
+### Silencing one finding: `repowise-security-ignore`
+
+For a single false positive, put `repowise-security-ignore` on the finding's
+own line, in any comment syntax; `repowise-security-ignore: aws_access_key`
+silences only the kinds it lists. There is no next-line or whole-file form: use
+the baseline for that. A silenced finding never fails the gate and is still
+reported as suppressed in every format. The exact rules are in the
+[CLI reference](../reference/CLI_REFERENCE.md#repowise-security-check-revspec).
+
+### Custom patterns: `security.patterns`
+
+A secret shape of your own goes under `security.patterns` in
+`.repowise/config.yaml` as a name, a regex and a severity. Each becomes the
+secret kind `custom:<name>`, scanned and masked like the built-in ones, and an
+invalid pattern stops the check with exit 2. Keys and limits are in
+[the `security:` block](../reference/CONFIG.md#the-security-block).
+
+### Before a commit: `--staged`
+
+`repowise security check --staged` checks what the next commit would record:
+the staged lines, read from the index. `repowise hook install --security` runs
+it as a pre-commit hook that blocks a commit only on a finding at or above
+`high`, and lets the commit through when the check cannot run. Skip it once
+with `git commit --no-verify`. See
+[`repowise hook install`](../reference/CLI_REFERENCE.md#repowise-hook-install).
+
 ## Line verification
 
 A finding's `line_number` is written at scan time, and the file moves on. A wrong
