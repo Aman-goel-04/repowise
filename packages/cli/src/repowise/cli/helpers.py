@@ -853,15 +853,19 @@ def save_config_partial(
     keyword arguments. ``None`` values are skipped so callers can forward
     optional flags without clobbering existing keys.
 
-    ``embedder`` is the one exception: passing it re-commits to an embedder,
-    the same moment :func:`save_config` represents, so an ``embedding_model``
-    that is missing or ``None`` alongside it clears any pinned model instead
-    of being skipped. Otherwise a model pinned for a previous embedder (or a
-    previous run of the same one) would keep describing an index this run
-    did not build (#2627).
-
-    No scalar-only fallback like :func:`save_config`: it would silently drop
-    ``exclude_patterns``, and PyYAML is a hard dependency anyway.
+    ``embedding_model`` is the one exception to "None is skipped": passed
+    explicitly as ``None``, it clears any pinned model instead of leaving it
+    alone, because that is the caller saying the model changed (or is no
+    longer known) for whatever embedder this call names. Merely *omitting*
+    ``embedding_model`` is not the same claim, so it does not clear anything
+    on its own -- ``reindex_cmd`` calls this after every reindex with only
+    ``embedder=``, having never had a model to pass, and a bare ``in extra``
+    check on ``embedder`` used to read that silence as "no model" and wipe a
+    real pin on every routine reindex (#2627, caught in review on the fix
+    itself). Distinguishing "not passed" from "passed as ``None``" needs the
+    raw ``extra`` dict, since a keyword default cannot do it: ``in extra``
+    only reports that once, but ``get`` cannot tell the two shapes apart
+    afterwards.
     """
     import yaml  # type: ignore[import-untyped]
 
@@ -871,7 +875,7 @@ def save_config_partial(
     if commit_limit is not None:
         updates["commit_limit"] = commit_limit
     updates.update({k: v for k, v in extra.items() if v is not None})
-    clear_embedding_model = "embedder" in extra and not extra.get("embedding_model")
+    clear_embedding_model = "embedding_model" in extra and extra["embedding_model"] is None
     if not updates and not clear_embedding_model:
         return
 

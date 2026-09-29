@@ -326,6 +326,28 @@ class TestStaleEmbeddingModelIsNotCarriedOver:
 
         assert os.environ.get("REPOWISE_EMBEDDING_MODEL") is None
 
+    def test_embedder_alone_does_not_clear_a_pin_it_was_never_told_changed(self, tmp_path):
+        """Regression from review on #2654: reindex passes only ``embedder=`` every run.
+
+        The first cut of the fix cleared the pin whenever ``embedder`` was
+        passed without ``embedding_model``, which reads reindex's silence
+        (it has never had a model to pass) as "the model is gone" and wiped a
+        real pin on every routine reindex. Clearing now needs an explicit
+        ``embedding_model=None``, not merely the absence of the keyword.
+        """
+        from repowise.cli.helpers import load_config, save_config_partial
+
+        rw_dir = tmp_path / ".repowise"
+        rw_dir.mkdir()
+        (rw_dir / "config.yaml").write_text(
+            "embedder: openai\nembedding_model: text-embedding-3-large\n", encoding="utf-8"
+        )
+
+        save_config_partial(tmp_path, embedder="openai")
+
+        cfg = load_config(tmp_path)
+        assert cfg["embedding_model"] == "text-embedding-3-large"
+
 
 class TestConfigFingerprint:
     def test_config_fingerprint_detects_change(self, tmp_path):
