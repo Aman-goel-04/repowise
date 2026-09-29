@@ -25,6 +25,7 @@ from repowise.cli.hooks import (
     _husky_user_hook_dir,
     husky_pending_reason,
     install,
+    removal_blocked_reason,
     status,
     uninstall,
 )
@@ -191,3 +192,33 @@ def test_falls_back_when_git_unavailable(git_repo, monkeypatch):
     monkeypatch.setattr(subprocess, "run", _boom)
 
     assert _hooks_dir(git_repo) == git_repo / ".git" / "hooks"
+
+
+class TestRemovalBlockedReason:
+    """``repowise uninstall`` must not remove a hook shared beyond this repo (#2469)."""
+
+    def test_a_plain_repos_own_hooks_dir_is_not_blocked(self, git_repo):
+        hooks_dir = _hooks_dir(git_repo)
+        assert removal_blocked_reason(git_repo, hooks_dir) is None
+
+    def test_a_global_core_hooks_path_is_blocked(self, git_repo, tmp_path):
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        _git("config", "core.hooksPath", str(outside), cwd=git_repo)
+
+        hooks_dir = _hooks_dir(git_repo)
+        reason = removal_blocked_reason(git_repo, hooks_dir)
+
+        assert reason is not None
+        assert "outside this repo" in reason
+
+    def test_a_worktree_is_blocked_and_names_the_main_checkout(self, committed_repo, tmp_path):
+        wt = tmp_path / "wt"
+        _git("worktree", "add", "-b", "feature", str(wt), cwd=committed_repo)
+
+        hooks_dir = _hooks_dir(wt)
+        reason = removal_blocked_reason(wt, hooks_dir)
+
+        assert reason is not None
+        assert str(committed_repo) in reason
+        assert "worktree" in reason

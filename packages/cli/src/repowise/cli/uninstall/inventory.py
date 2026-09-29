@@ -361,6 +361,32 @@ def _repo_file_items(repo_path: Path) -> list[Item]:
     return items
 
 
+def _hook_item(repo_path: Path) -> Item | None:
+    """The post-commit auto-sync hook, as one row in ``REPO_FILES``.
+
+    Per repo instructions is is grouped with the generated blocks rather than
+    given its own group: the hook only runs ``repowise update``, which is
+    useless once the index is gone, so there is no real case for keeping the
+    hook while removing the index. ``None`` when there is no repository to
+    look in, the same as every other group falls silent rather than raising.
+    """
+    from repowise.cli import hooks
+
+    hooks_dir = hooks._hooks_dir(repo_path)
+    if hooks_dir is None:
+        return None
+    hook_path = hooks_dir / "post-commit"
+    installed = hooks.status(repo_path).startswith("installed")
+    return Item(
+        group=Group.REPO_FILES,
+        path=hook_path,
+        label="post-commit auto-sync hook",
+        exists=installed,
+        size=_size_of(hook_path) if installed else None,
+        blocked=hooks.removal_blocked_reason(repo_path, hooks_dir) if installed else None,
+    )
+
+
 def _global_items() -> list[Item]:
     """``~/.repowise/`` as one row, with the two consequences named.
 
@@ -453,6 +479,9 @@ def build_plan(repo_path: Path) -> Plan:
     plan = Plan(repo_path=repo_path)
     plan.items.extend(_agent_items(repo_path))
     plan.items.extend(_repo_file_items(repo_path))
+    hook_item = _hook_item(repo_path)
+    if hook_item is not None:
+        plan.items.append(hook_item)
     plan.items.append(
         Item(
             group=Group.INDEX,
