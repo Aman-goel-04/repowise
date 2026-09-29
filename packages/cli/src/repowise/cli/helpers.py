@@ -807,6 +807,11 @@ def save_config(
     existing["embedder"] = embedder
     if embedding_model:
         existing["embedding_model"] = embedding_model
+    else:
+        # No model was resolved this run: dropping the key beats leaving a
+        # stale one that names a different provider's model, or one this
+        # embedder was not actually built with (#2627).
+        existing.pop("embedding_model", None)
     if exclude_patterns is not None:
         existing["exclude_patterns"] = exclude_patterns
     if commit_limit is not None:
@@ -848,6 +853,13 @@ def save_config_partial(
     keyword arguments. ``None`` values are skipped so callers can forward
     optional flags without clobbering existing keys.
 
+    ``embedder`` is the one exception: passing it re-commits to an embedder,
+    the same moment :func:`save_config` represents, so an ``embedding_model``
+    that is missing or ``None`` alongside it clears any pinned model instead
+    of being skipped. Otherwise a model pinned for a previous embedder (or a
+    previous run of the same one) would keep describing an index this run
+    did not build (#2627).
+
     No scalar-only fallback like :func:`save_config`: it would silently drop
     ``exclude_patterns``, and PyYAML is a hard dependency anyway.
     """
@@ -859,13 +871,16 @@ def save_config_partial(
     if commit_limit is not None:
         updates["commit_limit"] = commit_limit
     updates.update({k: v for k, v in extra.items() if v is not None})
-    if not updates:
+    clear_embedding_model = "embedder" in extra and not extra.get("embedding_model")
+    if not updates and not clear_embedding_model:
         return
 
     ensure_repowise_dir(repo_path)
     config_path = get_repowise_dir(repo_path) / CONFIG_FILENAME
     existing = load_config(repo_path)
     existing.update(updates)
+    if clear_embedding_model:
+        existing.pop("embedding_model", None)
 
     config_path.write_text(
         yaml.dump(existing, default_flow_style=False, sort_keys=False),
