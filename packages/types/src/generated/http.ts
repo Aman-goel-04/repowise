@@ -708,6 +708,56 @@ export interface CouplingNodeResponse {
   nloc?: number;
 }
 
+/** One ingested report's repo-wide figures, as ``crud.load_coverage_history`` reads them. */
+export interface CoverageHistoryPoint {
+  ingested_at: string;
+  ingested_commit_sha: string | null;
+  line_coverage_pct: number;
+  branch_coverage_pct: number | null;
+}
+
+/** How the report's own file entries mapped to the repository at ingest. */
+export interface CoverageReportPaths {
+  total: number;
+  matched: number;
+  unmatched: number;
+  ambiguous: number;
+  unmatched_sample: string[];
+}
+
+/** ``GET /health/coverage``. ``basis`` is absent when the graph was not consulted. */
+export interface CoverageResponse {
+  summary: CoverageSummary;
+  files: Record<string, unknown>[];
+  modules: Record<string, unknown>[];
+  modules_total: number;
+  basis?: "measured" | "inferred" | "none" | null;
+  inferred?: Record<string, unknown> | null;
+  history?: CoverageHistoryPoint[] | null;
+}
+
+/** The repository's stored coverage, aggregated. Zero counts and nulls when none is stored. */
+export interface CoverageSummary {
+  file_count: number;
+  covered_lines: number;
+  total_lines: number;
+  line_coverage_pct: number | null;
+  branch_coverage_pct: number | null;
+  source_format: string | null;
+  source_formats: string[];
+  mapping_partial: boolean | null;
+  ingested_at: string | null;
+  ingested_commit_sha: string | null;
+  report_paths: CoverageReportPaths | null;
+  freshness: CoverageSummaryFreshness | null;
+}
+
+/** Whether the coverage was measured at the commit the index describes. */
+export interface CoverageSummaryFreshness {
+  status: "current" | "stale" | "unknown";
+  indexed_commit: string | null;
+}
+
 /** 202 launch payload for a re-analysis (an index-only job, no LLM work). */
 export interface DeadCodeAnalyzeResponse {
   job_id: string;
@@ -1067,6 +1117,11 @@ export interface DocDriftFindingResponse {
   raw: string;
   context: string;
   evidence: string[];
+  fingerprint: string;
+  suggestion?: string | null;
+  suggestion_basis?: string | null;
+  first_seen_at?: string | null;
+  is_new?: boolean;
 }
 
 /**
@@ -1115,6 +1170,7 @@ export interface DocDriftSummaryResponse {
   confidence: Record<string, number>;
   by_kind: Record<string, number>;
   findings_basis: string;
+  new_since_last_update?: number | null;
 }
 
 export interface EgoGraphResponse {
@@ -1667,6 +1723,7 @@ export interface HealthTrendKpiRow {
   structure_average?: number | null;
   history_average?: number | null;
   maintainability_average?: number | null;
+  doc_drift_count?: number | null;
 }
 
 export interface HealthTrendResponse {
@@ -2133,6 +2190,96 @@ export interface Paginated_SymbolResponse_ {
   total: number;
   has_more: boolean;
   next_offset?: number | null;
+}
+
+export interface PatchCoverageFile {
+  file_path: string;
+  status: "measured" | "not_in_report" | "no_line_data" | "no_coverable_changes";
+  changed_line_count: number;
+  coverable_line_count: number;
+  covered_line_count: number;
+  patch_coverage_pct: number | null;
+  uncovered_ranges: number[][];
+  risk: PatchCoverageFileRisk | null;
+  hints: PatchCoverageTestHint[] | null;
+}
+
+export interface PatchCoverageFileCounts {
+  measured: number;
+  not_in_report: number;
+  no_line_data: number;
+  no_coverable_changes: number;
+  out_of_scope: number;
+}
+
+export interface PatchCoverageFileRisk {
+  fix_pressure: number | null;
+  dependents: number | null;
+  hotspot: boolean | null;
+  bug_magnet: boolean | null;
+  basis: "git" | "index" | "git_and_index" | "unavailable";
+  risky: boolean;
+  reasons: string[];
+}
+
+/** One path-scoped gate from ``coverage.gates``, judged on the change. */
+export interface PatchCoveragePathGate {
+  name: string;
+  paths: string[];
+  threshold: number | null;
+  informational: boolean;
+  measured_file_count: number;
+  unmeasured_file_count: number;
+  covered_line_count: number;
+  coverable_line_count: number;
+  patch_coverage_pct: number | null;
+  gate: "pass" | "fail" | "no_data" | "not_set" | "too_small";
+}
+
+export interface PatchCoverageResponse {
+  patch_coverage_pct: number | null;
+  covered_line_count: number;
+  coverable_line_count: number;
+  threshold: number | null;
+  min_coverable_lines: number | null;
+  gate: "pass" | "fail" | "no_data" | "not_set" | "too_small";
+  file_counts: PatchCoverageFileCounts;
+  files: PatchCoverageFile[];
+  scope: PatchCoverageScope;
+  path_gates: PatchCoveragePathGate[];
+  risky: PatchCoverageRisky | null;
+}
+
+/** Patch coverage over the measured files history marks as risky. */
+export interface PatchCoverageRisky {
+  file_count: number;
+  covered_line_count: number;
+  coverable_line_count: number;
+  patch_coverage_pct: number | null;
+  threshold: number | null;
+  gate: "pass" | "fail" | "no_data" | "not_set" | "too_small";
+}
+
+export interface PatchCoverageScope {
+  label: string;
+  source_formats: string[];
+  reports: string[];
+  report_path_count: number | null;
+  unmatched_report_path_count: number | null;
+  mapping_partial: boolean;
+  measured_commit: string | null;
+  freshness: "current" | "stale" | "unknown";
+  ignored_file_count: number;
+  config_errors: string[];
+}
+
+/** Where to extend the tests for one uncovered range. */
+export interface PatchCoverageTestHint {
+  range: number[];
+  symbol: string | null;
+  tests: string[];
+  basis: "per_test" | "call_graph" | "import_graph" | "none";
+  total: number;
 }
 
 /**

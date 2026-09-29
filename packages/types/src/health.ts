@@ -16,6 +16,7 @@
  */
 
 import type { C4IoKind } from "./external-systems.js";
+import type { CoverageHistoryPoint, CoverageSummary } from "./generated/http.js";
 import type { Paginated } from "./pagination.js";
 import type { StepClassification, ValidationBasis, ValidationVia } from "./refactoring.js";
 
@@ -957,6 +958,8 @@ export interface HealthTrendResponse {
     structure_average?: number | null;
     history_average?: number | null;
     maintainability_average?: number | null;
+    /** Stored documentation drift findings at this snapshot; `null` before recorded. */
+    doc_drift_count?: number | null;
   }>;
   summary: {
     /** `null` under a narrowed scope: only the average covers both populations. */
@@ -1034,16 +1037,18 @@ export interface ModuleCoverageRow {
   line_coverage_pct: number;
 }
 
-export interface CoverageSummary {
-  file_count: number;
-  covered_lines: number;
-  total_lines: number;
-  line_coverage_pct: number | null;
-  branch_coverage_pct: number | null;
-  source_format: string | null;
-  ingested_at: string | null;
-  ingested_commit_sha: string | null;
-}
+/**
+ * The summary is generated from the server's response model. `freshness` is
+ * `stale` when the report was measured at another commit than the indexed
+ * one; `report_paths` is how the report's own entries mapped, `null` for an
+ * ingest that did not record it.
+ */
+export type {
+  CoverageHistoryPoint,
+  CoverageReportPaths,
+  CoverageSummary,
+  CoverageSummaryFreshness,
+} from "./generated/http.js";
 
 /**
  * Which signal answered "is this tested". `measured` is a coverage report: it
@@ -1151,6 +1156,11 @@ export interface HealthCoverageResponse {
    * the inferred map carries counts only — never a percentage.
    */
   inferred?: InferredTestMap;
+  /**
+   * One point per retained report, oldest first, partial reports left out.
+   * Present on the measured basis only; absent from an older backend.
+   */
+  history?: CoverageHistoryPoint[];
 }
 
 /* ------------------------------------------------------------------ *

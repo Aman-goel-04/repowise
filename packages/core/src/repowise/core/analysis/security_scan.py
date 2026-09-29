@@ -318,14 +318,23 @@ def _redaction(val: str) -> str:
 
 # ``public_env_secret`` has no capture group, so its value is found here. In
 # ``SECRET_KINDS`` the empty capture would fail validation and drop the finding.
-_ASSIGNED_VALUE = re.compile(r"""\A['"]?\s*[:=]+\s*['"`]?([^'"`\s,;]+)""")
+# After the name: the name's own closing quote or bracket, then an operator
+# (``=``, ``:``, ``=>``, ``??``, ``||``) or plain whitespace (a Dockerfile
+# ``ENV NAME value``), then the value, quoted or not.
+_PUBLIC_VALUE = re.compile(r"""\A['"\]]*(?:\s*[:=>?|]+\s*|\s+)(['"`]?)(?=[^\s;,)])""")
 
 _SECRET_PATTERNS = [(p, kind) for p, kind, _ in _PATTERNS if kind in SECRET_KINDS]
 _PUBLIC_ENV_PATTERN = next(p for p, kind, _ in _PATTERNS if kind == "public_env_secret")
-# A PEM body written on its header's line (escaped ``\n`` breaks), up to ``-----END``.
+# A PEM body written on its header's line (escaped ``\n`` breaks, or spaces when
+# an environment variable flattened it), up to ``-----END``.
 _PEM_INLINE_BODY = re.compile(
-    r"(?i:-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY-----)(?:\\[rn])*((?:[A-Za-z0-9+/=]|\\[rn])+)"
+    r"(?i:-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY-----)(?:\\[rn])*"
+    r"((?:[A-Za-z0-9+/=]|\\[rn]|[ \t])+)"
 )
+# A header that ends its line: the body follows on the next lines.
+_PEM_HEADER_LINE = re.compile(r"(?i:-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY-----)['\"]?\s*\Z")
+# A line of key body: one base64 run, however indented.
+_PEM_BODY_LINE = re.compile(r"\A\s*[A-Za-z0-9+/=]{16,}\s*\Z")
 _SECRET_PREFILTER = re.compile(
     "|".join(
         f"(?:{p.pattern})"
@@ -337,20 +346,56 @@ _SNIPPET_MAX = 120
 _MARKER = "****"
 
 
+def _string_end(line: str, start: int) -> int:
+    """Where the string literal holding *start* closes, else the end of *line*.
+
+    The keyword captures stop at the first quote of either kind, so a value
+    holding the other quote would otherwise be masked only up to it.
+    """
+    quote = line[start - 1] if start > 0 else ""
+    i = start
+    while i < len(line):
+        if line[i] == "\\":
+            i += 2
+        elif line[i] == quote:
+            return i
+        else:
+            i += 1
+    return len(line)
+
+
+def _value_span(kind: str, match: re.Match, line: str) -> tuple[int, int]:
+    """The captured credential's span; a keyword value runs to its closing quote."""
+    start, end = match.span(1)
+    return (start, _string_end(line, start)) if kind in _KEYWORD_KINDS else (start, end)
+
+
+def _public_env_value(line: str, name_end: int) -> tuple[int, int] | None:
+    """The value assigned to a public env name ending at *name_end*, if any."""
+    value = _PUBLIC_VALUE.search(line[name_end:])
+    if value is None:
+        return None
+    start = name_end + value.end()
+    if value.group(1):
+        return start, _string_end(line, start)
+    stop = next((i for i in range(start, len(line)) if line[i].isspace()), len(line))
+    return start, stop
+
+
 def _secret_spans(line: str) -> list[tuple[int, int]]:
     """Every credential value on *line*, including repeats of one elsewhere on it."""
     spans: list[tuple[int, int]] = []
     for pattern, kind in _SECRET_PATTERNS:
         for match in pattern.finditer(line):
-            if _is_secret_value(kind, match.group(1)):
-                spans.append(match.span(1))
+            start, end = _value_span(kind, match, line)
+            if _is_secret_value(kind, line[start:end]):
+                spans.append((start, end))
     for match in _PEM_INLINE_BODY.finditer(line):
         if _is_valid_credential_value(match.group(1)):
             spans.append(match.span(1))
     for match in _PUBLIC_ENV_PATTERN.finditer(line):
-        value = _ASSIGNED_VALUE.search(line[match.end() :])
-        if value is not None:
-            spans.append((match.end() + value.start(1), match.end() + value.end(1)))
+        if (span := _public_env_value(line, match.end())) is not None:
+            spans.append(span)
     for val in {line[start:end] for start, end in spans}:
         if len(val) < 4:
             continue
@@ -498,6 +543,15 @@ def _mask_comments_and_strings(source: str) -> str:
     return "".join(chars)
 
 
+def source_lines(source: str) -> list[str]:
+    """*source* split where git splits it, so line numbers agree with a diff.
+
+    ``str.splitlines`` also breaks on form feeds and Unicode separators, which
+    numbered every later finding past git's line for it.
+    """
+    return [line.removesuffix("\r") for line in source.split("\n")]
+
+
 def _call_findings(file_path: str, source: str) -> list[dict]:
     """Find executable eval/exec calls with AST or bounded lexical fallback."""
     if file_path.lower().endswith((".py", ".pyi")):
@@ -506,6 +560,7 @@ def _call_findings(file_path: str, source: str) -> list[dict]:
         except SyntaxError:
             pass
         else:
+            lines = source_lines(source)
             findings = []
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
@@ -522,14 +577,18 @@ def _call_findings(file_path: str, source: str) -> list[dict]:
                     {
                         "kind": f"{call_name}_call",
                         "severity": "high",
-                        "snippet": _snippet(source.splitlines()[node.lineno - 1]),
+                        # ast also breaks lines on a lone ``\r``, which git does
+                        # not; such a line number can outrun the split.
+                        "snippet": _snippet(lines[node.lineno - 1])
+                        if node.lineno <= len(lines)
+                        else "",
                         "line": node.lineno,
                     }
                 )
             return findings
 
     masked = _mask_comments_and_strings(source)
-    lines = source.splitlines()
+    lines = source_lines(source)
     findings = []
 
     def add(kind: str, severity: str, offset: int) -> None:
@@ -567,14 +626,14 @@ def _is_missing_table_error(exc: Exception) -> bool:
 def scan_source(file_path: str, source: str, symbols: Iterable[Any] = ()) -> list[dict]:
     """Scan *source* text and symbol names; return finding dicts. No I/O."""
     findings: list[dict] = []
-    lines = source.splitlines()
+    lines = source_lines(source)
     is_prose = file_path.lower().endswith(_PROSE_EXTENSIONS)
 
     if not is_prose:
         findings.extend(_call_findings(file_path, source))
 
     masked = "" if is_prose else _mask_comments_and_strings(source)
-    masked_lines = masked.splitlines()
+    masked_lines = source_lines(masked)
 
     # Line-by-line pattern scan
     is_low_sev_file = _is_low_severity_path(file_path)
@@ -592,8 +651,9 @@ def scan_source(file_path: str, source: str, symbols: Iterable[Any] = ()) -> lis
                 continue
             match = pattern.search(code_line if kind in _MASKED_KINDS else line)
             if match:
+                value = line[slice(*_value_span(kind, match, line))] if match.groups() else ""
                 if kind in SECRET_KINDS:
-                    if not _is_secret_value(kind, match.group(1)):
+                    if not _is_secret_value(kind, value):
                         continue
                     if is_low_sev_file:
                         severity = "low"
@@ -607,9 +667,9 @@ def scan_source(file_path: str, source: str, symbols: Iterable[Any] = ()) -> lis
                 }
                 findings.append(finding)
                 if kind in _KEYWORD_KINDS:
-                    keyword_hits.append((finding, match.group(1)))
+                    keyword_hits.append((finding, value))
                 elif kind in SECRET_KINDS:
-                    vendor_values.append(match.group(1))
+                    vendor_values.append(value)
         # One secret, one finding: the vendor shape already names what the keyword saw.
         for finding, value in keyword_hits:
             if any(vendor in value for vendor in vendor_values):
@@ -629,6 +689,7 @@ def scan_source(file_path: str, source: str, symbols: Iterable[Any] = ()) -> lis
                 if is_low_sev_file:
                     severity = "low"
             start_line = source.count("\n", 0, match.start()) + 1
+            end_line = source.count("\n", 0, match.end()) + 1
             if kind == "private_key_pem":
                 end = source.find("-----END", match.end())
                 end_line = source.count("\n", 0, end if end != -1 else match.end()) + 1
@@ -645,8 +706,23 @@ def scan_source(file_path: str, source: str, symbols: Iterable[Any] = ()) -> lis
                     "severity": severity,
                     "snippet": _snippet(source[line_start:line_end]),
                     "line": start_line,
+                    # The last line the match spans, so a diff-scoped reader
+                    # counts an edit anywhere inside the call or key.
+                    "end_line": end_line,
                 }
             )
+
+    # The base64 lines after a header that ends its line are body whether or not
+    # the key validated: an indented YAML block or a key with no END line never
+    # matches the pattern above, and its body lines would otherwise reach another
+    # kind's snippet. The run stops at the first line that is not base64, so a
+    # header constant in code that assembles PEM text marks nothing after it.
+    in_body = False
+    for lineno, line in enumerate(lines, start=1):
+        if in_body and _PEM_BODY_LINE.search(line):
+            pem_body_lines.add(lineno)
+        else:
+            in_body = bool(_PEM_HEADER_LINE.search(line))
 
     # A key body line matches nothing of its own, so a hit there is stray and its
     # snippet would carry key material: mask the whole line.

@@ -217,6 +217,15 @@ if TYPE_CHECKING:
         PageVersionResponse,
     )
     from .pagination import Paginated
+    from .patch_coverage import (
+        PatchCoverageFile,
+        PatchCoverageFileCounts,
+        PatchCoverageFileRisk,
+        PatchCoverageResponse,
+        PatchCoverageRisky,
+        PatchCoverageScope,
+        PatchCoverageTestHint,
+    )
     from .refactoring import (
         RefactoringOpportunitiesResponse,
         RefactoringOpportunityDetailResponse,
@@ -488,6 +497,15 @@ _EXPORTS: dict[str, tuple[str, ...]] = {
     ),
     "pages": ("JobResponse", "PageResponse", "PageSummaryResponse", "PageVersionResponse"),
     "pagination": ("Paginated",),
+    "patch_coverage": (
+        "PatchCoverageFile",
+        "PatchCoverageFileCounts",
+        "PatchCoverageFileRisk",
+        "PatchCoverageResponse",
+        "PatchCoverageRisky",
+        "PatchCoverageScope",
+        "PatchCoverageTestHint",
+    ),
     "refactoring": (
         "RefactoringOpportunitiesResponse",
         "RefactoringOpportunityDetailResponse",
@@ -743,6 +761,13 @@ __all__ = [
     "PageSummaryResponse",
     "PageVersionResponse",
     "Paginated",
+    "PatchCoverageFile",
+    "PatchCoverageFileCounts",
+    "PatchCoverageFileRisk",
+    "PatchCoverageResponse",
+    "PatchCoverageRisky",
+    "PatchCoverageScope",
+    "PatchCoverageTestHint",
     "PopulationBreakdown",
     "ProviderEntry",
     "ProviderStatusResponse",
