@@ -5,11 +5,15 @@
  * A verdict sentence, not a figure with a band. There is no threshold here to
  * colour against, and a gate belongs to CI (`repowise coverage check`), so the
  * only marked state is stale evidence: coverage measured at another commit
- * describes other code, and the line numbers below it may not line up.
+ * describes other code, and the line numbers below it may not line up. The
+ * exception is path-scoped gates (`coverage.gates`), which carry their own
+ * thresholds: each is a dot plus a word.
  */
 
+import type { ReactNode } from "react";
 import type {
   PatchCoverageFile,
+  PatchCoveragePathGate,
   PatchCoverageResponse,
 } from "@repowise-dev/types/generated/http";
 
@@ -37,15 +41,33 @@ export function formatLineRanges(ranges: number[][]): string {
     .join(", ");
 }
 
-function plural(n: number, word: string): string {
-  return `${n} ${word}${n === 1 ? "" : "s"}`;
+function plural(n: number, word: string, many?: string): string {
+  return `${n} ${n === 1 ? word : (many ?? `${word}s`)}`;
 }
+
+type Tone = "error" | "warning" | "success" | "neutral";
+
+const DOT: Record<Tone, string> = {
+  error: "bg-[var(--color-error)]",
+  warning: "bg-[var(--color-warning)]",
+  success: "bg-[var(--color-success)]",
+  neutral: "bg-[var(--color-text-tertiary)]",
+};
+
+/** A path-scoped gate's verdict in words, as `coverage check` prints it. Red
+ *  is kept for a gate that fails the change. */
+const GATE_STATUS: Record<PatchCoveragePathGate["gate"], { text: string; tone: Tone }> = {
+  pass: { text: "passes", tone: "success" },
+  fail: { text: "fails", tone: "error" },
+  no_data: { text: "no measured changed lines", tone: "neutral" },
+  not_set: { text: "no threshold", tone: "neutral" },
+  too_small: { text: "too few changed lines to judge", tone: "neutral" },
+};
 
 export function PatchCoverageSummary({
   coverage,
   onOpenFile,
 }: PatchCoverageSummaryProps) {
-  const pct = coverage.patch_coverage_pct;
   const uncovered = coverage.files.filter(
     (f) => f.status === "measured" && f.uncovered_ranges.length > 0,
   );
@@ -56,60 +78,21 @@ export function PatchCoverageSummary({
 
   return (
     <div className="flex flex-col gap-1.5">
-      <p className="text-[15px] text-[var(--color-text-secondary)]">
-        {pct == null ? (
-          // Unknown is a sentence, never 0%: nothing the report measured changed.
-          <>
-            <span className="font-semibold text-[var(--color-text-primary)]">
-              Patch coverage not measured
-            </span>{" "}
-            · no changed line is an executable line the coverage report measured
-          </>
-        ) : (
-          <>
-            <span className="font-semibold text-[var(--color-text-primary)]">
-              Patch coverage{" "}
-              <span className="tabular-nums">{floorPct(pct)}%</span>
-            </span>{" "}
-            ·{" "}
-            <span className="tabular-nums">
-              {coverage.covered_line_count} of{" "}
-              {plural(coverage.coverable_line_count, "changed executable line")}{" "}
-              covered
-            </span>
-          </>
-        )}
-      </p>
+      <Headline coverage={coverage} />
 
       {coverage.scope.freshness === "stale" && (
-        <p className="flex items-center gap-1.5 text-xs text-[var(--color-text-secondary)]">
-          <span
-            aria-hidden
-            className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-warning)]"
-          />
-          <span>
-            <span className="sr-only">Stale: </span>
-            Coverage was measured at{" "}
-            {measuredAt ? (
-              <code className="font-mono">{measuredAt}</code>
-            ) : (
-              "another commit"
-            )}
-            , not at this change&apos;s head
-          </span>
-        </p>
+        <WarningNote>
+          <span className="sr-only">Stale: </span>
+          Coverage was measured at{" "}
+          {measuredAt ? <code className="font-mono">{measuredAt}</code> : "another commit"}
+          , not at this change&apos;s head
+        </WarningNote>
       )}
 
       {coverage.scope.mapping_partial && (
-        <p className="flex items-center gap-1.5 text-xs text-[var(--color-text-secondary)]">
-          <span
-            aria-hidden
-            className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-warning)]"
-          />
-          <span>
-            Most report paths did not match this repository, so this covers a fragment
-          </span>
-        </p>
+        <WarningNote>
+          Most report paths did not match this repository, so this covers a fragment
+        </WarningNote>
       )}
 
       {coverage.scope.ignored_file_count > 0 && (
@@ -118,6 +101,12 @@ export function PatchCoverageSummary({
           <code className="font-mono">coverage.ignore</code>
         </p>
       )}
+
+      {/* Guarded: a server older than path-scoped gates sends neither field. */}
+      <PathGates
+        gates={coverage.path_gates ?? []}
+        configErrors={coverage.scope.config_errors ?? []}
+      />
 
       {uncovered.length > 0 && (
         <ul className="mt-1 flex flex-col gap-0.5">
@@ -158,6 +147,120 @@ export function PatchCoverageSummary({
         </details>
       )}
     </div>
+  );
+}
+
+function Headline({ coverage }: { coverage: PatchCoverageResponse }) {
+  const pct = coverage.patch_coverage_pct;
+  return (
+    <p className="text-[15px] text-[var(--color-text-secondary)]">
+      {pct == null ? (
+        // Unknown is a sentence, never 0%: nothing the report measured changed.
+        <>
+          <span className="font-semibold text-[var(--color-text-primary)]">
+            Patch coverage not measured
+          </span>{" "}
+          · no changed line is an executable line the coverage report measured
+        </>
+      ) : (
+        <>
+          <span className="font-semibold text-[var(--color-text-primary)]">
+            Patch coverage <span className="tabular-nums">{floorPct(pct)}%</span>
+          </span>{" "}
+          ·{" "}
+          <span className="tabular-nums">
+            {coverage.covered_line_count} of{" "}
+            {plural(coverage.coverable_line_count, "changed executable line")} covered
+          </span>
+        </>
+      )}
+    </p>
+  );
+}
+
+/** An amber dot plus a sentence: evidence to read with care. */
+function WarningNote({ children }: { children: ReactNode }) {
+  return (
+    <p className="flex items-center gap-1.5 text-xs text-[var(--color-text-secondary)]">
+      <span aria-hidden className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${DOT.warning}`} />
+      <span>{children}</span>
+    </p>
+  );
+}
+
+/** Path-scoped gates (`coverage.gates`): why none is judged, then each one. */
+function PathGates({
+  gates,
+  configErrors,
+}: {
+  gates: PatchCoveragePathGate[];
+  configErrors: string[];
+}) {
+  return (
+    <>
+      {configErrors.length > 0 && (
+        <WarningNote>
+          {plural(configErrors.length, "invalid entry", "invalid entries")} in{" "}
+          <code className="font-mono">coverage.gates</code>, so no path-scoped gate is
+          judged
+        </WarningNote>
+      )}
+      {gates.length > 0 && (
+        <div className="mt-1 flex flex-col gap-0.5">
+          {/* The list carries the same name, so the visible label is not read twice. */}
+          <p aria-hidden className="px-1.5 text-xs text-[var(--color-text-tertiary)]">
+            Path-scoped gates
+          </p>
+          <ul aria-label="Path-scoped gates" className="flex flex-col gap-0.5">
+            {gates.map((g) => (
+              <PathGateRow key={g.name} gate={g} />
+            ))}
+          </ul>
+        </div>
+      )}
+    </>
+  );
+}
+
+function gateStatus(gate: PatchCoveragePathGate): { text: string; tone: Tone } {
+  if (gate.gate === "fail" && gate.informational) {
+    return { text: "below threshold", tone: "warning" };
+  }
+  if (gate.gate !== "no_data") return GATE_STATUS[gate.gate];
+  // Counted but not judged: stale coverage or invalid config, said above.
+  if (gate.coverable_line_count > 0) return { text: "not judged", tone: "neutral" };
+  const unmeasured = gate.unmeasured_file_count ?? 0;
+  const text = GATE_STATUS.no_data.text;
+  return unmeasured > 0
+    ? { text: `${text} (${plural(unmeasured, "changed file")} not measured)`, tone: "neutral" }
+    : GATE_STATUS.no_data;
+}
+
+function gateFigures(gate: PatchCoveragePathGate): string {
+  const pct = gate.patch_coverage_pct;
+  const covered =
+    pct == null
+      ? "n/a"
+      : `${gate.covered_line_count} of ${gate.coverable_line_count} (${floorPct(pct)}%)`;
+  return gate.threshold == null ? covered : `${covered} · gate ${floorPct(gate.threshold)}%`;
+}
+
+function PathGateRow({ gate }: { gate: PatchCoveragePathGate }) {
+  const { text, tone } = gateStatus(gate);
+  return (
+    <li className="flex items-center gap-2 px-1.5 py-0.5 text-xs" title={gate.paths.join(", ")}>
+      <span aria-hidden className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${DOT[tone]}`} />
+      <span className="min-w-0 flex-1 truncate font-mono text-[var(--color-text-primary)]">
+        {gate.name}
+      </span>
+      <span className="shrink-0 text-[var(--color-text-secondary)]">
+        {text}
+        {gate.informational ? " (informational)" : ""}
+      </span>
+      <span className="shrink-0 font-mono tabular-nums text-[var(--color-text-tertiary)]">
+        {gateFigures(gate)}
+      </span>
+    </li>
   );
 }
 

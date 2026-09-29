@@ -1114,11 +1114,14 @@ async def _patch_coverage_block(
     coverage the index stores. ``None`` when there is no index, no stored
     coverage, or no readable change: ``impacted_tests`` already says why.
     ``files`` lists only the files that need attention, capped; the totals and
-    ``file_counts`` still count every file.
+    ``file_counts`` still count every file. ``coverage.ignore``,
+    ``coverage.min_coverable_lines`` and the path-scoped ``coverage.gates``
+    apply as they do in the CLI gate; path gates read ``no_data`` on stale
+    coverage or invalid config, which ``scope.config_errors`` names.
     """
     from repowise.core import git_refs
     from repowise.core.analysis.change_risk.features import revspec_head
-    from repowise.core.analysis.health.coverage import configured_ignore
+    from repowise.core.analysis.health.coverage import configured_coverage
     from repowise.core.analysis.patch_coverage import attention_rows, stored_patch_coverage
     from repowise.core.persistence.database import get_session
 
@@ -1137,7 +1140,7 @@ async def _patch_coverage_block(
                 changed,
                 label=result.features.ref,
                 head_commit=head_commit,
-                ignore=configured_ignore(ctx.path),
+                config=configured_coverage(ctx.path),
             )
     except (LookupError, SQLAlchemyError):
         return None
