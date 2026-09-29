@@ -68,6 +68,12 @@ def test_matching_is_case_insensitive():
     assert is_support_path("Docs/Guide.md")
 
 
+def test_classification_token_prefers_suffix_and_falls_back_to_dotfile_name():
+    """#2454: `.env` has no pathlib suffix; its whole name is the token."""
+    assert classification_token("config.yaml") == ".yaml"
+    assert classification_token(".env") == ".env"
+    assert classification_token("proj/.ENV") == ".env"
+
 class TestClassificationToken:
     """classification_token picks the right token for suffix vs dotfile."""
 
