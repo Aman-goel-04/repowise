@@ -36,6 +36,7 @@ from ...ingestion.package_roots import module_for as _module_for
 from ...ingestion.package_roots import package_roots_from_paths as _package_roots
 from ...ingestion.package_roots import scan_package_roots as _scan_package_roots
 from ...test_paths import paired_test_names
+from ..dead_code.file_reachability import file_dependency_neighbors
 from ..graph_view import HasEdge, ImportEdgeView
 from ..test_reachability import files_reached_by_tests, files_with_paired_tests
 from .asserts.lexicon import AssertVocabulary
@@ -447,6 +448,11 @@ def _compute_repo_function_mod_p80(
     return _percentile_p80(counts)
 
 
+def _dependents_count(graph: Any, path: str) -> int:
+    """Distinct files that depend on *path* in code; co-change is history, not a dependent."""
+    return len(set(file_dependency_neighbors(graph, path, incoming=True)))
+
+
 def _compute_repo_dependents_p80(parsed_files: list[Any], graph: Any) -> int | None:
     """Repo-wide 80th percentile of file-level in-degree (dependents).
 
@@ -466,10 +472,7 @@ def _compute_repo_dependents_p80(parsed_files: list[Any], graph: Any) -> int | N
         path = pf.file_info.path
         if path not in graph:
             continue
-        try:
-            deg = int(graph.in_degree(path))
-        except Exception:
-            continue
+        deg = _dependents_count(graph, path)
         if deg > 0:
             counts.append(deg)
     return _percentile_p80(counts)
@@ -1076,10 +1079,7 @@ class HealthAnalyzer:
             path = s.file_path
             if path in out or path not in self.graph:
                 continue
-            try:
-                out[path] = float(self.graph.in_degree(path))
-            except Exception:
-                out[path] = 0.0
+            out[path] = float(_dependents_count(self.graph, path))
         return out
 
     def _apply_cross_file_oracles(self, walked: list[tuple[Any, FileComplexity]]) -> None:
@@ -1310,11 +1310,8 @@ class HealthAnalyzer:
         nloc = fcx.file_nloc
 
         dependents_count = 0
-        if self.graph is not None and file_path in self.graph:
-            try:
-                dependents_count = int(self.graph.in_degree(file_path))
-            except Exception:
-                dependents_count = 0
+        if self.graph is not None:
+            dependents_count = _dependents_count(self.graph, file_path)
 
         cov = self.coverage_map.get(file_path)
         if cov is None:
