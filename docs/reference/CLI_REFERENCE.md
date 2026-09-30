@@ -1054,8 +1054,9 @@ line up.
 | Flag | Description |
 |------|-------------|
 | `--path` | Repo path (defaults to cwd / workspace primary) |
-| `--staged` | Diff the staged changes (`git diff --cached`); the default when no range is given |
-| `--format` | `table` (default), `json` (full report), or `list` (test ids one per line, for piping) |
+| `--staged` | Diff the staged changes (`git diff --cached`); the default with no range outside CI (in CI: the pull request's change) |
+| `--format` | `table` (default), `json` (full report plus the selection), `list` (test ids one per line), or `args` (one line of runner arguments, or `:all`; reasons on stderr) |
+| `--runner` | For `--format args`: `auto` (default; `files` when mixed), `pytest` (node ids or files), `go` (package dirs), `jest` (files; pass with `--runTestsByPath`), `files` |
 
 ```bash
 repowise impacted-tests                        # staged changes
@@ -1063,7 +1064,17 @@ repowise impacted-tests main...HEAD            # a branch / PR (diffed from the 
 repowise impacted-tests main..HEAD             # a plain range
 repowise impacted-tests abc123                 # a single commit
 repowise impacted-tests main..HEAD --format list | xargs pytest
+repowise impacted-tests main...HEAD --format args --runner pytest
 ```
+
+`--format args` exits `0` whether it selects a subset or everything, and `2`
+when it cannot read the change (unknown revision, missing history) or `tests.*`
+in the config. `--format json` adds `indexed_commit`, `map_current` and a
+per-file `selected.basis`: `full-run`, `no-tests-needed`, `test-tree`,
+`test-package`, `conftest`, `helper-importers`, `deleted-test`, `coverage`,
+`changed-test`, `call-graph`, `import-graph`, `filename-pattern`, `unknown`,
+or `none` (no index). When it runs everything:
+[CI](../start/CI.md#selecting-the-tests-a-change-needs).
 
 ---
 

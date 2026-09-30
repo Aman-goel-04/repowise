@@ -25,6 +25,9 @@ Doc drift's `--check` needs no index. `--kind symbol` adds symbol references
 exits `2` without one. It also reads `git blame`: in a shallow clone every line
 blames to the boundary commit, so give that job `fetch-depth: 0`.
 
+Not a gate, but in the same pipeline:
+[selecting the tests a change needs](#selecting-the-tests-a-change-needs).
+
 ## What every gate does the same way
 
 **Exit codes.** `0` passed, or had nothing to judge. `1` the change failed the
@@ -132,9 +135,13 @@ release the action installs.
 | `security-baseline` | none | Committed baseline file. |
 | `risk-fail-above-percentile` | none | With `risk` in `checks`, fail when the change ranks above this percentile of recent commits. Empty reports the rank without gating. |
 | `upload-sarif` | `false` | Upload doc drift and security findings to code scanning. |
+| `impacted-tests` | `false` | Select the tests the change needs (needs a cached `.repowise` index); see [below](#selecting-the-tests-a-change-needs). |
+| `impacted-tests-runner` | `auto` | `auto`, `pytest`, `go`, `jest` or `files`. |
 
 Outputs: `coverage`, `doc-drift`, `security` and `risk` hold each gate's exit
 code (empty when not run), and `sarif-dir` the SARIF directory.
+`impacted-tests` holds the runner arguments (or `:all`), and `run-all-tests` is
+`false` only when that subset is safe to run alone.
 
 The risk gate ranks the change against the repository's own recent commits,
 so at a percentile P roughly (100 - P)% of changes fail it by construction.
@@ -235,6 +242,98 @@ repowise security check "origin/$CHANGE_TARGET...HEAD"
 
 Bitbucket Pipelines and others work the same way with their own branch
 variable; `--format markdown` or `json` gives you something to post.
+
+## Selecting the tests a change needs
+
+`repowise impacted-tests --format args` prints one line of arguments for a test
+runner, or `:all` whenever any part of the answer is not known, with the
+reasons on stderr. It needs an index (cached from the default branch, below);
+a per-test coverage map (`repowise coverage add`) makes it more precise.
+
+- It exits `0` for a subset or for everything, and `2` only when it cannot read the change or the `tests.*` config.
+- Branch on the run-all flag, never on `:all`: jest and vitest read it as a pattern and run nothing.
+- It runs everything for: an empty change; a lockfile, manifest, build, test or CI config change; `.repowise/config.yaml`; a production package's `__init__.py`.
+- It also runs everything for: non-code files in a test tree; a changed file with no known test or only a filename guess; a route through a test helper no test imports; any Python test helper while a conftest or pytest config loads plugins by name.
+- It also runs everything for: a missing, out-of-date or unreadable index; a per-test map at its row cap; a deleted file no known test used.
+- Only `docs/` and root README-like files (README, CHANGELOG, LICENSE, CONTRIBUTING) are skipped, and only when no code names them (a test that reads `README.md` names it); an empty line means only those changed.
+- Tests the graph cannot see into (not indexed, or importing nothing it resolves, such as a test that only runs a subprocess) run with every subset. With `--runner pytest`, test-named modules outside `testpaths` and outside test directories are left out, as a bare `pytest` leaves them out.
+- A changed `conftest.py`, test package `__init__.py` or imported test helper selects the tests under or importing it, not everything.
+- Without a range, in CI it reads the pull request's change; locally, the staged changes.
+- `tests.full_run_on` (gitignore patterns) adds run-everything paths; `tests.always_run` is appended to every selection as written.
+- Ceiling: on the JVM and .NET, a same-package test linked only by an unresolved call is missed. A test that reaches the change only through a subprocess, a plugin or registry loaded by a string name, or a directory it globs, while importing something else, is missed too: list such tests in `tests.always_run`, and run the full suite on the default branch.
+
+**What to expect.** The subset is only as small as the code is loosely coupled.
+On tightly coupled code the graph alone picks most tests (over 80% of test
+files on this repository), because most tests import something that imports
+the changed file. Real savings need a per-test map measured at the change's
+base. `--format json` shows what drove each file's selection in
+`selected.basis`.
+
+On GitHub Actions, keep the index cached from the default branch and branch
+on the outputs in the pull request job:
+
+```yaml
+# .github/workflows/repowise-index.yml
+on: {push: {branches: [main]}}
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: actions/cache/restore@v4
+        with: {path: .repowise, key: "repowise-${{ github.sha }}", restore-keys: "repowise-"}
+      - run: pip install repowise
+      - run: if [ -f .repowise/state.json ]; then repowise update --index-only; else repowise init --yes --index-only; fi
+      - uses: actions/cache/save@v4
+        with: {path: .repowise, key: "repowise-${{ github.sha }}"}
+```
+
+```yaml
+# in the pull request workflow
+- uses: actions/checkout@v4
+  with: {fetch-depth: 0}
+- uses: actions/cache/restore@v4
+  with: {path: .repowise, key: "repowise-${{ github.event.pull_request.base.sha }}", restore-keys: "repowise-"}
+- id: select
+  uses: repowise-dev/repowise@main
+  with: {checks: "", impacted-tests: true, impacted-tests-runner: pytest}
+- if: steps.select.outputs.run-all-tests != 'false'
+  run: pytest
+- if: steps.select.outputs.run-all-tests == 'false' && steps.select.outputs.impacted-tests != ''
+  env: {TESTS: "${{ steps.select.outputs.impacted-tests }}"}
+  run: eval "pytest $TESTS"
+```
+
+A skipped or failed step leaves `run-all-tests` empty, so `!= 'false'` runs
+everything.
+
+On GitLab, set `REPOWISE_IMPACTED_TESTS: "true"` (and optionally
+`REPOWISE_IMPACTED_TESTS_RUNNER`). The `repowise-impacted-tests` job writes the
+arguments to `impacted-tests.txt` and `RUN_ALL_TESTS` to a dotenv report:
+
+```yaml
+repowise-index:
+  image: python:3.12
+  variables: {GIT_DEPTH: "0"}
+  script:
+    - pip install repowise
+    - if [ -f .repowise/state.json ]; then repowise update --index-only; else repowise init --yes --index-only; fi
+  cache: {key: repowise-index, paths: [.repowise/], policy: pull-push}
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+repowise-impacted-tests:
+  cache: {key: repowise-index, paths: [.repowise/], policy: pull}
+
+test:
+  needs: [{job: repowise-impacted-tests, optional: true}]
+  script:
+    - |
+      if [ "${RUN_ALL_TESTS:-}" != "false" ]; then pytest
+      elif [ -n "$(cat impacted-tests.txt 2>/dev/null)" ]; then eval "pytest $(cat impacted-tests.txt)"
+      fi
+```
 
 ## Coverage reports per language
 

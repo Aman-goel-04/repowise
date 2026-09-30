@@ -185,13 +185,15 @@ repowise impacted-tests main...HEAD            # a branch or PR, from the merge-
 repowise impacted-tests main..HEAD             # a plain range
 repowise impacted-tests abc123                 # a single commit
 repowise impacted-tests main..HEAD --format list | xargs pytest
+repowise impacted-tests main...HEAD --format args --runner pytest   # for CI
 ```
 
 | Flag | Values |
 |------|--------|
 | `--path` | Repo path (defaults to cwd, or the workspace primary) |
-| `--staged` | Diff `git diff --cached`. Implied when no range is given |
-| `--format` | `table` (default), `json` (full report), `list` (test ids, one per line) |
+| `--staged` | Diff `git diff --cached`. Implied with no range outside CI; in CI the default is the pull request's change |
+| `--format` | `table` (default), `json` (full report), `list` (test ids, one per line), `args` (runner arguments, or `:all`) |
+| `--runner` | For `--format args`: `auto` (default), `pytest`, `go`, `jest`, `files` |
 
 It always says which path fired, and it never lets a guess pass for evidence:
 
@@ -199,15 +201,21 @@ It always says which path fired, and it never lets a guess pass for evidence:
 |-----------|-------------|
 | Changed file has per-test coverage on the changed lines | The exact covering tests, `via: coverage` |
 | The changed file is itself a test | Itself, `via: changed-test` |
-| Changed file has no coverage rows, but a test reaches it in the graph | Those test files, `via: import-graph`, in the "NOT coverage-backed" table |
+| Changed file has no coverage rows, but a test reaches it in the graph | Those test files, `via: call-graph` or `via: import-graph` (direct or transitive), in the "NOT coverage-backed" table |
 | No coverage and no graph edge, but a name-shaped match | That file, `via: filename-pattern`, in the same table |
 | None of the above | "unknown, run the full suite to be safe" |
 | No map ingested at all | A prompt to run `coverage add` on a report with contexts |
 
-Deletion-only files are dropped from the diff (there are no new lines to cover).
-With `--format list` the caveats go to stderr so the stdout pipe into `pytest`
-stays clean. The command exits `0` in every one of these cases, including "no
-tests found": it is a reporting tool, not a gate.
+Changed lines are matched at the commit the map was measured at (the change's
+base or head); otherwise, and for deleted or removal-only files, matching is by
+file and the graph is asked too. With `--format list` the caveats go to stderr
+so the pipe into `pytest` stays clean. The command exits `0` in every one of
+these cases, including "no tests found": it is a reporting tool, not a gate.
+
+For CI, `--format args` prints the runner arguments, or `:all` whenever any part
+of the answer is not known, with the reasons on stderr. The rules, the
+`tests.*` config keys and the CI recipes are in
+[CI](../start/CI.md#selecting-the-tests-a-change-needs).
 
 A `base...head` range diffs from the merge-base of the two, so it is what a pull
 request changed: commits that landed on `base` after the branch forked stay out.
@@ -722,7 +730,7 @@ Note that `--coverage-report` is test coverage, while `--coverage` controls
 | `repowise coverage status` | Coverage summary plus test-to-code map counts. Flag: `--path` |
 | `repowise coverage check [REVSPEC]` | Patch-coverage gate for CI, no index needed. Flags: `--report`, `--report-format`, `--fail-under`, `--min-coverable-lines`, `--fail-under-risky`, `--fail-under-branches`, `--base-report`, `--max-drop`, `--path`, `--format` |
 | `repowise coverage suggest-gates` | Propose path-scoped gates for `coverage.gates` as YAML to paste below `coverage:`; writes nothing. Flags: `--path`, `--format` |
-| `repowise impacted-tests [REVSPEC]` | The tests a change exercises. Flags: `--path`, `--staged`, `--format` |
+| `repowise impacted-tests [REVSPEC]` | The tests a change exercises, or the runner arguments for CI. Flags: `--path`, `--staged`, `--format`, `--runner` |
 
 Full reference: [CLI_REFERENCE.md](../reference/CLI_REFERENCE.md#repowise-coverage).
 
