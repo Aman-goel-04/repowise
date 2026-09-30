@@ -569,7 +569,7 @@ class TestSymbolTestPenalty:
     """The -5 a symbol takes for living in a test file (#1103)."""
 
     @staticmethod
-    def _score(path: str, language: str = "python") -> float:
+    def _score(path: str, language: str = "python", query: str = "build index") -> float:
         from repowise.core.persistence.models import WikiSymbol
         from repowise.server.mcp_server.tool_search_symbols import _score_symbol
 
@@ -581,11 +581,14 @@ class TestSymbolTestPenalty:
         )
         # No graph node: symbol nodes never carry `is_test`, so the path rules
         # are what decide here in practice.
-        return _score_symbol(row, None, {"build", "index"}, "build_index")
+        return _score_symbol(row, None, {"build", "index"}, query)
 
     def test_tests_are_penalised_and_support_is_not(self):
         base = self._score("src/indexing/build.py")
         assert self._score("packages/core/tests/test_build.py") == base - 5.0
+        # An exact match is left to the shared rank key, which puts kind first.
+        exact = self._score("src/indexing/build.py", query="build_index")
+        assert self._score("packages/core/tests/test_build.py", query="build_index") == exact
         assert self._score("myapp/tests.py") == base - 5.0
         # A fixture factory is often what the query was after.
         assert self._score("packages/core/tests/conftest.py") == base
@@ -1327,3 +1330,102 @@ async def test_an_exact_name_outranks_a_crowd_of_substring_neighbours(
     assert res["mode"] == "symbol"
     assert res["exact_match"] is True
     assert res["results"][0]["symbol_id"] == "src/zzz_last.py::load"
+
+
+def test_rank_key_orders_same_named_symbols():
+    from repowise.server.mcp_server._symbol_lookup import symbol_rank_key
+
+    def key(name, kind, path, centrality=0.0):
+        return symbol_rank_key(
+            "Gadgets", name=name, qualified_name=name, kind=kind, path=path,
+            centrality=centrality,
+        )
+
+    ranked = sorted(
+        [
+            ("GADGETS", "constant", "src/lib/gadgets.py"),
+            ("gadgets", "function", "src/lib/gadgets.py"),
+            ("Gadgets", "class", "docs/snippets/gadgets.py"),
+            ("Gadgets", "method", "src/lib/core.py"),
+            ("Gadgets", "class", "tests/test_gadgets.py"),
+            ("Gadgets", "class", "src/lib/core.py"),
+        ],
+        key=lambda row: key(*row),
+    )
+    assert ranked == [
+        ("Gadgets", "class", "src/lib/core.py"),
+        ("Gadgets", "class", "tests/test_gadgets.py"),
+        ("Gadgets", "class", "docs/snippets/gadgets.py"),
+        ("Gadgets", "method", "src/lib/core.py"),
+        ("gadgets", "function", "src/lib/gadgets.py"),
+        ("GADGETS", "constant", "src/lib/gadgets.py"),
+    ]
+    # Centrality, then the shorter path, decide between otherwise equal hits.
+    assert key("Gadgets", "class", "a/b/c/x.py", 0.5) < key("Gadgets", "class", "x.py")
+    assert key("Gadgets", "class", "x.py") < key("Gadgets", "class", "a/x.py")
+
+
+async def test_a_bare_name_search_leads_with_the_class_over_a_docs_constant(
+    session, populated_db, setup_mcp
+) -> None:
+    """Case-folded, a docs constant and the core class share a name and score;
+    the central docs file used to win the tie."""
+    from repowise.core.persistence.models import GraphNode, WikiSymbol
+    from repowise.server.mcp_server.tool_search import search_codebase
+
+    rid = populated_db
+    rows = [
+        ("docs/snippets/listing.py", "GIZMOS", "constant", 0.9),
+        ("src/gizmo/core.py", "Gizmos", "class", 0.01),
+    ]
+    for path, name, kind, pagerank in rows:
+        session.add(
+            WikiSymbol(
+                id=f"gz-{name}", repository_id=rid, file_path=path,
+                symbol_id=f"{path}::{name}", name=name, qualified_name=name,
+                kind=kind, signature=name, start_line=1, end_line=5, language="python",
+            )
+        )
+        for node_id in (path, f"{path}::{name}"):
+            session.add(
+                GraphNode(
+                    id=f"gzn-{node_id}", repository_id=rid, node_id=node_id,
+                    node_type="file" if node_id == path else "symbol", name=name,
+                    file_path=path, language="python", pagerank=pagerank,
+                    betweenness=pagerank,
+                )
+            )
+    await session.commit()
+
+    res = await search_codebase(query="Gizmos", limit=5)
+    assert [r["symbol_id"] for r in res["results"][:2]] == [
+        "src/gizmo/core.py::Gizmos",
+        "docs/snippets/listing.py::GIZMOS",
+    ]
+    res = await search_codebase(query="gizmos", limit=5)
+    assert res["results"][0]["symbol_id"] == "src/gizmo/core.py::Gizmos"
+
+
+async def test_an_exact_test_class_outranks_an_exact_code_function(
+    session, populated_db, setup_mcp
+) -> None:
+    """For exact matches the shared key decides, and it ranks kind before test path."""
+    from repowise.core.persistence.models import WikiSymbol
+    from repowise.server.mcp_server.tool_search import search_codebase
+
+    rid = populated_db
+    for path, kind in (("src/widget/core.py", "function"), ("tests/test_widget.py", "class")):
+        session.add(
+            WikiSymbol(
+                id=f"wd-{path}", repository_id=rid, file_path=path,
+                symbol_id=f"{path}::Widgets", name="Widgets", qualified_name="Widgets",
+                kind=kind, signature="Widgets", start_line=1, end_line=5, language="python",
+            )
+        )
+    await session.commit()
+
+    res = await search_codebase(query="Widgets", limit=5)
+    assert [r["symbol_id"] for r in res["results"][:2]] == [
+        "tests/test_widget.py::Widgets",
+        "src/widget/core.py::Widgets",
+    ]
