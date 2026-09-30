@@ -794,6 +794,7 @@ class FileTraverser:
             or rel_str in self._distribution_inits
         )
         is_test = is_test_related_path(rel_str, language)
+        entry = _is_entry_point(rel_str, abs_path, language) or manifest_entry
         return FileInfo(
             path=rel_str,
             abs_path=str(abs_path),
@@ -804,8 +805,10 @@ class FileTraverser:
             is_test=is_test,
             is_config=_is_config_file(language),
             is_api_contract=not is_test and _is_api_contract(abs_path, language),
-            is_entry_point=_is_entry_point(rel_str, abs_path, language) or manifest_entry,
+            # A runner loads a test file, but no reader enters the system there.
+            is_entry_point=entry and not is_test,
             is_manifest_entry=manifest_entry,
+            is_reachability_root=entry,
         )
 
     # ------------------------------------------------------------------
@@ -1144,8 +1147,8 @@ def _is_entry_point(rel_str: str, abs_path: Path, language: str) -> bool:
     A conventional filename or stem is a guess, so it passes through
     ``not_an_execution_start``, the same correction the wiki's orientation list
     uses. A manifest-named file (a ``[project.scripts]`` target) is evidence,
-    so the caller ORs it in outside that gate: this flag is what exempts a
-    file from dead-code detection.
+    so the caller ORs it in outside that gate. Dead-code exemption reads
+    ``is_reachability_root``, which every entry point also carries.
     """
     filename = abs_path.name
     named_entry = (
