@@ -97,6 +97,22 @@ def record(event: TelemetryEvent) -> None:
         return
 
 
+def _flusher_executable() -> str:
+    """Return the executable for the detached flusher.
+
+    On Windows (``os.name == "nt"``) prefer a ``pythonw.exe`` sibling next
+    to ``sys.executable`` (windowless GUI subsystem, never allocates a
+    console) when it exists as a file; otherwise fall back to
+    ``sys.executable``.
+    """
+    if os.name == "nt" and sys.executable:
+        candidate = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        with contextlib.suppress(Exception):
+            if os.path.isfile(candidate):
+                return candidate
+    return sys.executable or ""
+
+
 def _spawn_flusher() -> bool:
     """Start the detached delivery process. Returns whether it started.
 
@@ -106,7 +122,10 @@ def _spawn_flusher() -> bool:
     """
     if not sys.executable:
         return False
-    spawn_detached([sys.executable, "-m", _FLUSHER_MODULE], os.getcwd())
+    try:
+        spawn_detached([_flusher_executable(), "-m", _FLUSHER_MODULE], os.getcwd())
+    except Exception:
+        return False
     return True
 
 
