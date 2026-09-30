@@ -1047,6 +1047,14 @@ never silently: the response carries `truncated: true`, the `*_total` /
 `_meta.omitted` names refs that restore the dropped rows. Re-requesting one
 block with `only` also recovers it.
 
+**Finding types must earn their place.** `core/analysis/finding_registry.py`
+records each finding type as `validated`, `provisional` or `hidden`. Hidden
+types never appear in `get_health`, `get_dead_code`, overview, priorities or
+wiki prompts (the analyzers still run). Provisional types appear only when asked
+for — `include=["unverified"]` here, `kind=` on `get_dead_code` — and each row
+carries `verification: "unverified"`. `get_dead_code` reports what it held back
+in `summary.withheld_types`.
+
 **Test material is bucketed, not hidden.** Every metric row carries `is_test`
 (distinct from `has_test_file`: "is this file a test" vs "is this file tested").
 In dashboard mode the ranked finding lists are split — `top_findings` /
@@ -1055,9 +1063,12 @@ In dashboard mode the ranked finding lists are split — `top_findings` /
 a test asks a different question from defect risk in the code it covers, and at
 the default limit a quarter of the headline list was describing the test suite.
 Targeted mode is never split: you named the files, so you get their findings.
-KPIs, `worst_files` and `high_leverage_files` deliberately still include test
-files — excluding them would move the repo's headline score, which is a scoring
-change, not a display one.
+The ranked file lists split the same way: `worst_files` and
+`high_leverage_files` (and the `directive` built from them) are production files,
+and `test_worst_files` ranks the test files. `kpis.worst_performer_path` is the
+worst production file and `kpis.worst_test_path` the worst test file. The KPI
+averages still include test files — excluding them would move the repo's
+headline score, which is a scoring change, not a display one.
 
 **Leverage, not just lowness.** `average_health` is NLOC-weighted (the number the
 badge and dashboard surface), so a few large low-scoring files hold it down. To

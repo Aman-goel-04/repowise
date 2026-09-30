@@ -23,6 +23,8 @@ from repowise.core.analysis.attention import (
     severity_of_file_score,
     silo_source,
 )
+from repowise.core.analysis.dead_code.risk_factors import REVIEW_ONLY_KINDS
+from repowise.core.analysis.finding_registry import excluded_types
 from repowise.core.analysis.health.scoring import HISTORY_CATEGORY, biomarker_category
 from repowise.core.persistence.models import (
     DeadCodeFinding,
@@ -79,6 +81,7 @@ async def _health_items(session: AsyncSession, repo_id: str) -> tuple[list[dict]
         HealthFinding.repository_id == repo_id,
         HealthFinding.status == "open",
         HealthFinding.file_path.not_in(_test_paths(repo_id)),
+        HealthFinding.biomarker_type.not_in(excluded_types()),
     )
     rows = (
         await session.execute(
@@ -336,6 +339,7 @@ async def _dead_code_items(session: AsyncSession, repo_id: str) -> tuple[list[di
                     DeadCodeFinding.repository_id == repo_id,
                     DeadCodeFinding.status == "open",
                     DeadCodeFinding.safe_to_delete.is_(True),
+                DeadCodeFinding.kind.not_in(REVIEW_ONLY_KINDS),
                     DeadCodeFinding.file_path.not_in(_test_paths(repo_id)),
                 )
                 .order_by(DeadCodeFinding.confidence.desc())
@@ -351,6 +355,7 @@ async def _dead_code_items(session: AsyncSession, repo_id: str) -> tuple[list[di
                 DeadCodeFinding.repository_id == repo_id,
                 DeadCodeFinding.status == "open",
                 DeadCodeFinding.safe_to_delete.is_(True),
+                DeadCodeFinding.kind.not_in(REVIEW_ONLY_KINDS),
                 DeadCodeFinding.file_path.not_in(_test_paths(repo_id)),
             )
         )
