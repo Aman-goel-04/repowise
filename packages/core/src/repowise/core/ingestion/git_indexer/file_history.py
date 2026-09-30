@@ -27,6 +27,7 @@ from ._constants import (
     _PR_NUMBER_RE,
     HOTSPOT_HALFLIFE_DAYS,
     _truncate_body,
+    is_fix_commit,
 )
 from .enrich import detect_original_path, is_significant_commit
 from .function_blame import (
@@ -89,6 +90,9 @@ def new_meta(file_path: str) -> dict[str, Any]:
     """Return the default metadata dict for *file_path* (all fields zeroed)."""
     return {
         "file_path": file_path,
+        # A non-code file: history tier only (counts, span, authors). No blame,
+        # no churn signals, and kept out of the repo-relative rankings.
+        "history_only": False,
         "commit_count_total": 0,
         "commit_count_90d": 0,
         "commit_count_30d": 0,
@@ -212,6 +216,7 @@ def _per_file_log_args(file_path: str, commit_limit: int, follow_renames: bool) 
     walk = [
         "--no-merges",
         f"-{commit_limit}",
+        "-M",
         "--numstat",
         f"--format={_LOG_FORMAT}",
         "--",
@@ -250,12 +255,17 @@ def _add_own_churn(
         if len(numstat_parts) < 3:
             continue
         match_path = numstat_parts[2]
-        if "=>" in match_path:
+        renamed = "=>" in match_path
+        if renamed:
             _old, _new = _extract_rename_paths(match_path, known_paths)
             match_path = _new or match_path
         changed_paths.add(match_path)
         if match_path in known_paths:
             _add_row_churn(current, numstat_parts)
+            # Accumulate: a later row for the file must not clear the rename.
+            current.pure_move |= renamed and numstat_parts[:2] == ["0", "0"]
+    # Still a pure move only if no row for the file changed a line.
+    current.pure_move = current.pure_move and not (current.added or current.deleted)
     return changed_paths
 
 
@@ -308,6 +318,7 @@ def index_file(
     provenance_classifier: Any | None = None,
     note_agents: dict[str, str] | None = None,
     trace_index: Any | None = None,
+    history_only: bool = False,
 ) -> dict:
     """Index a single file's git history. Runs in executor.
 
@@ -319,12 +330,17 @@ def index_file(
     repo's newest commit, so re-indexing the same commit yields the same
     windows and a historical checkout measures the 90 days before it. Falls
     back to ``now()``.
+
+    *history_only* (a non-code file) keeps the history tier: commit counts and
+    windows, first and last commit, and authorship. Blame, the decayed churn
+    score, agent provenance and commit-message mining stay code-only.
     """
     now = _window_anchor(as_of_ts)
     ninety_days_ago_ts = (now - timedelta(days=90)).timestamp()
     thirty_days_ago_ts = (now - timedelta(days=30)).timestamp()
 
     meta = new_meta(file_path)
+    meta["history_only"] = history_only
 
     orig_path: str | None = None
     if precomputed_commits is not None:
@@ -354,16 +370,18 @@ def index_file(
         _add_span(meta, commits, now)
         authors = _Authors.tally(commits, ninety_days_ago_ts)
         _add_windows(meta, commits, ninety_days_ago_ts, thirty_days_ago_ts)
+        _add_ownership(meta, authors)
+        meta["is_stable"] = _is_stable(meta)
+        if history_only:
+            return meta
         _add_agent_rollup(meta, commits)
         meta["temporal_hotspot_score"] = _temporal_hotspot_score(commits, now)
-        _add_ownership(meta, authors)
         if include_blame:
             _add_blame_ownership(meta, repo, repo_path, now, authors)
         _add_commit_messages(meta, commits)
         # Only the per-file ``--follow`` walk reports an original path.
         if orig_path:
             meta["original_path"] = orig_path
-        meta["is_stable"] = _is_stable(meta)
     except Exception:
         logger.debug("git_indexer_partial_failure", file_path=file_path, exc_info=True)
 
@@ -427,6 +445,8 @@ class _Authors:
     def tally(cls, commits: list[_CommitRec], recent_since_ts: float) -> _Authors:
         authors = cls()
         for c in commits:
+            if c.pure_move:
+                continue  # moving a file is not authoring it
             name = c.author_name
             authors.counts[name] += 1
             if c.ts >= recent_since_ts:
@@ -599,6 +619,8 @@ def _significant_entry(c: _CommitRec, msg: str) -> dict[str, Any]:
 
 
 def _commit_category(msg: str) -> str | None:
+    if is_fix_commit(msg):
+        return "fix"
     for cat, pattern in _COMMIT_CATEGORIES.items():
         if pattern.search(msg):
             return cat

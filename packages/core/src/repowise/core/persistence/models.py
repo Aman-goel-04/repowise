@@ -27,6 +27,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -597,6 +598,9 @@ class GitMetadata(Base):
     churn_percentile: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     age_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     commit_count_capped: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # A non-code file: history tier only (counts, span, authors), no blame or
+    # churn signals, and left out of the repo-relative rankings.
+    history_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
 
     # Diff size (Phase 2)
     lines_added_90d: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
