@@ -33,6 +33,7 @@ async def seed_fix_first(session, rid: str | None = None) -> str:
                 repository_id=rid,
                 **{k: m[k] for k in ("file_path", "score", "nloc", "is_test",
                                      "analyzed_commit", "updated_at")},
+                code_origin=m.get("code_origin"),
             )
         )
         session.add(GitMetadata(repository_id=rid, file_path=m["file_path"],
@@ -100,3 +101,116 @@ async def test_the_queue_is_cached_until_a_store_changes(async_session) -> None:
     rebuilt = await load_fix_first(async_session, rid)
     assert rebuilt is not first
     assert all(i.target.file_path != "src/plain.py" for i in rebuilt.items)
+
+
+async def test_loader_reads_the_stored_code_origin(async_session) -> None:
+    from sqlalchemy import update
+
+    rid = await seed_fix_first(async_session)
+    await async_session.execute(
+        update(HealthFileMetric)
+        .where(HealthFileMetric.file_path == "src/plain.py")
+        .values(code_origin="docs_example")
+    )
+    await async_session.flush()
+    loaded = await load_fix_first(async_session, rid)
+    metrics = [
+        {**m, "code_origin": "docs_example"} if m["file_path"] == "src/plain.py" else m
+        for m in METRICS
+    ]
+    built = build_fix_first(
+        metrics=metrics,
+        findings=FINDINGS,
+        refactoring=REFACTORING,
+        performance=PERFORMANCE,
+        plans=PLANS,
+    )
+    assert loaded.totals.excluded["docs_example"] == 1
+    # The update moved the metric's ``updated_at``, so only the basis differs.
+    assert (loaded.items, loaded.totals) == (built.items, built.totals)
+
+
+async def test_loader_reads_verified_duplicates_as_a_fact(async_session) -> None:
+    """A dispatch-heavy function stays a candidate when a verified duplicate
+    sits in it: an Extract Helper plan stored at another file names it."""
+    from sqlalchemy import select
+
+    rid = await seed_fix_first(async_session)
+    row = (
+        await async_session.execute(
+            select(HealthFinding).where(HealthFinding.public_id == "finding_c1")
+        )
+    ).scalar_one()
+    dispatch = {**json.loads(row.details_json), "dispatch_share": 0.9}
+    row.details_json = json.dumps(dispatch)
+    helper = {
+        "public_id": "refac3_helper", "refactoring_type": "extract_helper",
+        "file_path": "src/other.py", "target_symbol": "other",
+        "evidence": {"duplicated_lines": 15},
+        "plan": {"occurrences": [
+            {"file": "src/other.py", "line_start": 5, "line_end": 20},
+            {"file": "src/core.py", "line_start": 30, "line_end": 44},
+        ]},
+    }
+    async_session.add(
+        RefactoringSuggestion(
+            repository_id=rid,
+            public_id=helper["public_id"],
+            refactoring_type="extract_helper",
+            file_path="src/other.py",
+            target_symbol="other",
+            status="open",
+            evidence_json=json.dumps(helper["evidence"]),
+            plan_json=json.dumps(helper["plan"]),
+        )
+    )
+    await async_session.flush()
+    findings = [
+        {**f, "details": dispatch} if f["public_id"] == "finding_c1" else f for f in FINDINGS
+    ]
+    built = build_fix_first(
+        metrics=METRICS,
+        findings=findings,
+        refactoring=REFACTORING,
+        performance=PERFORMANCE,
+        plans=[*PLANS, helper],
+    )
+    loaded = await load_fix_first(async_session, rid)
+    assert "src/core.py" in {i.target.file_path for i in loaded.items}
+    assert (loaded.items, loaded.totals) == (built.items, built.totals)
+
+
+async def test_loader_reads_extractions_for_a_finding_without_a_plan(async_session) -> None:
+    """A size finding takes its first step from an Extract Method plan stored
+    for its function, though no opportunity carries that plan."""
+    rid = await seed_fix_first(async_session)
+    extraction = {
+        "public_id": "refac2_walk", "refactoring_type": "extract_method",
+        "file_path": "src/plain.py", "target_symbol": "walk",
+        "evidence": {"slice_nloc": 8, "ccn_removed": 2},
+        "plan": {"span": {"start": 12, "end": 20}, "suggested_name": "step"},
+    }
+    async_session.add(
+        RefactoringSuggestion(
+            repository_id=rid,
+            public_id=extraction["public_id"],
+            refactoring_type="extract_method",
+            file_path="src/plain.py",
+            target_symbol="walk",
+            status="open",
+            evidence_json=json.dumps(extraction["evidence"]),
+            plan_json=json.dumps(extraction["plan"]),
+        )
+    )
+    await async_session.flush()
+    loaded = await load_fix_first(async_session, rid)
+    walk = next(i for i in loaded.items if i.target.file_path == "src/plain.py")
+    assert walk.action.steps[0].text == "Extract lines 12-20 of walk into step()"
+    built = build_fix_first(
+        metrics=METRICS,
+        findings=FINDINGS,
+        refactoring=REFACTORING,
+        performance=PERFORMANCE,
+        plans=[*PLANS, extraction],
+    )
+    assert (loaded.items, loaded.totals) == (built.items, built.totals)

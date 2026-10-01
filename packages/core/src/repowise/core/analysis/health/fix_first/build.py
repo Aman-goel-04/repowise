@@ -10,15 +10,17 @@ caller may pass unfiltered rows.
 Row shapes (field names are the SQL columns):
 
 ``metrics``
-    ``file_path``, ``score``, ``nloc``, ``is_test``, ``analyzed_commit``,
-    ``updated_at``, plus ``commit_count_90d`` (git) and ``dependents`` (graph
-    in-degree).
+    ``file_path``, ``score``, ``nloc``, ``is_test``, ``code_origin``,
+    ``line_coverage_pct``, ``analyzed_commit``, ``updated_at``, plus
+    ``commit_count_90d`` and ``contributor_count`` (git) and ``dependents``
+    (graph in-degree).
 ``findings``
-    ``file_path``, ``biomarker_type``, ``severity``, ``function_name``,
+    Hidden types are never items. ``file_path``, ``biomarker_type``,
+    ``severity``, ``function_name``,
     ``line_start``, ``line_end``, ``reason``, ``health_impact``, ``public_id``,
     ``dimension``, ``status`` (absent = open), and ``details`` /
     ``details_json`` (``ccn``, ``nloc``, ``max_nesting``) for the numbers a
-    sentence quotes.
+    sentence quotes, and ``deprecated`` for a function on its way out.
 ``refactoring``
     The ``refactoring_opportunities`` columns, ``details`` (or
     ``details_json``) carrying ``steps``, ``validation_profiles``,
@@ -31,8 +33,12 @@ Row shapes (field names are the SQL columns):
 ``plans``
     Plan rows named by a refactoring step: ``public_id``, ``evidence`` /
     ``evidence_json`` and ``plan`` / ``plan_json`` (an extract-method ``span``,
-    ``params``, ``returns``, ``suggested_name``). A step whose plan is absent
-    is kept, with less to say.
+    ``params``, ``returns``, ``suggested_name``; a move's destination; a
+    split's named groups; a helper's ``occurrences``). A plan row that also
+    carries ``refactoring_type`` ``extract_method``, ``file_path`` and
+    ``target_symbol`` can give a finding with no plan of its own its first
+    concrete step. Every Extract Helper plan's occurrences say where verified
+    duplicates sit.
 """
 
 from __future__ import annotations
@@ -120,6 +126,33 @@ MAX_CONTEXT = 3
 HEAD = 5
 HEAD_PER_KIND = 3
 DEFAULT_LIMIT = 10
+#: Findings that measure one function's size; a unit led by one of them, or by
+#: an Extract Method step, is a function-level complexity unit.
+SIZE_MARKERS = frozenset(
+    {"complex_method", "nested_complexity", "brain_method", "large_method", "bumpy_road"}
+)
+#: A function whose largest dispatch on one value holds this share of its
+#: decision points is usually fine as it is. Fitted on the dev labels only:
+#: share >= 0.6 held 9 labelled complexity rows, 8 of them rejected.
+DISPATCH_SHARE = 0.6
+#: A function-level complexity unit needs this many code lines or this CCN.
+#: Picked on the dev labels (67 complexity rows): 30 / 15 drops 13 rejected
+#: small functions and 4 accepted ones; no cut that keeps every accepted row
+#: drops more than 4 rejected.
+SMALL_NLOC = 30
+SMALL_CCN = 15
+#: Class-level findings: a fix names member groups, which only a plan holds.
+CLASS_MARKERS = frozenset({"low_cohesion", "god_class"})
+#: Kinds the baseline raters found not worth doing: a refactoring led by one
+#: of these steps, or a plan-less finding led by one of these markers, is no
+#: candidate (it stays in the refactoring tab). Worth over rater labels, dev
+#: repos first, then all 17 baseline repos.
+LOW_VALUE_KINDS: dict[str, str] = {
+    "extract_class": "dev 0/6, all 0/14",
+    "move_method": "dev 0/14, all 0/34",
+    "low_cohesion": "dev 0/26, all 0/46",
+    "large_method": "dev 0/4, all 0/10",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,9 +172,20 @@ class _Unit:
     effort: str
     improves: str
     write: Callable[[int], FixItem]
+    #: False for a performance cause whose marker has not cleared the bar for
+    #: leading (``opportunity_rank.may_lead``): listed, never first.
+    may_lead: bool = True
 
 
 _VENDORED = frozenset({"vendor", "third_party", "thirdparty", "node_modules"})
+#: Stored code origins that do not ship, by the exclusion each counts as.
+_ORIGIN_EXCLUSION = {
+    "test": "test",
+    "vendored": "vendored",
+    "docs_example": "docs_example",
+    "generated": "generated",
+    "tooling": "tooling",
+}
 
 
 def _open(row: Any) -> bool:
@@ -157,19 +201,27 @@ def _num(value: Any) -> float:
 _code_context = functools.lru_cache(maxsize=65536)(code_context)
 
 
-def _path_exclusion(path: str, is_test: bool | None, context: str | None = None) -> str | None:
+def _path_exclusion(
+    path: str, is_test: bool | None, context: str | None = None, origin: str | None = None
+) -> str | None:
     """Why a file is out of the queue, or ``None`` when it ships.
 
-    Code-shape work reads :func:`code_context`, where a CLI ships. A
-    performance fix passes ``production``: its stored execution context is
-    judged by the performance default queue, so only the path rules apply.
-    The stored ``is_test`` flag also marks a test.
+    The stored ``code_origin`` decides first: it read the file's head, so it
+    knows a vendored library or a docs tutorial the path alone does not.
+    Then the path rules. Code-shape work reads :func:`code_context`, where a
+    CLI ships. A performance fix passes ``production``: its stored execution
+    context is judged by the performance default queue, so only the path
+    rules apply. The stored ``is_test`` flag also marks a test.
     """
+    if origin in _ORIGIN_EXCLUSION:
+        return _ORIGIN_EXCLUSION[origin]
     ctx = context or _code_context(path)
     if is_test or ctx == "test":
         return "test"
     parts = set(path.lower().split("/")[:-1])
-    if _is_generated_path(path) or parts & _VENDORED:
+    if parts & _VENDORED:
+        return "vendored"
+    if _is_generated_path(path):
         return "generated"
     # ``unknown`` under a directory is docs, examples or demos: code that does
     # not ship. A root-level file stays eligible.
@@ -254,9 +306,13 @@ class _Files:
         history: Mapping[str, list[Any]],
         functions: Mapping[tuple[str, str], list[Any]],
         cuts: tuple[float, float] | None,
+        clones: Mapping[str, list[tuple[int, int]]] | None = None,
+        extractions: Mapping[tuple[str, str], list[Any]] | None = None,
     ) -> None:
         self.by_path = {field(m, "file_path"): m for m in metrics}
         self.functions = functions
+        self.clones = clones or {}
+        self.extractions = extractions or {}
         if cuts is None:
             production = [m for m in self.by_path.values() if not field(m, "is_test")]
             cuts = (
@@ -270,8 +326,16 @@ class _Files:
         """The stored flag; ``None`` when the file has no metric row or flag."""
         return field(self.by_path.get(path), "is_test")
 
+    def origin(self, path: str) -> str | None:
+        """The stored code origin; ``None`` before it was recorded."""
+        return field(self.by_path.get(path), "code_origin")
+
     def commits(self, path: str) -> int:
         return int(field(self.by_path.get(path), "commit_count_90d") or 0)
+
+    def coverage(self, path: str) -> float | None:
+        """Measured line coverage in percent; ``None`` when no report has it."""
+        return field(self.by_path.get(path), "line_coverage_pct")
 
     def dependents(self, path: str) -> int | None:
         return field(self.by_path.get(path), "dependents")
@@ -299,6 +363,78 @@ class _Files:
             )
         return _measure(found)
 
+    def cloned(self, path: str, shape: Mapping[str, int]) -> bool:
+        """Whether a stored duplicate overlaps the function ``shape`` spans."""
+        start, end = shape.get("start"), shape.get("end")
+        if not start or not end:
+            return False
+        return any(a <= end and b >= start for a, b in self.clones.get(path, ()))
+
+    def first_step(self, finding: Any) -> FixStep | None:
+        """The concrete first edit for a finding with no plan of its own.
+
+        A function-size finding starts at the best stored Extract Method span
+        inside the function, else at its deepest nested block. Any other
+        finding names its own line or function. ``None`` when there is no
+        such edit to name: a class-level finding with no member groups, or a
+        size finding with neither fact stored.
+        """
+        path = field(finding, "file_path")
+        marker = field(finding, "biomarker_type") or ""
+        function = field(finding, "function_name")
+        line = field(finding, "line_start")
+        if marker in CLASS_MARKERS:
+            return None
+        if marker not in SIZE_MARKERS:
+            if line or function:
+                summary = text.first_sentence(suggestion_for(marker))
+                return FixStep(1, summary, path, line, False)
+            return None
+        tail = (function or "").rsplit(".", 1)[-1]
+        plans = self.extractions.get((path, tail)) or ()
+        best = max(plans, key=_extraction_worth, default=None)
+        if best is not None:
+            start, end = _span(best)
+            body = _plan_body(best)
+            into = text.signature(
+                body.get("suggested_name"),
+                list(body.get("params") or []),
+                list(body.get("returns") or []),
+            )
+            return FixStep(1, f"Extract lines {start}-{end} of {tail} into {into}", path, start)
+        shape = self.shape(path, function)
+        start, end = shape.get("deep_start"), shape.get("deep_end")
+        if start and end:
+            depth = shape.get("max_nesting")
+            where = f"where it nests {depth} deep" if depth else "where it nests deepest"
+            lines = f"line {start}" if start == end else f"lines {start}-{end}"
+            return FixStep(
+                1,
+                f"Start with {lines}, {where}: return early or move it into a helper",
+                path,
+                start,
+            )
+        return None
+
+    def unit_exclusion(self, path: str, symbol: str | None, complexity: bool) -> str | None:
+        """Why a unit on ``symbol`` is not a candidate, or ``None``.
+
+        A deprecated function is on its way out. A complexity unit on a
+        function that is mostly one dispatch on one value is usually fine as
+        it is, unless a duplicate also sits in it; one on a small function is
+        not worth an item.
+        """
+        shape = self.shape(path, symbol)
+        if shape.get("deprecated"):
+            return "deprecated"
+        if not complexity:
+            return None
+        if shape.get("dispatch_pct", 0) >= DISPATCH_SHARE * 100 and not self.cloned(path, shape):
+            return "inherent_dispatch"
+        if _small(shape):
+            return "small_function"
+        return None
+
     def why(
         self,
         path: str,
@@ -306,25 +442,31 @@ class _Files:
         measured: str | None,
         fallback: str,
         dependents: int | None = None,
+        cloned: bool = False,
     ) -> str:
-        """One sentence: the measured problem, then who depends on the file."""
+        """One sentence: the problem, then why it matters here (who imports
+        the file, how often it changes, how much of it tests run)."""
         deps = dependents if dependents is not None else self.dependents(path)
         head = measured or fallback.rstrip(". ")
-        return f"{head}{text.exposure(deps, self.commits(path))}."
+        if cloned:
+            head += f", {text.CLONED}"
+        return f"{head}{text.exposure(deps, self.commits(path), self.coverage(path))}."
 
     def context(self, path: str) -> tuple[FixContext, ...]:
         """History is context: shown beside the item, never ranked on."""
         out: list[FixContext] = []
         commits = self.commits(path)
         if commits:
-            out.append(FixContext("changes in 90 days", str(commits)))
+            people = field(self.by_path.get(path), "contributor_count")
+            out.append(FixContext("recent changes", text.changes(commits, people)))
         if self.is_test(path):
             out.append(FixContext("file kind", "test"))
         ranked = sorted(self.history.get(path, ()), key=lambda f: -_num(field(f, "health_impact")))
         for f in ranked:
-            out.append(
-                FixContext(text.humanize(field(f, "biomarker_type") or ""), field(f, "reason") or "")
-            )
+            marker = field(f, "biomarker_type") or ""
+            sentence = text.history_fact(marker, detail_map(f), field(f, "function_name"))
+            if sentence:
+                out.append(FixContext(text.HISTORY_LABEL.get(marker, "history"), sentence))
         return tuple(out[:MAX_CONTEXT])
 
     def common_facts(self, path: str, dependents: int | None = None) -> list[FixFact]:
@@ -358,6 +500,7 @@ def _finish(
     improves: str,
     rank_inputs: Callable[[], list[FixRankFact]],
     fields: Callable[[], dict[str, Any]],
+    may_lead: bool = True,
 ) -> _Unit:
     confidence = confidence if confidence in LEVEL_RANK else "low"
     effort = effort if effort in FIX_EFFORTS else "M"
@@ -379,7 +522,7 @@ def _finish(
             **fields(),
         )
 
-    return _Unit(item_id, kind, tier, value, score, confidence, effort, improves, write)
+    return _Unit(item_id, kind, tier, value, score, confidence, effort, improves, write, may_lead)
 
 
 # --- refactoring ----------------------------------------------------------------
@@ -423,17 +566,95 @@ def _refactor_step(order: int, step: Mapping[str, Any], plan: Any) -> FixStep:
     elif kind == "extract_helper":
         line_text = f"Replace the duplicate in {sym} with a call to one shared helper"
     elif kind == "extract_class":
-        line_text = f"Move a cohesive group of {sym}'s methods into a new class"
+        groups = [g for g in _plan_body(plan).get("groups") or [] if g.get("methods")]
+        members = sorted(groups, key=lambda g: len(g["methods"]))[0]["methods"] if groups else []
+        line_text = (
+            f"Move {', '.join(members[:4])}"
+            + (f" and {len(members) - 4} more" if len(members) > 4 else "")
+            + f" out of {sym} into a new class"
+            if members
+            else f"Move a cohesive group of {sym}'s methods into a new class"
+        )
     elif kind == "split_file":
-        line_text = f"Split {text.basename(path)} along its independent groups"
+        names = [g.get("name") for g in _plan_body(plan).get("groups") or [] if g.get("name")]
+        line_text = (
+            f"Split {text.basename(path)} into {', '.join(names[:4])}"
+            + (f" and {len(names) - 4} more" if len(names) > 4 else "")
+            if names
+            else f"Split {text.basename(path)} along its independent groups"
+        )
     elif kind == "break_cycle":
-        line_text = f"Break the import cycle at {text.basename(path)}"
+        edge = _cut_edge(plan)
+        line_text = (
+            f"Cut the import of {text.basename(edge['to'])} in "
+            f"{text.basename(edge['from'])} (line {edge['line']})"
+            if edge
+            else f"Break the import cycle at {text.basename(path)}"
+        )
     elif kind == "move_method":
-        line_text = f"Move {sym} to the class it uses most"
+        dest = _plan_body(plan).get("to_class") or text.basename(
+            _plan_body(plan).get("to_file") or ""
+        )
+        line_text = (
+            f"Move {sym} to {dest}" if dest else f"Move {sym} to the class it uses most"
+        )
     else:
         line_text = f"Apply the {text.humanize(kind)} step to {sym}"
     mechanical = (step.get("applicability") or {}).get("classification") == "mechanical"
     return FixStep(order, line_text, path, start or step.get("line_start"), mechanical)
+
+
+def _cut_edge(plan: Any) -> dict[str, Any] | None:
+    """The first cut edge whose import line is stored."""
+    for edge in _plan_body(plan).get("cut_edges") or ():
+        if isinstance(edge, dict) and edge.get("line") and edge.get("from") and edge.get("to"):
+            return edge
+    return None
+
+
+def _concrete(step: Mapping[str, Any], plan: Any) -> bool:
+    """Whether a refactoring step names an edit someone can make: lines to
+    lift, a destination, the import to cut, or named groups."""
+    kind = step.get("refactoring_type") or ""
+    body = _plan_body(plan)
+    if kind == "extract_method":
+        start, end = _span(plan)
+        return bool(start and end)
+    if kind == "extract_helper":
+        return any(
+            isinstance(o, dict) and o.get("line_start") for o in body.get("occurrences") or ()
+        )
+    if kind == "move_method":
+        return bool(body.get("to_class") or body.get("to_file"))
+    if kind == "break_cycle":
+        return _cut_edge(plan) is not None
+    if kind in ("split_file", "extract_class"):
+        members = "symbols" if kind == "split_file" else "methods"
+        return any(
+            isinstance(g, dict) and g.get(members) and (g.get("name") or kind == "extract_class")
+            for g in body.get("groups") or ()
+        )
+    return bool(step.get("line_start"))
+
+
+def _extraction_worth(plan: Any) -> tuple[int, int]:
+    evidence = _evidence(plan)
+    return int(evidence.get("ccn_removed") or 0), int(evidence.get("slice_nloc") or 0)
+
+
+def _extractions(plans: Iterable[Any]) -> dict[tuple[str, str], list[Any]]:
+    """Extract Method plans with a span, by (file, function name)."""
+    out: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for plan in plans:
+        symbol = field(plan, "target_symbol")
+        if field(plan, "refactoring_type") != "extract_method" or not symbol:
+            continue
+        start, end = _span(plan)
+        if start and end:
+            out[(field(plan, "file_path"), text.short_symbol(symbol).rsplit(".", 1)[-1])].append(
+                plan
+            )
+    return dict(out)
 
 
 def _refactor_unit(
@@ -460,6 +681,7 @@ def _refactor_unit(
     dimension = biomarker_dimension(marker) if marker else "maintainability"
     shape = files.shape(path, lead.get("target_symbol"))
     size = _size_value(shape, hot)
+    cloned = lead_type == "extract_method" and files.cloned(path, shape)
 
     def fields() -> dict[str, Any]:
         lead_plan = plans.get(lead.get("plan_id"))
@@ -501,8 +723,10 @@ def _refactor_unit(
         fix_steps = tuple(
             _refactor_step(i + 1, s, plans.get(s.get("plan_id"))) for i, s in enumerate(steps)
         )
+        size_text = text.size_line(shape)
         facts = [
             FixFact("health recoverable", f"+{gain:.1f}", "inferred"),
+            *([FixFact("size", size_text)] if size_text else []),
             FixFact("steps", f"{len(steps)} ({mechanical_n} mechanical)"),
             *files.common_facts(path, dependents),
         ]
@@ -527,6 +751,7 @@ def _refactor_unit(
                 measured=_refactor_measure(lead_type, sym, path, lead, lead_plan, files),
                 fallback=text.problem(marker, sym),
                 dependents=dependents,
+                cloned=cloned,
             ),
             "facts": tuple(facts[:MAX_FACTS]),
             "action": FixAction(
@@ -562,7 +787,7 @@ def _refactor_unit(
     return _finish(
         kind="refactor",
         source_id=field(row, "opportunity_id"),
-        value=max(_gain_value(gain, hot), size),
+        value=_lifted(max(_gain_value(gain, hot), size), cloned),
         ready=mechanical or confidence == "high",
         score=_num(field(row, "rank_score")),
         confidence=confidence if confidence in LEVEL_RANK else "medium",
@@ -572,9 +797,16 @@ def _refactor_unit(
             FixRankFact("health gain", f"{gain:.2f}"),
             FixRankFact("problem size", str(size)),
             FixRankFact("hot file", "yes" if hot else "no"),
+            FixRankFact("duplicate inside", "yes" if cloned else "no"),
         ],
         fields=fields,
     )
+
+
+def _lifted(value: int, cloned: bool) -> int:
+    """A complexity unit with a duplicate in the same function is one step
+    more worth doing: raters accepted that shape almost every time."""
+    return min(VALUE_MAX, value + 1) if cloned else value
 
 
 def _refactor_measure(
@@ -610,7 +842,27 @@ def _has_plan(row: Any) -> bool:
     return field(row, "plan_state") == "available" and bool(field(row, "fix_strategy"))
 
 
+#: Causes whose cost is real only in shipped code over a loop that grows: a
+#: string built in a bounded loop, or in a script, costs nothing a user sees.
+GROWS_ONLY_MARKERS = frozenset({"string_concat_in_loop"})
+
+
+def _perf_worth(row: Any) -> bool:
+    """Whether a planned cause is worth an item at all."""
+    if field(row, "biomarker_type") not in GROWS_ONLY_MARKERS:
+        return True
+    facets = detail_map(row).get("facets") or {}
+    return (
+        field(row, "execution_context") == "production"
+        and facets.get("loop_magnitude") == "grows_with_data"
+    )
+
+
 def _perf_value(row: Any, facets: Mapping[str, Any]) -> int:
+    """0 to :data:`VALUE_MAX`. A production, entry-reachable database or
+    network call in a loop that grows with the data is the costliest kind of
+    work Fix first holds, so it shares the top band with the largest
+    functions; capped below it, it never reached a top ten that size fills."""
     production = field(row, "execution_context") == "production"
     grows = facets.get("loop_magnitude") == "grows_with_data"
     unknown = facets.get("loop_magnitude") in (None, "unknown")
@@ -620,10 +872,13 @@ def _perf_value(row: Any, facets: Mapping[str, Any]) -> int:
         and grows
         and field(row, "boundary_kind") in ("db", "network")
     ):
-        return 3
-    if production and (grows or unknown):
-        return 2
-    return 1
+        return VALUE_MAX
+    value = 2 if production and (grows or unknown) else 1
+    # No traffic data: a loop of unknown size that no entry point reaches is
+    # most often an admin or maintenance path, where an N+1 is cheap.
+    if unknown and facets.get("exposure") != "entry_reachable":
+        value -= 1
+    return value
 
 
 def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
@@ -648,10 +903,11 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
         # A cause with no intervention symbol is named by the function its plan edits.
         first = plan_steps[0] if plan_steps else {}
         name = (
-            text.short_symbol(symbol)
-            or text.short_symbol(first.get("symbol"))
+            text.scope_name(symbol, path)
+            or text.scope_name(first.get("symbol"), path)
             or text.basename(path)
         )
+        module = name.startswith("module scope of ")
         noun = text.BOUNDARY_NOUN.get(field(lead, "boundary_kind") or "")
         call_sites = int(field(lead, "affected_call_sites_total") or 0)
         files_n = int(field(lead, "affected_files_total") or 1)
@@ -660,7 +916,7 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
         if shaped:
             title = shaped[0].format(name=name)
         elif noun and call_sites > 1:
-            title = f"Batch the {noun} calls loops make through {name}"
+            title = f"Batch the {noun} calls loops make {'in' if module else 'through'} {name}"
         elif noun:
             title = f"Move the {noun} call in {name} out of its loop"
         else:
@@ -700,7 +956,7 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
             FixStep(
                 int(s.get("order") or i + 1),
                 s.get("action", "")
-                + (f" ({text.short_symbol(s.get('symbol'))})" if s.get("symbol") else ""),
+                + (f" ({text.scope_name(s.get('symbol'), path)})" if s.get("symbol") else ""),
                 s.get("file_path") or path,
                 s.get("line"),
                 s.get("applicability") == "mechanical",
@@ -711,7 +967,9 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
         return {
             "title": text.clip(title),
             "target": FixTarget(
-                path, name if symbol or first.get("symbol") else None, first.get("line")
+                path,
+                name if (symbol or first.get("symbol")) and not module else None,
+                first.get("line"),
             ),
             "why": f"{what}; {', '.join(reach) or 'the loop size is unknown'}.",
             "facts": tuple(facts[:MAX_FACTS]),
@@ -744,6 +1002,7 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
     confidence = confidence if confidence in LEVEL_RANK else "low"
     return _finish(
         kind="perf_fix",
+        may_lead=details.get("may_lead") is not False,
         source_id=f"{path}::{symbol or path}",
         value=_perf_value(lead, facets),
         ready=ready or mechanical,
@@ -753,8 +1012,8 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
         improves="performance",
         rank_inputs=lambda: [
             FixRankFact("runs in", field(lead, "execution_context") or "unknown"),
-            FixRankFact("entry reachable", exposure or "unknown"),
-            FixRankFact("loop size", magnitude or "unknown"),
+            FixRankFact("entry reachable", text.humanize(exposure or "unknown")),
+            FixRankFact("loop size", text.humanize(magnitude or "unknown")),
             FixRankFact("boundary", field(lead, "boundary_kind") or "none"),
         ],
         fields=fields,
@@ -764,7 +1023,7 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
 # --- findings with no plan ----------------------------------------------------------
 
 
-def _finding_unit(lead: Any, files: _Files) -> _Unit:
+def _finding_unit(lead: Any, files: _Files, first: FixStep) -> _Unit:
     path = field(lead, "file_path")
     marker = field(lead, "biomarker_type") or ""
     function = field(lead, "function_name")
@@ -774,12 +1033,13 @@ def _finding_unit(lead: Any, files: _Files) -> _Unit:
     dimension = biomarker_dimension(marker)
     shape = files.shape(path, function)
     size = _size_value(shape, hot)
+    cloned = marker in SIZE_MARKERS and files.cloned(path, shape)
 
     def fields() -> dict[str, Any]:
         where = function or text.basename(path)
         summary = text.first_sentence(suggestion_for(marker))
         line = field(lead, "line_start")
-        if _magnitude(shape) >= SIZE_BREAK_UP and function:
+        if _magnitude(shape) >= SIZE_BREAK_UP and function and marker in SIZE_MARKERS:
             title = f"Break up {where} ({text.size_brief(shape)})"
         else:
             title = text.FINDING_TITLE.get(marker, "Address the finding in {where}").format(
@@ -790,17 +1050,19 @@ def _finding_unit(lead: Any, files: _Files) -> _Unit:
             "target": FixTarget(path, function, line, field(lead, "line_end")),
             "why": files.why(
                 path,
-                measured=text.measured(where, files.shape(path, function)),
-                fallback=field(lead, "reason") or text.problem(marker, where),
+                measured=text.measured(where, shape),
+                fallback=text.problem(marker, where),
+                cloned=cloned,
             ),
             "facts": tuple(
                 [
-                    FixFact("finding", marker),
+                    FixFact("finding", text.marker_label(marker)),
+                    *([FixFact("size", size_text)] if (size_text := text.size_line(shape)) else []),
                     FixFact("severity", field(lead, "severity") or "unknown"),
                     *files.common_facts(path),
                 ][:MAX_FACTS]
             ),
-            "action": FixAction(summary, (FixStep(1, summary, path, line, False),), 1, False),
+            "action": FixAction(summary, (first,), 1, False),
             "gain": FixGain(
                 "health_points", round(impact, 3), text.health_gain(impact, ceiling=True)
             ),
@@ -820,7 +1082,7 @@ def _finding_unit(lead: Any, files: _Files) -> _Unit:
     return _finish(
         kind="finding",
         source_id=public_id or f"{path}::{marker}::{function or ''}",
-        value=max(_gain_value(impact, hot), size),
+        value=_lifted(max(_gain_value(impact, hot), size), cloned),
         ready=False,
         score=impact,
         confidence="medium",
@@ -830,9 +1092,50 @@ def _finding_unit(lead: Any, files: _Files) -> _Unit:
             FixRankFact("health gain", f"{impact:.2f}"),
             FixRankFact("problem size", str(size)),
             FixRankFact("hot file", "yes" if hot else "no"),
+            FixRankFact("duplicate inside", "yes" if cloned else "no"),
         ],
         fields=fields,
     )
+
+
+def _small(shape: Mapping[str, int]) -> bool:
+    """Under both size floors. A function whose size findings carry no line
+    count is measured by its span, which bounds its code lines from above; one
+    with neither is not judged small."""
+    nloc = shape.get("nloc")
+    if not nloc and shape.get("start") and shape.get("end"):
+        nloc = shape["end"] - shape["start"] + 1
+    if not nloc:
+        return False
+    return nloc < SMALL_NLOC and shape.get("ccn", 0) < SMALL_CCN
+
+
+def _finding_exclusion(finding: Any, files: _Files) -> str | None:
+    if field(finding, "biomarker_type") in LOW_VALUE_KINDS:
+        return "low_value_kind"
+    reason = files.unit_exclusion(
+        field(finding, "file_path"),
+        field(finding, "function_name"),
+        complexity=field(finding, "biomarker_type") in SIZE_MARKERS,
+    )
+    if reason is None and files.first_step(finding) is None:
+        return "no_concrete_step"
+    return reason
+
+
+def _clone_spans(plans: Iterable[Any]) -> dict[str, list[tuple[int, int]]]:
+    """Where verified duplicates sit, by file: the occurrences an Extract
+    Helper plan names. Those come from clone pairs the detector verified
+    token by token and by shared identifier names, with test, generated and
+    short spans already dropped. ``dry_violation`` is not read: it also
+    pairs import blocks and data literals, which is why it is hidden.
+    """
+    out: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for plan in plans:
+        for occ in _plan_body(plan).get("occurrences") or ():
+            if isinstance(occ, dict) and occ.get("line_start") and occ.get("line_end"):
+                out[occ.get("file") or ""].append((occ["line_start"], occ["line_end"]))
+    return dict(out)
 
 
 # --- order ------------------------------------------------------------------------
@@ -868,7 +1171,12 @@ def _order(units: list[_Unit]) -> list[_Unit]:
         ranked.remove(pick)
         head.append(pick)
         taken[pick.kind] += 1
-    return head + ranked
+    out = head + ranked
+    # A cause that may not lead stays in the list, behind the first that may.
+    first = next((i for i, u in enumerate(out) if u.may_lead), 0)
+    if first:
+        out.insert(0, out.pop(first))
+    return out
 
 
 def _by_function(findings: Iterable[Any]) -> dict[tuple[str, str], list[Any]]:
@@ -883,13 +1191,31 @@ def _by_function(findings: Iterable[Any]) -> dict[tuple[str, str], list[Any]]:
 def _measure(findings: Iterable[Any]) -> dict[str, int]:
     """A function's largest measured CCN, size and nesting across its findings.
 
-    ``severe`` is set when any of them is critical or a brain method.
+    ``severe`` is set when any of them is critical or a brain method,
+    ``deprecated`` when any sits in a function marked deprecated,
+    ``dispatch_pct`` is the largest stored dispatch share in percent,
+    ``start`` / ``end`` span the function as its size findings place it, and
+    ``deep_start`` / ``deep_end`` are its deepest nested block's lines.
     """
     shape: dict[str, int] = {}
     for f in findings:
         if field(f, "severity") == "critical" or field(f, "biomarker_type") == "brain_method":
             shape["severe"] = 1
         details = detail_map(f)
+        if details.get("deprecated"):
+            shape["deprecated"] = 1
+        deepest = details.get("deepest_block")
+        if isinstance(deepest, dict) and deepest.get("start") and "deep_start" not in shape:
+            shape["deep_start"] = int(deepest["start"])
+            shape["deep_end"] = int(deepest.get("end") or deepest["start"])
+        share = details.get("dispatch_share")
+        if isinstance(share, (int, float)):
+            shape["dispatch_pct"] = max(shape.get("dispatch_pct", 0), round(share * 100))
+        if field(f, "biomarker_type") in SIZE_MARKERS:
+            start, end = field(f, "line_start"), field(f, "line_end")
+            if start and end:
+                shape["start"] = min(shape.get("start", start), start)
+                shape["end"] = max(shape.get("end", end), end)
         for k in ("ccn", "nloc", "max_nesting", "lcom4", "method_count"):
             v = details.get(k)
             if isinstance(v, (int, float)) and v > shape.get(k, 0):
@@ -932,6 +1258,7 @@ def build_fix_first(
     :func:`hot_cut` for the rule.
     """
     metrics = list(metrics)
+    findings = list(findings)
     keep_tests = scope == "all"
     excluded = dict.fromkeys(FIX_EXCLUSIONS, 0)
     hidden = excluded_types()
@@ -946,15 +1273,18 @@ def build_fix_first(
         ):
             by_file[field(f, "file_path")].append(f)
     split = {path: split_by_origin(rows) for path, rows in by_file.items()}
+    plans = list(plans)
     files = _Files(
         metrics,
         {p: hist for p, (_shape, hist) in split.items() if hist},
         _by_function(f for shape, _hist in split.values() for f in shape),
         hot_cuts,
+        _clone_spans(plans),
+        _extractions(plans),
     )
 
     def out_of_scope(path: str, context: str | None = None) -> bool:
-        reason = _path_exclusion(path, files.is_test(path), context)
+        reason = _path_exclusion(path, files.is_test(path), context, files.origin(path))
         if reason is None or (reason == "test" and keep_tests):
             return False
         excluded[reason] += 1
@@ -978,6 +1308,20 @@ def build_fix_first(
         gain = _num(field(row, "recoverable_health"))
         if not steps:
             excluded["below_min_worth"] += 1
+            continue
+        reason = (
+            "low_value_kind"
+            if steps[0].get("refactoring_type") in LOW_VALUE_KINDS
+            else files.unit_exclusion(
+                path,
+                steps[0].get("target_symbol"),
+                complexity=steps[0].get("refactoring_type") == "extract_method",
+            )
+        )
+        if reason is None and not _concrete(steps[0], plan_rows.get(steps[0].get("plan_id"))):
+            reason = "no_concrete_step"
+        if reason is not None:
+            excluded[reason] += 1
             continue
         units.append(_refactor_unit(row, details, steps, gain, plan_rows, files))
         # Only a plan that became an item speaks for the file's findings; an
@@ -1005,7 +1349,11 @@ def build_fix_first(
         if not ready:
             excluded["no_plan" if queued else reasons[0] or "no_plan"] += 1
             continue
-        units.append(_perf_unit(ready, files))
+        worth = [r for r in ready if _perf_worth(r)]
+        if not worth:
+            excluded["below_min_worth"] += 1
+            continue
+        units.append(_perf_unit(worth, files))
 
     for path, (shape, history) in split.items():
         if path in planned_files:
@@ -1018,7 +1366,14 @@ def build_fix_first(
         if lead is None:
             excluded["history_only"] += 1
             continue
-        units.append(_finding_unit(lead, files))
+        # A finding that is no candidate leaves the file's others to compete;
+        # the file is counted under its own lead's reason when none is left.
+        reasons = {id(f): _finding_exclusion(f, files) for f in shape}
+        eligible = primary_finding([f for f in shape if reasons[id(f)] is None])
+        if eligible is None:
+            excluded[reasons[id(lead)] or next(r for r in reasons.values() if r)] += 1
+            continue
+        units.append(_finding_unit(eligible, files, files.first_step(eligible)))
 
     ordered = _order(units)
     if item_id is not None:
@@ -1041,11 +1396,18 @@ def build_fix_first(
 
 
 __all__ = [
+    "CLASS_MARKERS",
     "DEFAULT_LIMIT",
+    "DISPATCH_SHARE",
     "GAIN_CUTS",
+    "GROWS_ONLY_MARKERS",
     "HEAD",
     "HEAD_PER_KIND",
+    "LOW_VALUE_KINDS",
     "MIN_WORTH",
+    "SIZE_MARKERS",
+    "SMALL_CCN",
+    "SMALL_NLOC",
     "build_fix_first",
     "hot_cut",
     "hot_cut_offset",

@@ -46,6 +46,13 @@ FixExclusion = Literal[
     "no_plan",
     "below_min_worth",
     "history_only",
+    "vendored",
+    "docs_example",
+    "deprecated",
+    "inherent_dispatch",
+    "small_function",
+    "no_concrete_step",
+    "low_value_kind",
 ]
 FIX_EXCLUSIONS: tuple[str, ...] = get_args(FixExclusion)
 

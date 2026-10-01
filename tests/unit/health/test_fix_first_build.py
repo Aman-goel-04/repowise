@@ -48,6 +48,13 @@ def test_each_exclusion_is_counted_by_reason() -> None:
         "no_plan": 0,
         "below_min_worth": 1,
         "history_only": 1,
+        "vendored": 0,
+        "docs_example": 0,
+        "deprecated": 0,
+        "inherent_dispatch": 0,
+        "small_function": 0,
+        "no_concrete_step": 0,
+        "low_value_kind": 0,
     }
     assert queue.totals.eligible == 3
     assert queue.totals.candidates == 3 + 7
@@ -56,23 +63,33 @@ def test_each_exclusion_is_counted_by_reason() -> None:
 
 def test_history_never_leads_and_rides_along_as_context() -> None:
     queue = _build()
+    # The production, entry-reachable, growing database loop shares the top
+    # band with the refactor and leads it on score.
     assert [i.target.file_path for i in queue.items] == [
-        "src/core.py",
         "src/repo.py",
+        "src/core.py",
         "src/plain.py",
     ]
-    core = queue.lead
+    core = queue.items[1]
     assert core.kind == "refactor"
     assert "change" not in core.title.lower() and "entropy" not in core.why
-    assert [c.label for c in core.context] == ["changes in 90 days", "change entropy"]
+    assert [(c.label, c.value) for c in core.context] == [
+        ("recent changes", "changed 12 times in 90 days"),
+        ("scattered changes", "its changes are spread across many unrelated commits"),
+    ]
     # The history-only file is no item at all.
     assert all(i.target.file_path != "src/hist.py" for i in queue.items)
 
 
 def test_text_quotes_the_stored_numbers() -> None:
-    core = _build().lead
+    core = next(i for i in _build().items if i.kind == "refactor")
     assert core.title == "Extract lines 20-35 of run into sum_rows (+1 more step)"
-    assert core.why == "run: CCN 14, 50 lines, nests 4 deep; 9 files import it, changed 12 times in 90 days."
+    # The size is a fact; the why says why it matters here.
+    assert core.why == (
+        "run has many independent paths through it; 9 files import it, "
+        "changed 12 times in 90 days."
+    )
+    assert ("size", "CCN 14, 50 lines, nests 4 deep") in [(f.label, f.value) for f in core.facts]
     assert core.action.steps[0].text == "Extract lines 20-35 of run into sum_rows(rows, limit) -> total"
     assert core.action.steps[1].text == "Extract lines 40-41 of run into a helper"
     # The model's credit is the gain, with one decimal; the builder does not re-judge it.
@@ -126,9 +143,13 @@ def test_no_kind_takes_more_than_three_of_the_first_five() -> None:
         row["file_path"] = f"src/core{n}.py"
         row["details"]["steps"] = row["details"]["steps"][:1]
         refactors.append(row)
-    # Same value as the refactors (production, loop size unknown), lower tier.
+    # Same value as the refactors (production, loop size unknown, reachable),
+    # lower tier.
     perf = _perf("perf2_a", "s")
-    perf["details"] = {**perf["details"], "facets": {"loop_magnitude": "unknown"}}
+    perf["details"] = {
+        **perf["details"],
+        "facets": {"loop_magnitude": "unknown", "exposure": "entry_reachable"},
+    }
     queue = _build(refactoring=refactors, performance=[perf], findings=[])
     # The fourth place goes to the perf fix; the fifth back to a refactor,
     # since no other kind has anything left at value 2 or above.
@@ -173,14 +194,14 @@ def test_value_leads_tier_and_a_huge_function_says_so() -> None:
     """A function far past every bar outranks tidy work that is safer to start."""
     huge = {**FINDINGS[1], "file_path": "src/plain.py", "function_name": "walk",
             "public_id": "finding_huge", "details": {"ccn": 249, "nloc": 1280, "max_nesting": 5}}
-    queue = _build(findings=[*FINDINGS, huge])
+    queue = _build(findings=[*FINDINGS, huge], performance=[])
     lead = queue.lead
     assert (lead.kind, lead.tier, lead.target.file_path) == ("finding", "next", "src/plain.py")
     assert lead.title == "Break up walk (CCN 249, 1,280 lines)"
     assert ("problem size", "4") in [(f.factor, f.value) for f in lead.why_ranked]
     # With a plan, the title names the problem and the first concrete step.
     big = {**FINDINGS[1], "details": {"ccn": 120, "nloc": 900, "max_nesting": 6}}
-    planned = _build(findings=[big]).lead
+    planned = _build(findings=[big], performance=[]).lead
     assert planned.title == (
         "Start breaking up run (CCN 120, 900 lines): first lift lines 20-35 into sum_rows"
     )

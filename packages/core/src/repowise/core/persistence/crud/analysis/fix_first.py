@@ -69,7 +69,10 @@ async def _metrics(session: AsyncSession, repo_id: str, paths: set[str]) -> list
                 HealthFileMetric.file_path,
                 HealthFileMetric.nloc,
                 HealthFileMetric.is_test,
+                HealthFileMetric.code_origin,
+                HealthFileMetric.line_coverage_pct,
                 GitMetadata.commit_count_90d,
+                GitMetadata.contributor_count,
                 GraphMetric.in_degree.label("dependents"),
             )
             .outerjoin(
@@ -208,10 +211,8 @@ async def _findings(
                 f.public_id,
                 f.dimension,
                 f.status,
-                # Only a code-shape finding's numbers are quoted.
-                case((f.biomarker_type.in_(history), None), else_=f.details_json).label(
-                    "details_json"
-                ),
+                # History numbers become plain context sentences.
+                f.details_json,
             ).where(
                 _eligible_findings(repo_id),
                 or_(
@@ -305,21 +306,36 @@ def _steps(refactoring: list[Any]) -> list[dict[str, Any]]:
     return [s for r in refactoring if r.details for s in r.details.get("steps") or []]
 
 
-async def _plans(session: AsyncSession, repo_id: str, steps: list[dict[str, Any]]) -> list[Any]:
-    """The plans those steps name: span, signature, evidence."""
+async def _plans(
+    session: AsyncSession, repo_id: str, steps: list[dict[str, Any]], files: set[str]
+) -> list[Any]:
+    """The plans those steps name (span, signature, evidence), the open
+    Extract Method plans in ``files``, where a finding with no plan of its own
+    takes its first concrete step from, and every open Extract Helper plan,
+    whose occurrences say where verified duplicates sit (a plan is stored at
+    one anchor file and names every site, so it is not filtered by file)."""
     ids = {s.get("plan_id") for s in steps if s.get("plan_id")}
-    if not ids:
+    s = RefactoringSuggestion
+    named = s.public_id.in_(ids) if ids else None
+    extractions = (
+        and_(s.refactoring_type == "extract_method", s.status == "open", s.file_path.in_(files))
+        if files
+        else None
+    )
+    helpers = and_(s.refactoring_type == "extract_helper", s.status == "open")
+    wanted = [c for c in (named, extractions, helpers) if c is not None]
+    if not wanted:
         return []
     return _plain(
         await session.execute(
             select(
-                RefactoringSuggestion.public_id,
-                RefactoringSuggestion.evidence_json,
-                RefactoringSuggestion.plan_json,
-            ).where(
-                RefactoringSuggestion.repository_id == repo_id,
-                RefactoringSuggestion.public_id.in_(ids),
-            )
+                s.public_id,
+                s.refactoring_type,
+                s.file_path,
+                s.target_symbol,
+                s.evidence_json,
+                s.plan_json,
+            ).where(s.repository_id == repo_id, or_(*wanted))
         )
     )
 
@@ -412,7 +428,7 @@ async def _build(
         findings=[*findings, *(r for r in history_only if r.file_path not in full | planned)],
         refactoring=refactoring,
         performance=performance,
-        plans=await _plans(session, repository_id, steps),
+        plans=await _plans(session, repository_id, steps, full),
         limit=limit,
         scope=scope,
         item_id=item_id,
