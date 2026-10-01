@@ -113,3 +113,16 @@ def test_fix_first_vocabularies_match_python() -> None:
     # Upper-case members fall outside the lower-case member regex.
     match = re.search(r'export type FixEffort =(.*?);', (_TYPES_SRC / "fix-first.ts").read_text(encoding="utf-8"))
     assert match and set(re.findall(r'"([A-Z]+)"', match.group(1))) == set(FIX_EFFORTS)
+
+
+def test_agent_prompt_flavors_match_python() -> None:
+    from repowise.core.agent_prompts import FLAVORS
+
+    for src, module, alias in (
+        (_PACKAGES / "ui/src", "health/ai-prompts/shared.ts", "AiPromptFlavor"),
+        (_TYPES_SRC, "agent-prompts.ts", "AgentPromptFlavor"),
+    ):
+        text = (src / module).read_text(encoding="utf-8")
+        match = re.search(rf"export type {alias} =(.*?);", text, re.DOTALL)
+        assert match, f"{alias} is not declared in {module}"
+        assert set(re.findall(r'"([a-z-]+)"', match.group(1))) == set(FLAVORS), alias
