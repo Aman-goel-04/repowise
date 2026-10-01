@@ -328,9 +328,6 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         self._merged_import_symbols: dict[str, dict[str, str]] = {}
         self._merged_import_methods: dict[str, dict[tuple[str, str], str]] = {}
 
-        # Lazy per-file set of (line, target) that also carry a receiver.
-        self._member_shaped: dict[str, set[tuple[int, str]]] = {}
-
         self._init_receiver_typing_caches()
         self._repo_rebound_names: dict[str, frozenset[str]] = {}
 
@@ -789,7 +786,10 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
 
         # --- Method call with receiver: receiver.method() ---
         if call.receiver_name:
-            return self._with_props(self._resolve_member_call(file_path, call, caller_id), call)
+            handled, hit = self._resolve_member_call(file_path, call, caller_id)
+            if not handled and call.bare_name_fallback:
+                hit = self._resolve_free_call(file_path, call, caller_id)
+            return self._with_props(hit, call)
 
         # --- Free function call: function() ---
         return self._with_props(self._resolve_free_call(file_path, call, caller_id), call)
@@ -942,26 +942,6 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             return ResolvedCall(caller_id, sym_id, 0.88, line, "return_type_import")
         return ResolvedCall(caller_id, sym_id, 0.75, line, "return_type_global")
 
-    def _member_shaped_sites(self, file_path: str) -> set[tuple[int, str]]:
-        """``(line, target)`` pairs at which this file also records a receiver.
-
-        Several grammars match ``obj.m()`` twice — once with a receiver, once
-        against the bare-call pattern — so a member call also arrives as a
-        receiver-less site.
-
-        Keyed on the line because a ``CallSite`` carries no column, so
-        ``foo(bar.foo())`` suppresses the tier for its own bare ``foo()``: a
-        missed edge, never a wrong one.
-        """
-        sites = self._member_shaped.get(file_path)
-        if sites is None:
-            parsed = self._parsed_files.get(file_path)
-            sites = {
-                (c.line, c.target_name) for c in (parsed.calls if parsed else ()) if c.receiver_name
-            }
-            self._member_shaped[file_path] = sites
-        return sites
-
     def _enclosing_class_method(
         self,
         file_path: str,
@@ -972,15 +952,16 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
 
         ``_file_symbols`` is flat and last-wins, so a bare ``foo()`` inside
         class ``A`` would bind to class ``B``'s ``foo`` when ``B`` came later in
-        the file. ``_file_methods`` carries the class.
+        the file. ``_file_methods`` carries the class. A member call on its bare
+        fallback has an explicit receiver, so the caller's class is not it.
         """
         parsed = self._parsed_files.get(file_path)
         if parsed is None or parsed.file_info.language not in _IMPLICIT_RECEIVER_LANGUAGES:
             return None
+        if call.receiver_name:
+            return None
         caller_class = _extract_class_from_symbol_id(caller_id)
         if not caller_class:
-            return None
-        if (call.line, call.target_name) in self._member_shaped_sites(file_path):
             return None
         return self._file_methods.get(file_path, {}).get((caller_class, call.target_name))
 
@@ -1226,15 +1207,13 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
     ) -> ResolvedCall | None:
         """A bare call an ancestor of the caller's class answers.
 
-        Asked after tier 3, so it can only add an edge. The member-shaped
-        refusal is the one ``_enclosing_class_method`` already applies: several
-        grammars mint a receiver-less site for ``obj.m()`` too, and reading one
-        as an implicit receiver would bind the wrong class's hierarchy to the call.
+        Asked after tier 3, so it can only add an edge. A member call on its
+        bare fallback is refused, as in ``_enclosing_class_method``.
         """
         lang = self._language_of(file_path)
         if lang not in _IMPLICIT_RECEIVER_LANGUAGES or lang not in _INHERITED_LANGUAGES:
             return None
-        if (call.line, call.target_name) in self._member_shaped_sites(file_path):
+        if call.receiver_name:
             return None
         sym_id = self._inherited_method(caller_id, call.target_name)
         if sym_id is None:
@@ -1271,8 +1250,12 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         file_path: str,
         call: CallSite,
         caller_id: str,
-    ) -> ResolvedCall | None:
-        """Resolve receiver.method() calls."""
+    ) -> tuple[bool, ResolvedCall | None]:
+        """Resolve receiver.method() calls, as ``(handled, edge)``.
+
+        A handled None is a refusal (the receiver's type is foreign), which a
+        bare-name fallback must not overrule.
+        """
         receiver_name = call.receiver_name
         method_name = call.target_name
         assert receiver_name is not None
@@ -1280,13 +1263,13 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         # Every strategy below ends in a lookup keyed on the method name, so a
         # name the repo declares nowhere cannot resolve.
         if method_name not in self._global_symbols:
-            return None
+            return False, None
 
         # The caller's own file first, ahead of the language strategies: a
         # private inner class here outranks a same-named package sibling.
         own_file = self._file_methods.get(file_path, {}).get((receiver_name, method_name))
         if own_file is not None and own_file != caller_id:
-            return ResolvedCall(caller_id, own_file, 0.93, call.line, "receiver_same_file")
+            return True, ResolvedCall(caller_id, own_file, 0.93, call.line, "receiver_same_file")
 
         # A language may reach a receiver no import statement mentions: a Go
         # package alias spanning several files, a JVM class in the same package.
@@ -1298,13 +1281,14 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             or self._crate_root_call(call, caller_id)
         )
         if hit is not None:
-            return hit
+            return True, hit
 
         handled, hit = self._receiver_class_call(file_path, call, caller_id)
         if handled:
-            return hit
+            return True, hit
 
-        return self._unclassed_receiver_call(file_path, call, caller_id)
+        hit = self._unclassed_receiver_call(file_path, call, caller_id)
+        return hit is not None, hit
 
     def _unclassed_receiver_call(
         self,
