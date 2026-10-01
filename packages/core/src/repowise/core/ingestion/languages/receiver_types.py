@@ -325,12 +325,11 @@ _PY_BINDINGS = (
     # `with ... as n`, `except ... as n`, `import x as n`.
     re.compile(r"\bas\s+(?P<name>[a-z_]\w*)\b"),
     re.compile(r"\b(?P<name>[a-z_]\w*)\s*:="),
-    re.compile(r"\b(?:global|nonlocal)\s+(?P<name>[a-z_]\w*)"),
 )
 
 # Every parameter of any `def` or `lambda` in the span, the enclosing one
-# included: its signature starts its own span. Each lowercase identifier in the
-# list counts, a default's names too, since over-matching only refuses.
+# included: its signature starts its own span. Each lowercase identifier the
+# list binds counts; an annotation or a default binds nothing.
 # Ceiling: a `def` list ends at its first `)`, so a default that calls hides
 # the parameters after it.
 _PY_PARAMETER_LISTS = (
@@ -344,15 +343,16 @@ _PY_NAME = re.compile(r"(?<![\w.])[a-z_]\w*")
 
 _PY_IDENTIFIER = re.compile(r"^[a-z_]\w*$")
 
-# The TypeScript shapes that bind a name, typed or not. Over-matching only
-# refuses, so every identifier in a destructuring pattern or a parameter list
-# counts, a type name or a renamed key included. Ceiling: a parameter list
-# holding parentheses (a default that calls, a function type) is not read.
+# The TypeScript shapes that bind a name, typed or not. Every identifier in a
+# destructuring pattern counts, a renamed key included; a parameter's type
+# annotation and default do not. Ceiling: a parameter list holding
+# parentheses (a default that calls, a function type) is not read.
 _TS_IDENTIFIER = re.compile(r"[A-Za-z_$][\w$]*")
 _TS_BINDINGS = (
     re.compile(r"(?<![\w$.])(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)"),
     re.compile(r"(?<![\w$.])(?:function\*?|class)\s+(?P<name>[A-Za-z_$][\w$]*)"),
-    re.compile(r"(?<![\w$.])(?P<name>[A-Za-z_$][\w$]*)\s*=>"),
+    # A lone arrow parameter; ``): Foo =>`` is a return type, not one.
+    re.compile(r"(?<![\w$.:])(?<!:\s)(?P<name>[A-Za-z_$][\w$]*)\s*=>"),
     # An assignment at the start of a statement, plain or compound.
     re.compile(
         r"(?m)^[ \t]*(?P<name>[A-Za-z_$][\w$]*)\s*"
@@ -360,9 +360,15 @@ _TS_BINDINGS = (
     ),
 )
 _TS_TARGET_LISTS = (
-    re.compile(r"(?<![\w$.])(?:const|let|var)\s*(?P<lhs>\{[^;=]*\}|\[[^;=]*\])\s*(?:=|of\b|in\b)"),
-    # A parameter list: a function, a method, an arrow, a catch clause.
-    re.compile(r"(?P<head>[\w$]*)\s*(?P<lhs>\([^()]*\))\s*(?::[^=;{}()]*?)?\s*(?:=>|\{)"),
+    # Lazy, so a pattern ends at its own bracket, not at one lines later.
+    re.compile(
+        r"(?<![\w$.])(?:const|let|var)\s*(?P<lhs>\{[^;=]*?\}|\[[^;=]*?\])\s*(?:=|of\b|in\b)"
+    ),
+    # A parameter list: a function, a method, an arrow, a catch clause. Not
+    # one after a colon: ``cb: (x: T) => void`` is a function type.
+    re.compile(
+        r"(?<!:)(?<!:\s)(?P<head>[\w$]*)\s*(?P<lhs>\([^()]*\))\s*(?::[^=;{}()]*?)?\s*(?:=>|\{)"
+    ),
 )
 # Heads whose parenthesised part is a condition, not a parameter list.
 _TS_CONDITION_HEADS = frozenset({"if", "for", "while", "switch", "with", "return", "await"})
@@ -379,13 +385,37 @@ def _named_bindings(
     }
 
 
+def _without_annotations(names: str) -> str:
+    """*names* with each top-level item's annotation and default blanked.
+
+    ``(a: Foo, b = make)`` binds ``a`` and ``b``, never ``Foo`` or ``make``: a
+    bare call to either is still the module's. Blanked, not cut, so every name
+    kept stays at its offset. A bracket opens a nested pattern or a generic,
+    whose commas and colons are not the list's own.
+    """
+    out: list[str] = []
+    depth = 0
+    blanking = False
+    for ch in names:
+        if ch in "{[<":
+            depth += 1
+        elif ch in "}]>":
+            depth = max(depth - 1, 0)
+        elif depth == 0 and ch in ":=":
+            blanking = True
+        elif depth == 0 and ch == ",":
+            blanking = False
+        out.append(" " if blanking and ch != "\n" else ch)
+    return "".join(out)
+
+
 def _listed_bindings(
     patterns: Iterable[re.Pattern[str]],
     identifier: re.Pattern[str],
     cleaned: str,
     starts: list[int],
 ) -> set[tuple[int, str]]:
-    """``(line, name)`` for every identifier in each pattern's ``lhs`` list."""
+    """``(line, name)`` for every identifier each pattern's ``lhs`` list binds."""
     found: set[tuple[int, str]] = set()
     for pattern in patterns:
         for match in pattern.finditer(cleaned):
@@ -393,7 +423,7 @@ def _listed_bindings(
             if match.groupdict().get("head") in _TS_CONDITION_HEADS:
                 continue
             offset = match.start("lhs")
-            for name in identifier.finditer(match.group("lhs")):
+            for name in identifier.finditer(_without_annotations(match.group("lhs"))):
                 found.add((bisect_right(starts, offset + name.start()), name.group()))
     return found
 
@@ -412,14 +442,16 @@ def _python_target_bindings(cleaned: str, starts: list[int]) -> set[tuple[int, s
 
 
 # The languages ``scan_bindings`` reads: only there can a scope be shown not
-# to bind a name.
-BINDING_LANGUAGES = frozenset({"python", "typescript"})
+# to bind a name. JavaScript binds with TypeScript's shapes, less annotations.
+BINDING_LANGUAGES = frozenset({"javascript", "python", "typescript"})
+_BINDING_SCAN_AS = {"javascript": "typescript"}
 
 
 def scan_bindings(text: str, language: str) -> tuple[tuple[int, str], ...]:
     """Every ``(line, name)`` *text* binds, in line order."""
     if language not in BINDING_LANGUAGES:
         return ()
+    language = _BINDING_SCAN_AS.get(language, language)
     cleaned = _without_comments(text, language)
     starts = [0, *(newline.end() for newline in _NEWLINE.finditer(cleaned))]
     if language == "typescript":
@@ -430,6 +462,76 @@ def scan_bindings(text: str, language: str) -> tuple[tuple[int, str], ...]:
         found |= _named_bindings(_PY_BINDINGS, cleaned, starts)
         found |= _listed_bindings(_PY_PARAMETER_LISTS, _PY_NAME, cleaned, starts)
     return tuple(sorted(found))
+
+
+# What a scope binds beyond its positional bindings. A TypeScript/JavaScript
+# ``function`` declaration is hoisted, so it binds from the top of its scope
+# whatever its line. A Python ``global`` name is the module's in that scope,
+# however the body assigns it.
+_HOISTED = {"typescript": re.compile(r"(?<![\w$.])function\*?\s+(?P<name>[A-Za-z_$][\w$]*)")}
+_ESCAPES = {"python": re.compile(r"\bglobal\s+(?P<names>\w+(?:\s*,\s*\w+)*)")}
+
+
+class ScopeMarks(NamedTuple):
+    """Names a scope treats specially, each in line order.
+
+    A hoisted entry is ``(line, name, brace depth)``: a declaration hoists
+    only into the function whose body holds it directly, one brace below the
+    line that function starts on (``line_depths``, indexed by line). A block
+    declaration is block-scoped in a module, so it hoists nowhere.
+    """
+
+    hoisted: tuple[tuple[int, str, int], ...]
+    escaped: tuple[tuple[int, str], ...]
+    line_depths: tuple[int, ...]
+
+
+def _brace_depths(cleaned: str) -> tuple[list[int], list[int]]:
+    """Brace depth at every offset of *cleaned*, and at each line's first character."""
+    at: list[int] = []
+    lines = [0]
+    depth = 0
+    seen_code = False
+    for ch in cleaned:
+        at.append(depth)
+        if ch == "\n":
+            lines.append(depth)
+            seen_code = False
+            continue
+        if not seen_code and not ch.isspace():
+            lines[-1] = depth
+            seen_code = True
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth = max(depth - 1, 0)
+    return at, lines
+
+
+def scan_scope_marks(text: str, language: str) -> ScopeMarks:
+    """The hoisted and module-escaped names *text* declares."""
+    language = _BINDING_SCAN_AS.get(language, language)
+    hoisted, escapes = _HOISTED.get(language), _ESCAPES.get(language)
+    if hoisted is None and escapes is None:
+        return ScopeMarks((), (), ())
+    cleaned = _without_comments(text, language)
+    starts = [0, *(newline.end() for newline in _NEWLINE.finditer(cleaned))]
+    found_hoisted: set[tuple[int, str, int]] = set()
+    line_depths: list[int] = []
+    if hoisted is not None:
+        at, line_depths = _brace_depths(cleaned)
+        found_hoisted = {
+            (bisect_right(starts, match.start("name")), match.group("name"), at[match.start()])
+            for match in hoisted.finditer(cleaned)
+        }
+    found_escaped = {
+        (bisect_right(starts, match.start("names")), name.strip())
+        for match in (escapes.finditer(cleaned) if escapes else ())
+        for name in match.group("names").split(",")
+    }
+    return ScopeMarks(
+        tuple(sorted(found_hoisted)), tuple(sorted(found_escaped)), (0, *line_depths)
+    )
 
 
 def names_in_span(
