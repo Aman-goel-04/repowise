@@ -152,6 +152,10 @@ LOW_VALUE_KINDS: dict[str, str] = {
     "move_method": "dev 0/14, all 0/34",
     "low_cohesion": "dev 0/26, all 0/46",
     "large_method": "dev 0/4, all 0/10",
+    # Thinly measured: one held-out item (two labels), none on the dev repos.
+    # A low-value maintainability nudge that otherwise fills a small repo's
+    # whole top three; revisit when more of it is labelled.
+    "primitive_obsession": "dev 0/0, all 0/2",
 }
 
 
@@ -276,7 +280,7 @@ def _risk(files_touched: int, dependents: int | None) -> FixRisk:
         level = "low"
     parts = [f"touches {text.plural(files_touched, 'file')}"]
     if dependents:
-        parts.append(f"{text.plural(dependents, 'file')} import it")
+        parts.append(text.imports_it(dependents))
     return FixRisk(level, dependents, files_touched, "; ".join(parts).capitalize() + ".")
 
 
@@ -285,7 +289,8 @@ def _verify(profile: Mapping[str, Any] | None) -> FixVerify:
     if not profile:
         return FixVerify((), 0, None, "unknown")
     via = profile.get("via")
-    reason = f"reaches the changed code through the {text.humanize(via)}" if via else "covers it"
+    how = text.TEST_VIA.get(via or "")
+    reason = f"reaches the changed code {how}" if how else "covers it"
     tests = tuple(FixTest(str(t), reason) for t in (profile.get("tests") or [])[:MAX_TESTS])
     commands = profile.get("commands") or []
     basis = profile.get("basis")
@@ -881,7 +886,28 @@ def _perf_value(row: Any, facets: Mapping[str, Any]) -> int:
     return value
 
 
-def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
+def _perf_step_text(step: Mapping[str, Any], path: str) -> str:
+    """A plan step's action, naming its function once: an action that already
+    says the name is not followed by it again."""
+    action = step.get("action") or ""
+    name = text.scope_name(step.get("symbol"), path)
+    if not name or name.rsplit(".", 1)[-1] in action:
+        return action
+    return f"{action} ({name})"
+
+
+def _site_symbol(symbol: str | None) -> str | None:
+    """The function a call site sits in; ``None`` for none, or a file's top
+    level, which is no symbol to jump to."""
+    short = text.short_symbol(symbol)
+    if not short or short.rsplit(".", 1)[-1] == "__module__":
+        return None
+    return short
+
+
+def _perf_unit(
+    rows: list[Any], files: _Files, symbol_lines: Mapping[str, int] | None = None
+) -> _Unit:
     lead = min(rows, key=lambda r: (field(r, "rank_position") or 0, field(r, "opportunity_id")))
     details = detail_map(lead)
     facets = details.get("facets") or {}
@@ -902,6 +928,10 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
     def fields() -> dict[str, Any]:
         # A cause with no intervention symbol is named by the function its plan edits.
         first = plan_steps[0] if plan_steps else {}
+        lines = symbol_lines or {}
+        # The lead observation: the first call site the plan names. The item
+        # points at the loop around it, else at the call itself.
+        site = next((s for s in plan_steps if s.get("line")), None)
         name = (
             text.scope_name(symbol, path)
             or text.scope_name(first.get("symbol"), path)
@@ -940,12 +970,12 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
             FixFact("files", str(files_n)),
             FixFact(
                 "reachable from an entry point",
-                {"entry_reachable": "Yes", "not_entry_reachable": "No"}.get(exposure or "", "Unknown"),
+                text.REACH_ANSWER.get(exposure or "", "unknown"),
                 "inferred" if exposure in ("entry_reachable", "not_entry_reachable") else "unknown",
             ),
             FixFact(
                 "loop size",
-                text.humanize(magnitude) if magnitude and magnitude != "n/a" else "unknown",
+                text.loop_size(magnitude),
                 "inferred" if magnitude in ("grows_with_data", "bounded") else "unknown",
             ),
         ]
@@ -955,10 +985,9 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
         steps = tuple(
             FixStep(
                 int(s.get("order") or i + 1),
-                s.get("action", "")
-                + (f" ({text.scope_name(s.get('symbol'), path)})" if s.get("symbol") else ""),
+                _perf_step_text(s, path),
                 s.get("file_path") or path,
-                s.get("line"),
+                s.get("line") or lines.get(s.get("symbol") or ""),
                 s.get("applicability") == "mechanical",
             )
             for i, s in enumerate(plan_steps)
@@ -966,10 +995,18 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
         strategy = field(lead, "fix_strategy") or ""
         return {
             "title": text.clip(title),
-            "target": FixTarget(
-                path,
-                name if (symbol or first.get("symbol")) and not module else None,
-                first.get("line"),
+            "target": (
+                FixTarget(
+                    site.get("file_path") or path,
+                    _site_symbol(site.get("symbol")),
+                    site.get("loop_line") or site.get("line"),
+                )
+                if site
+                else FixTarget(
+                    path,
+                    name if (symbol or first.get("symbol")) and not module else None,
+                    steps[0].line if steps else None,
+                )
             ),
             "why": f"{what}; {', '.join(reach) or 'the loop size is unknown'}.",
             "facts": tuple(facts[:MAX_FACTS]),
@@ -1012,9 +1049,11 @@ def _perf_unit(rows: list[Any], files: _Files) -> _Unit:
         improves="performance",
         rank_inputs=lambda: [
             FixRankFact("runs in", field(lead, "execution_context") or "unknown"),
-            FixRankFact("entry reachable", text.humanize(exposure or "unknown")),
-            FixRankFact("loop size", text.humanize(magnitude or "unknown")),
-            FixRankFact("boundary", field(lead, "boundary_kind") or "none"),
+            FixRankFact("entry reachable", text.REACH_ANSWER.get(exposure or "", "unknown")),
+            FixRankFact("loop size", text.loop_size(magnitude)),
+            FixRankFact(
+                "boundary", text.BOUNDARY_NOUN.get(field(lead, "boundary_kind") or "", "none")
+            ),
         ],
         fields=fields,
     )
@@ -1108,6 +1147,29 @@ def _small(shape: Mapping[str, int]) -> bool:
     if not nloc:
         return False
     return nloc < SMALL_NLOC and shape.get("ccn", 0) < SMALL_CCN
+
+
+def _refactor_exclusion(
+    gain: float,
+    steps: list[Mapping[str, Any]],
+    plans: Mapping[str, Any],
+    files: _Files,
+    path: str,
+) -> str | None:
+    """Why an open refactoring opportunity in scope is no candidate, or ``None``."""
+    if gain < MIN_WORTH or not steps:
+        return "below_min_worth"
+    lead = steps[0]
+    if lead.get("refactoring_type") in LOW_VALUE_KINDS:
+        return "low_value_kind"
+    reason = files.unit_exclusion(
+        path,
+        lead.get("target_symbol"),
+        complexity=lead.get("refactoring_type") == "extract_method",
+    )
+    if reason is None and not _concrete(lead, plans.get(lead.get("plan_id"))):
+        return "no_concrete_step"
+    return reason
 
 
 def _finding_exclusion(finding: Any, files: _Files) -> str | None:
@@ -1246,6 +1308,7 @@ def build_fix_first(
     basis: Mapping[str, str | None] | None = None,
     item_id: str | None = None,
     hot_cuts: tuple[float, float] | None = None,
+    symbol_lines: Mapping[str, int] | None = None,
 ) -> FixFirstQueue:
     """One ranked queue of what to fix, from stored rows (shapes in the module docstring).
 
@@ -1255,7 +1318,9 @@ def build_fix_first(
     ``item_id`` keeps just that item, at its rank, for a lookup by id.
     ``hot_cuts`` are the (churn, dependents) thresholds for a hot file when the
     caller measured them over more files than it passed in ``metrics``; see
-    :func:`hot_cut` for the rule.
+    :func:`hot_cut` for the rule. ``symbol_lines`` maps a symbol id
+    (``path::name``) to its first line, for a performance plan step that
+    names a function but stored no line.
     """
     metrics = list(metrics)
     findings = list(findings)
@@ -1283,45 +1348,36 @@ def build_fix_first(
         _extractions(plans),
     )
 
-    def out_of_scope(path: str, context: str | None = None) -> bool:
+    def scope_reason(path: str, context: str | None = None) -> str | None:
+        """Why ``path`` is out of scope, counted; ``None`` when it is in."""
         reason = _path_exclusion(path, files.is_test(path), context, files.origin(path))
         if reason is None or (reason == "test" and keep_tests):
-            return False
+            return None
         excluded[reason] += 1
-        return True
+        return reason
+
+    def out_of_scope(path: str, context: str | None = None) -> bool:
+        return scope_reason(path, context) is not None
 
     plan_rows = {field(p, "public_id"): p for p in plans}
     units: list[_Unit] = []
     planned_files: set[str] = set()
+    refactoring_reasons: dict[str, str | None] = {}
     for row in sorted(
         (r for r in refactoring if _open(r)),
         key=lambda r: (field(r, "rank_position") or 0, field(r, "opportunity_id")),
     ):
         path = field(row, "file_path")
-        if out_of_scope(path):
-            continue
-        if _num(field(row, "recoverable_health")) < MIN_WORTH:
-            excluded["below_min_worth"] += 1
-            continue
+        reason = scope_reason(path)
         details = detail_map(row)
         steps = list(details.get("steps") or [])
         gain = _num(field(row, "recoverable_health"))
-        if not steps:
-            excluded["below_min_worth"] += 1
-            continue
-        reason = (
-            "low_value_kind"
-            if steps[0].get("refactoring_type") in LOW_VALUE_KINDS
-            else files.unit_exclusion(
-                path,
-                steps[0].get("target_symbol"),
-                complexity=steps[0].get("refactoring_type") == "extract_method",
-            )
-        )
-        if reason is None and not _concrete(steps[0], plan_rows.get(steps[0].get("plan_id"))):
-            reason = "no_concrete_step"
+        if reason is None:
+            reason = _refactor_exclusion(gain, steps, plan_rows, files, path)
+            if reason is not None:
+                excluded[reason] += 1
+        refactoring_reasons[field(row, "opportunity_id")] = reason
         if reason is not None:
-            excluded[reason] += 1
             continue
         units.append(_refactor_unit(row, details, steps, gain, plan_rows, files))
         # Only a plan that became an item speaks for the file's findings; an
@@ -1353,7 +1409,7 @@ def build_fix_first(
         if not worth:
             excluded["below_min_worth"] += 1
             continue
-        units.append(_perf_unit(worth, files))
+        units.append(_perf_unit(worth, files, symbol_lines))
 
     for path, (shape, history) in split.items():
         if path in planned_files:
@@ -1392,6 +1448,7 @@ def build_fix_first(
         ),
         by_improves={k: by_improves.get(k, 0) for k in FIX_IMPROVES},
         basis=dict(basis) if basis is not None else _basis(metrics),
+        refactoring_reasons=refactoring_reasons,
     )
 
 
