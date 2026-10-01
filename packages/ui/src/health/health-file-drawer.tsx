@@ -25,6 +25,7 @@ import { AiPromptModal } from "./ai-prompt-modal";
 import { buildFileHealthAiPrompt } from "./ai-prompt-builder";
 import { FileSignalsPanel } from "./file-signals-panel";
 import { FindingOpportunityLink } from "./file-opportunity";
+import { RelatedWork, type RelatedWorkSlotProps } from "./related-work";
 import { CollapsibleSection } from "../shared/collapsible-section";
 import { formatRelativeTimeOrNull } from "../lib/format";
 import { Sparkline } from "./sparkline";
@@ -90,7 +91,7 @@ export interface HealthDrawerMetric {
   total_deduction?: number | null;
 }
 
-export interface HealthFileDrawerProps {
+export interface HealthFileDrawerProps extends RelatedWorkSlotProps {
   open: boolean;
   onClose: () => void;
   loading?: boolean;
@@ -169,6 +170,9 @@ export function HealthFileDrawer({
   suggestions = {},
   opportunity,
   refactoringOpportunityHref,
+  related,
+  relatedWorkHref,
+  onNavigate,
   trend,
   signals,
   fileViewHref,
@@ -565,6 +569,15 @@ export function HealthFileDrawer({
               <FileSignalsPanel signals={signals} />
 
               <BugHistorySection signals={signals} />
+
+              {/* Findings are this drawer's own list, and the performance lens
+                  already leads with the file's causes. */}
+              <RelatedWork
+                related={related}
+                relatedWorkHref={relatedWorkHref}
+                onNavigate={onNavigate}
+                exclude={lens === "performance" ? ["findings", "performance"] : ["findings"]}
+              />
 
               {/* Collapsed by default. This is the audit trail for a number
                   the drawer already states at the top, beside a leading cause

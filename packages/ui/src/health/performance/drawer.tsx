@@ -19,6 +19,7 @@ import { performancePlanDetail } from "../../refactoring/types";
 import { SourceExcerpt } from "../../refactoring/source-excerpt";
 import { ValidationSummary } from "../../refactoring/validation-summary";
 import { EFFORT_LABEL, WORK_UNIT_LABEL } from "../labels";
+import { RelatedWork, useRelatedWork } from "../related-work";
 import type { PerformanceViewAdapter } from "./adapter";
 import { RawObservations } from "./evidence";
 import {
@@ -522,6 +523,8 @@ export function OpportunityDrawer({
               plan={plan}
             />
 
+            <RelatedSection adapter={adapter} filePath={current.file_path} />
+
             {current.evidence.some((item) => item.path.length > 0) ? (
               <Section title="Caller to sink paths">
                 <ProvenancePathList
@@ -663,6 +666,26 @@ function CodeSection({
         </p>
       ) : null}
     </Section>
+  );
+}
+
+/** What the other lenses hold for the file this cause is fixed in. */
+function RelatedSection({
+  adapter,
+  filePath,
+}: {
+  adapter: PerformanceViewAdapter;
+  filePath: string;
+}) {
+  const data = useRelatedWork(adapter.getRelatedWork, [filePath]);
+  return (
+    <RelatedWork
+      related={data?.files?.[0]}
+      relatedWorkHref={adapter.relatedWorkHref}
+      onNavigate={adapter.navigate}
+      exclude={["performance"]}
+      headingLevel="h4"
+    />
   );
 }
 

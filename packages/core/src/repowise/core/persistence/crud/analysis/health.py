@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -432,10 +433,12 @@ async def get_health_findings(
     min_severity: str | None = None,
     severity: str | None = None,
     file_path: str | None = None,
+    file_paths: Sequence[str] | None = None,
     dimension: str | None = None,
     exclude_dimensions: tuple[str, ...] | None = None,
     status: str = "open",
     include_withheld: bool = False,
+    limit: int | None = None,
 ) -> list[HealthFinding]:
     """Findings for one repository, ordered by health impact.
 
@@ -455,6 +458,9 @@ async def get_health_findings(
     ``open`` / ``acknowledged`` / ``resolved`` / ``false_positive``, or ``all``
     to drop the filter, so a triage surface can show what it has already
     reviewed without a second read.
+
+    ``file_paths`` scopes to a set of files in one read; an empty sequence
+    matches nothing. ``limit`` caps the rows read, highest impact first.
     """
     q = select(HealthFinding).where(HealthFinding.repository_id == repository_id)
     statuses = [s.strip() for s in status.split(",") if s.strip()]
@@ -477,6 +483,8 @@ async def get_health_findings(
         q = q.where(HealthFinding.biomarker_type.not_in(excluded_types(requested=types)))
     if file_path is not None:
         q = q.where(HealthFinding.file_path == file_path)
+    if file_paths is not None:
+        q = q.where(HealthFinding.file_path.in_(list(file_paths)))
     if dimension is not None:
         # Older rows predate the split and carry a NULL dimension that homes
         # under "defect"; fold those in so a defect filter never drops them.
@@ -496,6 +504,8 @@ async def get_health_findings(
         allowed = [k for k, v in order.items() if v >= threshold]
         q = q.where(HealthFinding.severity.in_(allowed))
     q = q.order_by(HealthFinding.health_impact.desc())
+    if limit is not None:
+        q = q.limit(limit)
     result = await session.execute(q)
     return _filter_excluded_paths(
         list(result.scalars().all()),

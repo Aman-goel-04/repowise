@@ -13,10 +13,12 @@ import type {
   PerformanceOpportunityDetail,
   PerformanceOpportunityPage,
   PerformanceOpportunityQuery,
+  RelatedWorkResponse,
   TestsReachingFile,
 } from "@repowise-dev/types/health";
 import type { Paginated } from "@repowise-dev/types";
 import type { CodeHealthOverlay } from "./map/types";
+import type { RelatedWorkHref } from "./related-work";
 import type {
   RefactoringOpportunity,
   RefactoringPlan,
@@ -134,6 +136,13 @@ export interface CodeHealthAdapter {
   getFileOpportunity?(filePath: string): Promise<RefactoringOpportunity | null>;
   /** Deep link into the refactoring surface for one opportunity. */
   refactoringOpportunityHref?(opportunityId: string): string;
+  /**
+   * What every lens holds for these files. Optional: a host without it shows
+   * no "elsewhere" section rather than an empty one.
+   */
+  getRelatedWork?(filePaths: string[]): Promise<RelatedWorkResponse>;
+  /** Where one related item lives, or null when it has nowhere to go. */
+  relatedWorkHref?: RelatedWorkHref;
   /**
    * Where this cause lives on the one map. Optional: a host without a galaxy
    * offers no link rather than a second map.
