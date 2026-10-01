@@ -25,6 +25,10 @@ from repowise.core.analysis.health.perf.opportunities import (
     PERFORMANCE_MODEL_VERSION,
     model_state,
 )
+from repowise.core.analysis.health.perf.opportunity_rank import (
+    DEFAULT_QUEUE_STATES,
+    NON_LEADING_MARKERS,
+)
 from repowise.core.analysis.health.rows import detail_map
 from repowise.core.persistence.crud import (
     get_performance_opportunity,
@@ -69,8 +73,9 @@ _CONFIDENCES = ("high", "medium", "low")
 _ACTIONABILITIES = ("plan_ready", "advisory", "investigate", "expected")
 _BOUNDARIES = ("db", "network", "filesystem", "subprocess", "lock", "none")
 
-_DEFAULT_ACTIONABILITIES = frozenset({"plan_ready", "advisory", "investigate"})
-"""``expected`` rows are true but offer nothing to change, so they are asked for, not queued."""
+_DEFAULT_ACTIONABILITIES = DEFAULT_QUEUE_STATES
+"""``expected`` rows offer nothing to change and ``investigate`` rows no strategy to apply,
+so both are asked for, not queued. The summary's ``default_queue`` counts each one left out."""
 
 _PLAN_REASONS = {
     "available": "A stored performance plan addresses this exact opportunity.",
@@ -121,7 +126,7 @@ class PerformanceQuery:
 
     @property
     def actionabilities(self) -> frozenset[str]:
-        """The set the queue is filtered to: one explicit state, or the default three."""
+        """The set the queue is filtered to: one explicit state, or the default queue states (plan_ready, advisory)."""
         if self.actionability is None:
             return _DEFAULT_ACTIONABILITIES
         return frozenset({self.actionability})
@@ -460,6 +465,7 @@ class PerformanceHealthService:
             "execution_context": row.execution_context,
             "terminal_sink": row.terminal_sink,
             "intervention_symbol": row.intervention_symbol,
+            "intervention_kind": details.get("intervention_kind"),
             "file_path": row.file_path,
             "affected_call_sites_total": row.affected_call_sites_total,
             "affected_files_total": row.affected_files_total,
@@ -469,6 +475,8 @@ class PerformanceHealthService:
             "rank_score": row.rank_score,
             "rank_position": row.rank_position,
             "why_ranked": details.get("why_ranked", []),
+            # An older store has no per-group answer; its marker gives the old one.
+            "may_lead": details.get("may_lead", row.biomarker_type not in NON_LEADING_MARKERS),
             "plan_id": link.row_id,
             "plan_reference": link.public_id,
             "plan_status": link.state,
@@ -479,6 +487,7 @@ class PerformanceHealthService:
         fix_strategy = row.fix_strategy
         return {
             **payload,
+            "terminal_sinks": details.get("terminal_sinks", []),
             "shared_path_suffix": details.get("shared_path_suffix", []),
             "resource_fingerprints": details.get("resource_fingerprints", []),
             "reliable_entry_reachability": details.get("reliable_entry_reachability"),
@@ -558,6 +567,7 @@ def _summary_of(row: Any) -> dict[str, Any]:
         "context": payload.get("context", {}),
         "boundary": payload.get("boundary", {}),
         "with_plan_total": payload.get("with_plan_total", 0),
+        **({"default_queue": payload["default_queue"]} if "default_queue" in payload else {}),
         **(
             {"refresh_required": True, "detail": "Run repowise update to rescore."}
             if stale

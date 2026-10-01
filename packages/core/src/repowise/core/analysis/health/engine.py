@@ -129,6 +129,13 @@ log = structlog.get_logger(__name__)
 # line (``details["symbol_line"]``) and its public id is anchored on the symbol
 # plus the offset into it, hashing no metric values, so every stored finding id
 # moves once.
+# v37 (also): a perf hit inside a lambda with no named function around it is
+# named for that lambda (``build``, ``it callback``), so its stored
+# ``function_name`` and public id change; top-level script code still carries
+# none. The v3 performance model also keys one opportunity per intervention, so
+# every stored opportunity id and the id stamped on every perf finding change.
+# ``lazy_load_in_loop`` findings carry ``details["orm"]``, which moves their
+# public ids and, for Django, their performance weight (0.4 -> 0.7).
 #
 # v36 (also): which files are tests changed (``repowise.core.test_paths``).
 # Compound directories headed by a test word (``e2e-tests/``, ``pkg_tests/``,

@@ -74,6 +74,8 @@ def opportunity_details(
     return {
         **({"plan": plan} if plan else {}),
         "biomarker_types": list(opportunity.biomarker_types),
+        "intervention_kind": opportunity.intervention_kind,
+        "terminal_sinks": list(opportunity.terminal_sinks),
         "shared_path_suffix": list(opportunity.shared_path_suffix),
         "resource_fingerprints": list(opportunity.resource_fingerprints),
         "reliable_entry_reachability": opportunity.reliable_entry_reachability,
@@ -84,6 +86,7 @@ def opportunity_details(
         "rank_factors": dict(opportunity.rank_factors),
         "why_ranked": [dict(entry) for entry in opportunity.why_ranked],
         "fix_rationale": opportunity.fix.rationale if opportunity.fix else None,
+        "may_lead": opportunity.may_lead,
         **({"fix_api": opportunity.fix.api} if opportunity.fix and opportunity.fix.api else {}),
         "siblings": [dict(entry) for entry in opportunity.siblings],
     }
@@ -137,7 +140,10 @@ def _summary_payload(
     plans: dict[str, dict[str, Any]] | None = None,
 ) -> dict:
     """The compact current headline, written once and read by primary key."""
-    from ....analysis.health.perf.opportunity_rank import NON_LEADING_MARKERS
+    from ....analysis.health.perf.opportunity_rank import (
+        default_queue_counts,
+        default_queue_exclusion,
+    )
 
     counts: dict[str, int] = {}
     contexts: dict[str, int] = {}
@@ -147,17 +153,18 @@ def _summary_payload(
         contexts[item.execution_context] = contexts.get(item.execution_context, 0) + 1
         key = item.boundary_kind or "none"
         boundaries[key] = boundaries.get(key, 0) + 1
-    # ``expected`` rows rank last and offer nothing to do, so they never lead; nor does a
-    # marker whose measured precision is below the bar for leading.
+    # The lead is the head of the default queue, so it is production work with a
+    # strategy; never a marker whose measured precision is below the bar for leading.
     lead = next(
         (
             o
             for o in opportunities
-            if o.actionability_state != "expected" and o.biomarker_type not in NON_LEADING_MARKERS
+            if default_queue_exclusion(o) is None and o.may_lead
         ),
         None,
     )
     return {
+        "default_queue": default_queue_counts(opportunities),
         "actionability": counts,
         "context": contexts,
         "boundary": boundaries,
