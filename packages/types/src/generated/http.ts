@@ -13,6 +13,8 @@ export interface ActionCommand {
   purpose: string;
   mcp?: string | null;
   cli?: string | null;
+  tool?: string | null;
+  arguments?: Record<string, unknown> | null;
 }
 
 export interface ActionContext {
@@ -1603,13 +1605,8 @@ export interface FixItem {
   verify: FixVerify;
   context: FixContext[];
   source: FixSource;
-  next_call: FixNextCall;
+  next_call: ActionCommand;
   why_ranked?: FixRankFact[];
-}
-
-export interface FixNextCall {
-  tool: string;
-  arguments: Record<string, unknown>;
 }
 
 export interface FixRankFact {
