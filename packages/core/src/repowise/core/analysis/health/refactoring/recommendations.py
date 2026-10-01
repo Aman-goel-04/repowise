@@ -22,14 +22,17 @@ from repowise.core.analysis.health.grading import TARGET_SCORE
 from repowise.core.analysis.pr_blast import rank_tests_by_reach
 from repowise.core.analysis.test_reachability import (
     DEFAULT_CALL_DEPTH,
+    MAX_TESTS_PER_TARGET,
     ReachDistance,
     ReachedBy,
     imported_names_by_test,
     load_test_files,
+    rank_tests,
     reach_into_symbols,
     tests_matching_by_name,
     tests_reaching_by_tier,
 )
+from repowise.core.analysis.test_selection import expand_test_scopes
 from repowise.core.test_paths import is_test_support_path, paired_test_names
 
 from .models import RefactoringSuggestion
@@ -439,8 +442,9 @@ def _rank_target_tests(
     Most direct evidence first: measured coverage of the changed lines, then a
     test naming the changed symbol (a direct call or an import of it), then
     fewer call hops to it, then more of the test's functions at that distance,
-    then a test named for the file, then directory overlap. Test support
-    (``conftest.py``) runs nothing on its own, so it goes last.
+    then a test named for the file, then directory overlap. Test support (a
+    helper module) runs nothing on its own, so it goes last; a ``conftest.py``
+    was already replaced by the tests under it (:func:`_expand_scopes`).
     """
     name = file_path.rsplit("/", 1)[-1]
     named_for = paired_test_names(file_path)
@@ -1037,7 +1041,36 @@ async def _validation_inputs(
     unreached = sorted(unanswered - inferred.keys())
     if unreached:
         inferred.update(tests_matching_by_name(unreached, test_files))
+    inferred = {
+        path: _expand_scopes(path, reached, test_files) for path, reached in inferred.items()
+    }
     return ValidationInputs(measured=measured, inferred=inferred, test_files=test_files)
+
+
+def _expand_scopes(path: str, reached: ReachedBy, test_files: set[str]) -> ReachedBy:
+    """*reached* with a conftest or test package it stopped at replaced by the tests under it.
+
+    A validation command must name tests a runner collects; ``pytest
+    tests/conftest.py`` runs nothing. A scope with no runnable test under it
+    drops out, so a target reached only through one can end up unknown.
+
+    A root conftest stands for every test in the repository, so the expansion
+    is ranked nearest-first and capped like the walk's own list. ``all_tests``
+    is cleared rather than left uncapped: plan ranking then scores at most the
+    cap per target, and ``total`` keeps the true count, so a capped target
+    reads as incomplete instead of as the whole answer.
+    """
+    found = reached.all_tests or tuple(reached.tests)
+    expanded = expand_test_scopes(found, test_files)
+    if tuple(expanded) == tuple(found):
+        return reached
+    ranked = rank_tests(path, expanded)
+    return dataclasses.replace(
+        reached,
+        tests=ranked[:MAX_TESTS_PER_TARGET],
+        total=len(ranked),
+        all_tests=None,
+    )
 
 
 async def _validation_evidence(

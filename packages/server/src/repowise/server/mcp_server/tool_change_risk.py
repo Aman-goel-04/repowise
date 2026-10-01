@@ -1106,7 +1106,8 @@ async def _inferred_impacted(
     a signal that cannot speak to lines - the distinction this whole block
     exists to keep.
     """
-    from repowise.core.analysis.test_reachability import tests_reaching
+    from repowise.core.analysis.test_reachability import load_test_files, tests_reaching
+    from repowise.core.analysis.test_selection import expand_test_scopes
 
     hint = (
         "Inferred from the dependency graph, not measured. For the line-precise "
@@ -1114,10 +1115,14 @@ async def _inferred_impacted(
         "`repowise coverage add`."
     )
     try:
-        reaching = await tests_reaching(session, repo_id, changed_files)
+        test_files = await load_test_files(session, repo_id)
+        reaching = await tests_reaching(session, repo_id, changed_files, test_files=test_files)
     except Exception:
-        reaching = {}
-    tests = rank_tests_by_reach(reaching)
+        test_files, reaching = set(), {}
+    # A conftest the walk stopped at stands for the tests under its directory.
+    tests = rank_tests_by_reach(
+        {path: expand_test_scopes(found, test_files) for path, found in reaching.items()}
+    )
     if not tests:
         return _empty_impacted(
             "no_map",

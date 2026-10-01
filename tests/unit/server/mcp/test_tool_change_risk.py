@@ -292,6 +292,39 @@ async def test_inferred_tests_treat_a_failed_graph_walk_as_no_reach(
 
 
 @pytest.mark.asyncio
+async def test_inferred_tests_run_the_tests_under_a_conftest_not_the_conftest(
+    monkeypatch, session, repo_id, tmp_path
+):
+    """The walk reports a conftest it stopped at; pytest collects nothing from one.
+
+    It stands for the tests under its directory, so ``b.py``, reached only
+    through it, still gets tests rather than "run the full suite".
+    """
+    import repowise.core.analysis.test_reachability as reach
+
+    async def _test_files(*_a, **_k):
+        return {
+            "tests/unit/conftest.py",
+            "tests/unit/test_a.py",
+            "tests/unit/sub/test_b.py",
+            "tests/unit/helpers.py",
+            "tests/other/test_c.py",
+        }
+
+    async def _reaching(*_a, **_k):
+        return {"a.py": ["tests/unit/test_a.py"], "b.py": ["tests/unit/conftest.py"]}
+
+    monkeypatch.setattr(reach, "load_test_files", _test_files)
+    monkeypatch.setattr(reach, "tests_reaching", _reaching)
+    block = await tool._inferred_impacted(
+        session, repo_id, ["a.py", "b.py"], OmissionCollector("get_change_risk", repo_root=tmp_path)
+    )
+    # test_a reaches both files, so it leads.
+    assert block["tests_to_run"] == ["tests/unit/test_a.py", "tests/unit/sub/test_b.py"]
+    assert block["total"] == 2
+
+
+@pytest.mark.asyncio
 async def test_independent_changes_are_silent_for_one_file_or_an_unreadable_index(
     monkeypatch, factory, tmp_path
 ):
