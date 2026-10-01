@@ -1201,6 +1201,8 @@ export interface HealthWorkItem {
   score: number;
   nloc: number;
   module?: string | null;
+  /** A test file. Optional: an older backend does not send it. */
+  is_test?: boolean;
   primary_biomarker: string;
   primary_severity: HealthSeverity;
   primary_reason: string;
@@ -1283,6 +1285,44 @@ export interface HealthWorkQueueQuery {
   /** Which half of the repository to describe. Defaults to `"all"`. */
   scope?: HealthScope;
 }
+
+/**
+ * One file on the impact / effort plane. With a refactoring plan that recovers
+ * something, both coordinates describe the plan (`effort_basis: "plan"`: lines
+ * its steps span, health it credits); otherwise the file (`"file"`: its code
+ * lines, the deduction its open findings carry).
+ */
+export interface ImpactEffortPoint {
+  file_path: string;
+  /** Always at least 1, so a log axis can hold it. */
+  effort_lines: number;
+  effort_basis: "plan" | "file";
+  /** Health points. */
+  recoverable_health: number;
+  /** The tier of the file's first Fix-first item, when it holds one. */
+  tier?: "now" | "next" | "later" | null;
+  /** That item's place in the Fix-first list, from 1. */
+  fix_rank?: number | null;
+}
+
+/** Every file the work queue's filters keep, history-only files excluded. */
+export interface ImpactEffortResponse {
+  /** Largest recoverable health first; at most `cap`. */
+  points: ImpactEffortPoint[];
+  plotted: number;
+  total: number;
+  cap: number;
+  /** Fixed quadrant midlines from core, never derived from the data. */
+  effort_midline_lines: number;
+  gain_midline_points: number;
+  history_only_excluded?: number;
+}
+
+/** The work queue's filters, without its paging, order or history switch. */
+export type ImpactEffortQuery = Omit<
+  HealthWorkQueueQuery,
+  "limit" | "offset" | "sort" | "history"
+>;
 
 /** @deprecated Use HealthWorkItem; this is a file triage row, not a plan. */
 export type RefactoringTarget = HealthWorkItem;
