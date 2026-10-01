@@ -74,7 +74,7 @@ per-line blame index built for every file.
 
 ## The markers, and what each is allowed to do
 
-Repowise ships **51 registered detectors (54 marker ids)**, but only **25 are
+Repowise ships **53 registered detectors (56 marker ids)**, but only **25 are
 permitted to move the headline number**. That restriction is deliberate: the
 defect score carries published accuracy claims, so only markers that earned
 their weight against a bug corpus may affect it.
@@ -82,7 +82,7 @@ their weight against a bug corpus may affect it.
 | Tier | Markers | What it may do |
 |---|---:|---|
 | **Defect-scoring** | **25** | Calibrated weights; moves the 1-10 score |
-| **Performance** | **20** | Own pillar, own cap; never touches the defect score |
+| **Performance** | **22** | Own pillar, own cap; never touches the defect score |
 | **Maintainability-only (SQL)** | **3** | Maintainability only |
 | **Governance** | **3** | Surfaces as a finding; never deducts |
 | **Advisory** | **3** | Measured and reported; never deducts, and stays out of impact-ranked lists unless asked for |
@@ -95,7 +95,7 @@ Nothing is inert, but "doesn't move the number" means three different things:
   matter for readability, but proved weak defect predictors under leakage-free
   calibration, so they were demoted rather than deleted — and most of them earn
   **full weight in maintainability**, where they belong.
-- **Advisory (19 of the 20 performance markers).** Sub-1.0 weights inside a
+- **Advisory (21 of the 22 performance markers).** Sub-1.0 weights inside a
   category capped at 2.0. Only `io_in_loop` carries full weight.
 - **Non-scoring (3 governance markers).** `ungoverned_hotspot`,
   `stale_governance` and `contradictory_decision` are written by an additive
@@ -533,8 +533,9 @@ score.
 
 **Soundness limits, by design.** Performance is a static signal, so it
 under-reports rather than over-reports. Dynamic dispatch, monkeypatching and
-callbacks-as-values produce no call edge and are invisible; ORM lazy-load N+1
-fires on attribute access with no visible call and is explicitly out of scope;
+callbacks-as-values produce no call edge and are invisible; an ORM lazy load
+fires on attribute access with no visible call, so it is seen only where
+`lazy_load_in_loop` can type the loop's rows (below) and missed everywhere else;
 chains beyond three hops are not followed; an unmodelled library has no
 classified sinks. We call this performance **risk**, never measured performance,
 and it never folds into the defect score.
@@ -544,6 +545,13 @@ round-trip, it does not claim the work is avoidable. Database and network
 findings are usually batchable; filesystem ones often are not, since deleting N
 files genuinely needs N unlinks. The finding still tells you where the time
 goes.
+
+Each opportunity carries one actionability state: `plan_ready` (a proven
+strategy on a reliable call path), `advisory` (a strategy whose prerequisites
+are not all proven), `investigate` (no supported strategy yet) or `expected`
+(the repetition is real and there is nothing to change: a filesystem or
+subprocess boundary, or a loop already walking chunks). The default queue
+leaves `expected` out and still counts it.
 
 A few more things keep the plans honest:
 
@@ -565,6 +573,16 @@ query with no limit or aggregate whose rows are then deduplicated per key in
 code, in the same function or one same-file helper. It is the one shape here
 that is not a loop around I/O: the query runs once and returns too much, and
 the fix is to select one row per key in the database.
+
+**ORM lazy loads.** `lazy_load_in_loop` (Python, advisory, weight 0.4) flags a
+lazy relationship read on each iteration of a loop over model rows, the N+1 an
+attribute access hides. The loop's rows must resolve to one SQLAlchemy or
+Django model through the cross-file model index, and the attribute must be a
+lazy relation the producing query does not already eager-load. Async functions
+are skipped, so SQLAlchemy coverage is sync only. Its plan is
+`eager_load_relationship`, advisory. Measured at 81% precision on held-out
+Django (47 of 58), it ranks in the queue but never leads the performance
+directive.
 
 Methodology and raw data:
 [perf-detection](https://github.com/repowise-dev/repowise-bench/tree/master/perf-detection).
