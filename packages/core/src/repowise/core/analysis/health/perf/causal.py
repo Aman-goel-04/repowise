@@ -17,13 +17,14 @@ import hashlib
 import json
 import re
 from collections import defaultdict
+from itertools import pairwise
 from typing import Any, Literal
 
 from repowise.core.test_paths import is_test_related_path
 
 from .facts import ObservationFacts, detail_map, is_performance, observation_facts
 
-PERFORMANCE_MODEL_VERSION = 2
+PERFORMANCE_MODEL_VERSION = 3
 """Version of the identity, grouping, actionability, and ranking semantics.
 
 From version 2 the version is the id prefix rather than a hash input, so a
@@ -31,6 +32,9 @@ stale id is recognisable without a lookup and :func:`model_state` can answer
 from the string alone. Version 1 ids carry no digit and remain readable as
 version 1. Moving this constant means bumping ``HEALTH_ANALYZER_VERSION`` with
 it, which forces the rescore that restamps every stored finding.
+
+Version 3 classes schema migrations as ``tooling`` in :func:`execution_context`,
+a kernel input. Digests of every other path are unchanged; only the prefix moved.
 """
 
 ExecutionContext = Literal["production", "tooling", "test", "unknown"]
@@ -41,8 +45,29 @@ _ID_PREFIX = "perf"
 _ID_PATTERN = re.compile(rf"^{_ID_PREFIX}(\d*)_[0-9a-f]{{20}}$")
 
 _TOOLING_PARTS = frozenset(
-    {".github", "benchmarks", "build", "devtools", "scripts", "tooling", "tools"}
+    {
+        ".github",
+        "benchmarks",
+        "build",
+        "devtools",
+        # Schema migrations run once per deploy, not per request: Django and
+        # Flask-Migrate ``migrations/``, EF Core ``Migrations/``.
+        "migrations",
+        "scripts",
+        "tooling",
+        "tools",
+    }
 )
+
+_TOOLING_DIR_PAIRS = frozenset({("db", "migrate"), ("alembic", "versions")})
+"""Adjacent directories that mark migrations where neither name does alone.
+
+Rails keeps them in ``db/migrate``. Alembic keeps them in ``versions/`` under
+its script directory; a bare ``versions/`` is too common (API versions) to
+class on its own. Ceiling: an Alembic script directory with another name is
+recognised only by its sibling ``env.py``, which a path-only classifier cannot
+see.
+"""
 
 _UNCLASSIFIABLE_PARTS = frozenset(
     {
@@ -78,8 +103,11 @@ def execution_context(file_path: str) -> ExecutionContext:
         return "unknown"
     if is_test_related_path(file_path):
         return "test"
-    parts = {part.lower() for part in normalized.split("/")}
+    segments = normalized.lower().split("/")
+    parts = set(segments)
     if parts & _TOOLING_PARTS or "/cli/" in f"/{normalized.lower()}/":
+        return "tooling"
+    if any(pair in _TOOLING_DIR_PAIRS for pair in pairwise(segments[:-1])):
         return "tooling"
     if parts & _UNCLASSIFIABLE_PARTS or "/" not in normalized:
         return "unknown"
