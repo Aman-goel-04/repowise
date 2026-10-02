@@ -122,6 +122,10 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "*AssemblyInfo.vb",
     "*/My Project/*.vb",
     "*ApplicationEvents.vb",  # My.MyApplication hooks, raised by the VB runtime
+    # .NET reference assemblies: compile-time API stubs (``throw null`` bodies)
+    # the build packs as the public surface. Nothing imports them, and every
+    # type they list is public API.
+    "*/ref/*.cs",
     "*MauiProgram.cs",  # MAUI app entry — invoked by host, not imported
     "*App.xaml.cs",
     "*AppShell.xaml.cs",
@@ -963,6 +967,11 @@ _PURE_WRAPPER_DECORATOR_ATTRS: frozenset[str] = frozenset(
 # because it names only the member (C# extension methods). A set so widening it
 # is a deliberate act.
 _CONTAINER_USE_LANGUAGES: frozenset[str] = frozenset({"csharp"})
+
+# Languages whose imports name a namespace, never a file, so a file no edge
+# reaches is not evidence that nothing uses it: a same-namespace ``new T()``
+# needs no ``using``, and one ``using`` stands for every file of the namespace.
+_NAMESPACE_IMPORT_LANGUAGES: frozenset[str] = frozenset({"csharp"})
 
 # Languages whose symbols the preprocessor reaches without naming them: a
 # ``typedef struct _X {...} X`` tag used only through ``X``, a function called
