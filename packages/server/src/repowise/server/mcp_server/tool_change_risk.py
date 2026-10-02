@@ -141,6 +141,7 @@ async def get_change_risk(
     repo: str | None = None,
     extensions: list[str] | None = None,
     exclude_patterns: list[str] | None = None,
+    include_paths: list[str] | str | None = None,
     baseline: int = 200,
     include: list[str] | None = None,
     finding_id: str | None = None,
@@ -169,6 +170,8 @@ async def get_change_risk(
         repo: Repository alias in workspace mode; omit for the default.
         extensions: File suffixes to count, e.g. ``[".py", ".ts"]``.
         exclude_patterns: Gitignore-style paths to omit, e.g. ``["tests/"]``.
+        include_paths: Gitignore-style paths to keep, as a list or one
+            comma-separated string, e.g. ``"src/api/,src/db/"``. Omit for all.
         baseline: Recent commits sampled for percentile ranking; 0 disables it.
         include: ``"findings"`` for every change finding, ``"diagnostics"`` for
             raw score mechanics, ``"scales"`` for units. All identical on
@@ -232,6 +235,7 @@ async def get_change_risk(
             revspec,
             tuple(extensions or ()),
             tuple(result.riskignore_excludes + result.request_excludes),
+            tuple(include_paths or ()),
         )
     )
     try:
@@ -336,13 +340,14 @@ def _compare_health(
     revspec: str | None,
     extensions: tuple[str, ...],
     exclude_patterns: tuple[str, ...],
+    include_paths: tuple[str, ...] = (),
 ) -> Any:
     """Run the comparison, degrading to an explicit unavailable state."""
     from repowise.core.analysis.change_health.models import ChangeHealthDelta
 
     try:
         return _delta_service(repo_path).compare(
-            DeltaRequest(repo_path, revspec, extensions, exclude_patterns)
+            DeltaRequest(repo_path, revspec, extensions, exclude_patterns, include_paths)
         )
     except Exception as exc:
         log.warning("change_health_comparison_failed", revspec=revspec, error=str(exc))
