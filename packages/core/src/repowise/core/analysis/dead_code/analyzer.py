@@ -22,7 +22,9 @@ from typing import Any
 
 import structlog
 
+from ...entry_candidacy import is_reachability_root
 from ...ingestion.models import REACHABILITY_USE_EDGE_TYPES
+from ...ingestion.symbol_identity import base_symbol_id, overload_sets
 from .constants import (
     _CONTAINER_USE_LANGUAGES,
     _DEAD_CODE_EXEMPT_LANGUAGES,
@@ -31,6 +33,8 @@ from .constants import (
     _FRAMEWORK_DECORATOR_SUFFIXES,
     _FRAMEWORK_DECORATORS,
     _NEVER_PACKAGE_DIRS,
+    _PURE_WRAPPER_DECORATOR_ATTRS,
+    _PURE_WRAPPER_DECORATOR_MODULES,
     _is_fixture_path,
     never_flag_match,
 )
@@ -40,6 +44,7 @@ from .dynamic_markers import (
     find_dynamic_import_files,
     read_source_text,
 )
+from .entry_shape import clamp_entry_shaped
 from .file_reachability import (
     PackageFileMap,
     ReachabilityRescues,
@@ -47,7 +52,12 @@ from .file_reachability import (
     is_file_reachable,
 )
 from .models import DeadCodeFindingData, DeadCodeKind, DeadCodeReport
-from .name_occurrences import IDENTIFIER_RE, clamp_unverified_absence
+from .name_occurrences import (
+    IDENTIFIER_RE,
+    clamp_path_mentions,
+    clamp_unverified_absence,
+    drop_internals_used_in_own_file,
+)
 from .risk_factors import (
     NO_GIT_SIGNAL_CONFIDENCE,
     RISK_CAP_CONFIDENCE,
@@ -171,11 +181,13 @@ def _is_framework_registered(decorators: list[str]) -> bool:
     drifts between the export pass and the internals pass is a bug nobody goes
     looking for.
 
-    Three spellings of one fact:
+    Four spellings of one fact:
 
     * a known base name or dotted prefix (``@Component``, ``@app.route``);
     * a known trailing attribute, for a receiver the prefix list cannot
       anticipate because it is named locally (``@my_group.command``);
+    * any other attribute of a receiver that is not a pure wrapper
+      (``@nox.session``), see :func:`_is_receiver_registration`;
     * a registration verb in the final path segment. Every suffix entry begins
       with a dot, so that list can only ever see a *dotted* decorator, and
       celery's ``@register_drainer('eventlet')`` is bare — invisible to all of
@@ -189,10 +201,38 @@ def _is_framework_registered(decorators: list[str]) -> bool:
         return True
     if any(b.endswith(_FRAMEWORK_DECORATOR_SUFFIXES) for b in bases):
         return True
+    if any(_is_receiver_registration(b) for b in bases):
+        return True
     return any(
         segment == "register" or segment.startswith("register_")
         for segment in (b.rsplit(".", 1)[-1] for b in bases)
     )
+
+
+def _is_receiver_registration(base: str) -> bool:
+    """Whether a dotted decorator hands the symbol to a receiver object.
+
+    ``@nox.session``, ``@mcp.tool()`` and ``@sub.handle(...)`` are the shape:
+    an attribute of some object, called later by that object. The lists above
+    can only name receivers someone thought of, so the rule is inverted: any
+    ``recv.attr`` is a registration unless it is a pure wrapper (functools,
+    typing, contextlib, ``@x.setter`` and the like), which returns the function
+    for an ordinary caller to call.
+
+    Held to a lowercase attribute. A capitalised last segment is a qualified
+    type name (``@java.lang.Deprecated``, ``[System.Obsolete]``), an annotation
+    rather than a method on a receiver.
+
+    Ceiling: matched on the text, so an aliased wrapper module
+    (``import functools as ft``) reads as a registration. That only ever hides
+    a finding.
+    """
+    receiver, _, attr = base.rpartition(".")
+    if not receiver or not (attr[:1].islower() or attr.startswith("_")):
+        return False
+    if receiver.split(".", 1)[0] in _PURE_WRAPPER_DECORATOR_MODULES:
+        return False
+    return attr not in _PURE_WRAPPER_DECORATOR_ATTRS
 
 
 def _is_symbol_deprecated(sym_name: str, decorators: list[str]) -> bool:
@@ -699,16 +739,21 @@ def _is_declaration_only(sym: dict) -> bool:
     )
 
 
+# Evidence line for a finding whose ``lines`` is ``None``: the count is
+# omitted rather than estimated.
+_LINES_UNKNOWN = "Line count unavailable: source was not read"
+
+
 def _symbol_span(data: dict) -> dict[str, int | None]:
     """``lines``/``start_line``/``end_line`` for a symbol finding.
 
-    Both-or-neither: a half-known span is worse than none.
+    Both-or-neither: a half-known span is worse than none. Spans are
+    inclusive, so a one-line symbol is 1 line; an unknown span is ``None``.
     """
-    return {
-        "lines": data.get("end_line", 0) - data.get("start_line", 0),
-        "start_line": (data.get("start_line") or None) if data.get("end_line") else None,
-        "end_line": (data.get("end_line") or None) if data.get("start_line") else None,
-    }
+    start, end = data.get("start_line") or None, data.get("end_line") or None
+    if start is None or end is None or end < start:
+        return {"lines": None, "start_line": None, "end_line": None}
+    return {"lines": end - start + 1, "start_line": start, "end_line": end}
 
 
 class DeadCodeAnalyzer:
@@ -796,6 +841,8 @@ class DeadCodeAnalyzer:
         # by _get_unsatisfied_prop_guard so each TSX/JSX file is read from
         # disk and parsed by tree-sitter at most once per analysis run.
         self._guard_cache: dict[str, list[tuple[str, str, str]]] = {}
+        # {base id: overload member ids}, built on first use.
+        self._overload_units: dict[str, list[str]] | None = None
 
     def _reachability_rescues(self, whitelist: AbstractSet[str]) -> ReachabilityRescues:
         """Assemble the rescue state the shared predicate reads."""
@@ -827,7 +874,7 @@ class DeadCodeAnalyzer:
         whitelist = set(cfg.get("whitelist", []))
 
         if cfg.get("detect_unreachable_files", True):
-            findings.extend(self._detect_unreachable_files(dynamic_patterns, whitelist))
+            findings.extend(self._detect_unreachable_files(whitelist))
             if on_step:
                 on_step("unreachable_files")
 
@@ -855,30 +902,18 @@ class DeadCodeAnalyzer:
         # version of the same question — not "could an unread file explain
         # this" but "did we look anywhere except the import graph".
         findings = clamp_unverified_absence(findings, self._source_map)
+        findings = drop_internals_used_in_own_file(findings, self._source_map)
+        findings = clamp_path_mentions(findings, self._source_map)
+        findings = clamp_entry_shaped(
+            findings, self._source_map, self._public_top_level_names(findings)
+        )
 
         min_conf = cfg.get("min_confidence", RISK_CAP_CONFIDENCE)
         hidden_below_threshold = sum(1 for f in findings if f.confidence < min_conf)
         findings = [f for f in findings if f.confidence >= min_conf]
 
-        now = datetime.now(UTC)
-        deletable = sum(f.lines for f in findings if f.safe_to_delete)
-
-        high = sum(1 for f in findings if f.confidence >= SAFE_CONFIDENCE_THRESHOLD)
-        medium = sum(
-            1
-            for f in findings
-            if RISK_CAP_CONFIDENCE <= f.confidence < SAFE_CONFIDENCE_THRESHOLD
-        )
-        low = sum(1 for f in findings if f.confidence < RISK_CAP_CONFIDENCE)
-
-        return DeadCodeReport(
-            repo_id="",
-            analyzed_at=now,
-            total_findings=len(findings),
-            findings=findings,
-            deletable_lines=deletable,
-            confidence_summary={"high": high, "medium": medium, "low": low},
-            hidden_below_threshold=hidden_below_threshold,
+        return DeadCodeReport.from_findings(
+            findings, hidden_below_threshold=hidden_below_threshold
         )
 
     # ------------------------------------------------------------------
@@ -887,7 +922,6 @@ class DeadCodeAnalyzer:
 
     def _detect_unreachable_files(
         self,
-        dynamic_patterns: tuple[str, ...],
         whitelist: set[str],
     ) -> list[DeadCodeFindingData]:
         """Detect files nothing can reach that are not tests, fixtures, or config."""
@@ -920,7 +954,7 @@ class DeadCodeAnalyzer:
             if is_file_reachable(str(node), self.graph, rescues):
                 continue
 
-            finding = self._make_unreachable_finding(str(node), node_data, dynamic_patterns)
+            finding = self._make_unreachable_finding(str(node), node_data)
             if finding:
                 findings.append(finding)
 
@@ -1018,7 +1052,6 @@ class DeadCodeAnalyzer:
         self,
         node: str,
         node_data: dict,
-        dynamic_patterns: tuple[str, ...],
     ) -> DeadCodeFindingData | None:
         """Create an unreachable file finding with confidence scoring."""
         git_meta = self.git_meta_map.get(node)
@@ -1067,9 +1100,9 @@ class DeadCodeAnalyzer:
         if risk_factors:
             confidence = min(confidence, RISK_CAP_CONFIDENCE)
 
-        safe = confidence >= SAFE_CONFIDENCE_THRESHOLD
-        if safe and self._matches_dynamic_patterns(node, dynamic_patterns):
-            safe = False
+        # A whole file is a review candidate, never deletion-ready: see
+        # ``REVIEW_ONLY_KINDS``. Confidence still ranks it.
+        safe = False
 
         evidence = ["in_degree=0 (no files import this)"]
         if no_git_signal:
@@ -1081,6 +1114,9 @@ class DeadCodeAnalyzer:
         risk_line = risk_evidence(risk_factors)
         if risk_line:
             evidence.append(risk_line)
+        lines = self._file_line_count(node)
+        if lines is None:
+            evidence.append(_LINES_UNKNOWN)
 
         return DeadCodeFindingData(
             kind=DeadCodeKind.UNREACHABLE_FILE,
@@ -1091,7 +1127,7 @@ class DeadCodeAnalyzer:
             reason="File has no importers (in_degree=0)",
             last_commit_at=last_commit if isinstance(last_commit, datetime) else None,
             commit_count_90d=commit_90d,
-            lines=node_data.get("symbol_count", 0) * 10,  # rough estimate
+            lines=lines,
             evidence=evidence,
             safe_to_delete=safe,
             primary_owner=primary_owner,
@@ -1159,6 +1195,29 @@ class DeadCodeAnalyzer:
 
         return findings
 
+    def _defined_symbols(self, node: Any) -> list[tuple[str, dict]]:
+        """``(symbol_id, data)`` for each symbol *node* defines."""
+        return [
+            (succ, self.graph.nodes[succ])
+            for succ in self.graph.successors(node)
+            if self.graph.nodes[succ].get("node_type") == "symbol"
+            and self.graph.get_edge_data(node, succ, {}).get("edge_type") == "defines"
+        ]
+
+    def _public_top_level_names(
+        self, findings: list[DeadCodeFindingData]
+    ) -> dict[str, frozenset[str]]:
+        """Top-level public symbol names of each unreachable file in *findings*."""
+        return {
+            f.file_path: frozenset(
+                sym["name"]
+                for _, sym in self._defined_symbols(f.file_path)
+                if sym.get("visibility") == "public" and not sym.get("parent_name")
+            )
+            for f in findings
+            if f.kind is DeadCodeKind.UNREACHABLE_FILE and self.graph.has_node(f.file_path)
+        }
+
     def _export_file_context(self, node: Any, whitelist: set[str]) -> _ExportFile | None:
         """The file-level facts the unused-export pass needs, or None to skip the file."""
         if _is_synthetic_node(str(node)):
@@ -1167,10 +1226,10 @@ class DeadCodeAnalyzer:
         node_data = self.graph.nodes[node]
         if node_data.get("language", "unknown") in _DEAD_CODE_EXEMPT_LANGUAGES:
             return None
-        # Entry points include framework-instantiated files the runtime constructs.
+        # Roots include framework-instantiated files the runtime constructs.
         # Not ``is_file_reachable``: its barrel rescue is scoped to files, and an
         # unused symbol defined in a barrel should still be flagged.
-        if node_data.get("is_entry_point", False):
+        if is_reachability_root(node_data):
             return None
         if node_data.get("is_test", False):
             return None
@@ -1179,22 +1238,21 @@ class DeadCodeAnalyzer:
         if self._should_never_flag(str(node), whitelist):
             return None
 
-        symbol_pairs = [
-            (succ, self.graph.nodes[succ])
-            for succ in self.graph.successors(node)
-            if self.graph.nodes[succ].get("node_type") == "symbol"
-            and self.graph.get_edge_data(node, succ, {}).get("edge_type") == "defines"
-        ]
+        symbol_pairs = self._defined_symbols(node)
         if not symbol_pairs:
             return None
 
         # A dynamic-use or framework edge means the runtime reaches any public
         # member of the file. Only these two: ``dynamic_imports`` means the
         # module is loaded, which a plain import edge does not rescue either.
+        # A framework edge that names its exports (a Lambda handler) rescues
+        # only those, through the importer check below.
         if any(
-            self.graph.get_edge_data(pred, node, {}).get("edge_type")
-            in ("dynamic_uses", "framework")
-            for pred in self.graph.predecessors(node)
+            edge.get("edge_type") in ("dynamic_uses", "framework")
+            and not edge.get("imported_names")
+            for edge in (
+                self.graph.get_edge_data(pred, node, {}) for pred in self.graph.predecessors(node)
+            )
         ):
             return None
 
@@ -1350,15 +1408,9 @@ class DeadCodeAnalyzer:
         # ``method_implements`` / ``reads`` / ``extends`` /
         # ``implements`` / ``type_use`` edge means somewhere in
         # the codebase actually uses this symbol — even if the
-        # file-level ``imported_names`` machinery missed it
-        if (
-            unsatisfied_guard is None
-            and self.graph.has_node(sym_id)
-            and any(
-                self.graph[pred][sym_id].get("edge_type") in REACHABILITY_USE_EDGE_TYPES
-                for pred in self.graph.predecessors(sym_id)
-            )
-        ):
+        # file-level ``imported_names`` machinery missed it. A use of one
+        # member of an overload set uses the set.
+        if unsatisfied_guard is None and self._has_inbound_use(sym_id):
             return True, None
 
         if self._member_is_used(sym_id, sym.get("language")):
@@ -1516,6 +1568,22 @@ class DeadCodeAnalyzer:
 
         return None
 
+    def _file_line_count(self, file_path: str) -> int | None:
+        """Physical line count of an indexed file, or ``None`` when unread.
+
+        Prefers ingestion's bytes; falls back to disk only under a known repo
+        root, so a missing source is reported as unknown rather than guessed.
+        """
+        data = self._source_map.get(file_path)
+        if data is None and self._repo_root is not None:
+            try:
+                data = (Path(self._repo_root) / file_path).read_bytes()
+            except OSError:
+                return None
+        if data is None:
+            return None
+        return data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+
     def _read_file_text(self, file_path: str) -> str | None:
         """Safely read the content of a file, using source_map if available."""
         try:
@@ -1561,12 +1629,11 @@ class DeadCodeAnalyzer:
             # reported all three as unused. The set is shared with the
             # unused-export pass, so it also carries types this population can
             # never hold — a method or an interface is filtered out above.
-            is_used = any(
-                self.graph.get_edge_data(pred, node, {}).get("edge_type")
-                in REACHABILITY_USE_EDGE_TYPES
-                for pred in self.graph.predecessors(node)
-            )
-            if is_used:
+            # ``new X(..)`` lands on X's constructor (``path::X::X``) when X
+            # declares one, and constructing a type uses it.
+            if self._has_inbound_use(node) or self._has_inbound_use(
+                f"{file_path}::{sym_name}::{sym_name}"
+            ):
                 continue
 
             # Dispatch-table pattern: a private helper imported by name
@@ -1606,6 +1673,36 @@ class DeadCodeAnalyzer:
             )
 
         return findings
+
+    def _overload_unit(self, node: str) -> list[str]:
+        """The members of the overload set *node* belongs to or names, else ``[]``.
+
+        A plain id names its set when the set's members carry discriminators,
+        which is how a composed constructor id ``path::X::X`` still finds
+        ``X::X#0`` and ``X::X#2``.
+        """
+        if self._overload_units is None:
+            self._overload_units = overload_sets(
+                n for n in self.graph.nodes if isinstance(n, str)
+            )
+        return self._overload_units.get(base_symbol_id(node), [])
+
+    def _has_inbound_use(self, node: str) -> bool:
+        """Whether any reachability-use edge lands on *node* or its overload set."""
+        members = self._overload_unit(node)
+        if members:
+            return any(self._lands_on(member) for member in members)
+        return self._lands_on(node)
+
+    def _lands_on(self, node: str) -> bool:
+        """Whether any reachability-use edge lands on *node* (False if absent)."""
+        if not self.graph.has_node(node):
+            return False
+        return any(
+            self.graph.get_edge_data(pred, node, {}).get("edge_type")
+            in REACHABILITY_USE_EDGE_TYPES
+            for pred in self.graph.predecessors(node)
+        )
 
     def _is_internal_candidate(
         self, node_data: dict, dynamic_patterns: tuple[str, ...], whitelist: set[str]
@@ -1703,11 +1800,17 @@ class DeadCodeAnalyzer:
             if self._has_cross_package_importer(pkg, files):
                 continue
 
-            total_lines = sum(
-                self.graph.nodes[f].get("symbol_count", 0) * 10
+            # A package total is only as known as its least-known file.
+            counts = [
+                self._file_line_count(f)
                 for f in files
-                if f in self.graph
-            )
+                if self.graph.nodes[f].get("node_type") != "symbol"
+            ]
+            known = [c for c in counts if c is not None]
+            total_lines = sum(known) if len(known) == len(counts) else None
+            evidence = [f"No inter-package imports into '{pkg}'"]
+            if total_lines is None:
+                evidence.append(_LINES_UNKNOWN)
             activity = self._package_git_activity(files)
             findings.append(
                 DeadCodeFindingData(
@@ -1718,7 +1821,7 @@ class DeadCodeAnalyzer:
                     confidence=0.5,
                     reason=f"Package '{pkg}' has no importers from other packages",
                     lines=total_lines,
-                    evidence=[f"No inter-package imports into '{pkg}'"],
+                    evidence=evidence,
                     safe_to_delete=False,
                     risk_factors=list(path_risk_factors(pkg)),
                     **activity,
@@ -1848,10 +1951,6 @@ class DeadCodeAnalyzer:
                     return True
         return False
 
-
-    def _matches_dynamic_patterns(self, path: str, patterns: tuple[str, ...]) -> bool:
-        name = Path(path).stem
-        return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
 
     def _name_matches_dynamic(self, name: str, patterns: tuple[str, ...]) -> bool:
         return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)

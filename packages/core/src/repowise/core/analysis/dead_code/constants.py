@@ -27,6 +27,9 @@ _DEAD_CODE_EXEMPT_LANGUAGES: frozenset[str] = (
     _NON_CODE_LANGUAGES | _LANG_REGISTRY.dead_code_exempt_languages()
 )
 
+# Extensions a JS tool's config file may take.
+_JS_TOOL_EXTS: tuple[str, ...] = (".js", ".cjs", ".mjs", ".ts", ".cts", ".mts")
+
 # Patterns that should never be flagged as dead. ``fnmatch`` ``*`` spans ``/``,
 # so a leading ``*`` matches nested and repo-root paths alike.
 _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
@@ -52,12 +55,21 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "*.d.ts",
     "*setup.py",
     "*setup.cfg",
-    "*next.config.*",
-    "*vite.config.*",
-    "*tailwind.config.*",
-    "*postcss.config.*",
-    "*jest.config.*",
-    "*vitest.config.*",
+    # JS tooling loads its config by file name: ``<tool>.config.<ext>`` (and
+    # variants like ``jest.config.base.js``), ``.<tool>rc.<ext>`` and pnpm's
+    # install hook. fnmatch ``*`` spans ``/``, so an ``*rc.<ext>`` file under a
+    # dot-directory is exempt too; an accepted recall loss.
+    *(f"*.config{ext}" for ext in _JS_TOOL_EXTS),
+    *(f"*.config.*{ext}" for ext in _JS_TOOL_EXTS),
+    *(f".*rc{ext}" for ext in _JS_TOOL_EXTS),
+    *(f"*/.*rc{ext}" for ext in _JS_TOOL_EXTS),
+    ".pnpmfile.cjs",
+    "*/.pnpmfile.cjs",
+    # CPython imports these at startup when they sit on ``sys.path``.
+    "sitecustomize.py",
+    "*/sitecustomize.py",
+    "usercustomize.py",
+    "*/usercustomize.py",
     # Next.js / Remix / SvelteKit framework route files — loaded by the
     # framework at runtime, never imported via module imports.
     "*/page.tsx",
@@ -576,17 +588,10 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "*.bench.tsx",
     "*.bench.js",
     "*.bench.mjs",
-    # Vitest / Playwright / Cypress config and workspace files.
+    # Vitest workspace and shim files.
     "*vitest.workspace.*",
     "*vitest.shims.*",
     "*vitest.root.*",
-    "*playwright.config.*",
-    "*cypress.config.*",
-    "*rollup.config.*",
-    "*esbuild.config.*",
-    "*tsup.config.*",
-    "*.config.mts",
-    "*.config.cts",
     # Codegen / generated artifacts.
     "*.gen.ts",
     "*.gen.tsx",
@@ -603,6 +608,9 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "*/instrumentation-client.ts",
     "*/middleware.ts",
     "*/middleware.js",
+    # Next.js 16 renamed ``middleware`` to ``proxy``.
+    "*/proxy.ts",
+    "*/proxy.js",
     "*/global-error.tsx",
     "*/global-error.ts",
     "*/forbidden.tsx",
@@ -624,6 +632,7 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     # app lives at root.
     "instrumentation.ts",
     "middleware.ts",
+    "proxy.ts",
     "sitemap.ts",
     "robots.ts",
     # Remix root/entry files — invoked by the framework runtime.
@@ -922,6 +931,39 @@ _FRAMEWORK_DECORATOR_SUFFIXES: tuple[str, ...] = (
     ".filter",
     ".simple_tag",
     ".inclusion_tag",
+)
+
+# A dotted decorator (``@recv.attr`` or ``@recv.attr(...)``) is read as a
+# registration: ``@nox.session``, ``@mcp.tool()``, ``@sub.handle(...)`` hand the
+# function to an object that calls it later, and no list of receivers can keep
+# up with every framework. The exceptions are decorators that only wrap the
+# function and hand it back, so the decorated name still needs a caller.
+# Matched on the first path segment (the module) ...
+_PURE_WRAPPER_DECORATOR_MODULES: frozenset[str] = frozenset(
+    {
+        "functools",
+        "typing",
+        "typing_extensions",
+        "contextlib",
+        "abc",
+        "dataclasses",
+        "mock",
+        "unittest",
+    }
+)
+# ... or on the last one (``@prop.setter``, ``@functools.cached_property``).
+_PURE_WRAPPER_DECORATOR_ATTRS: frozenset[str] = frozenset(
+    {
+        "setter",
+        "getter",
+        "deleter",
+        "property",
+        "staticmethod",
+        "classmethod",
+        "cached_property",
+        "override",
+        "deprecated",
+    }
 )
 
 # Languages whose idiom is a static holder class the call site never names,

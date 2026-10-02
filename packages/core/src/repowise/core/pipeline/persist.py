@@ -15,6 +15,7 @@ from typing import Any
 
 import structlog
 
+from repowise.core.entry_candidacy import is_reachability_root
 from repowise.core.generation.models import (
     STRUCTURALLY_KEYED_PAGE_TYPES,
     STUB_FALLBACK_ERROR,
@@ -457,6 +458,7 @@ async def persist_graph_nodes(
             "has_error": data.get("has_error", False),
             "is_test": data.get("is_test", False),
             "is_entry_point": data.get("is_entry_point", False),
+            "is_reachability_root": is_reachability_root(data),
             # Files draw from the file-level metric tables; symbols fall
             # back to the symbol subgraph (calls + heritage) so that the
             # per-symbol UI panel shows real centrality instead of 0.
@@ -581,8 +583,15 @@ async def persist_incremental_symbols(
     """
     if not parsed_files:
         return
+    from repowise.core.ingestion.parse_cache import parser_fingerprint
     from repowise.core.persistence.crud import reconcile_symbols_for_files
 
+    # An extraction change can re-key symbols in files git did not touch (an
+    # overload gaining its own id), so it widens to the whole parsed set on the
+    # same check that widens edges. The stamp is written once, by
+    # :func:`persist_incremental_edges`, which runs after this.
+    if await _stored_edges_parser_fingerprint(session, repo_id) != parser_fingerprint():
+        changed_paths = [pf.file_info.path for pf in parsed_files]
     reconcile_paths, symbols = _changed_file_symbols(parsed_files, changed_paths)
     if not reconcile_paths:
         return
@@ -674,14 +683,14 @@ async def _edges_predate_cohesion(session: Any, repo_id: str, graph_builder: Any
     The signal is the store's own content rather than a version marker: a
     routine update deliberately clamps ``store_format_version`` below the first
     reindex gate, so a version comparison would refire on every run. Here, a
-    repo whose graph now has cohesion edges but whose table has no
+    repo whose graph now has cohesion edges but whose table has no cohesion
     ``hint_source`` anywhere is exactly a pre-cohesion store. Rewriting it
     stamps those rows, so this answers False from then on and the full
     reconcile happens once.
     """
     from sqlalchemy import select
 
-    from repowise.core.ingestion.cohesion import is_cohesion_edge
+    from repowise.core.ingestion.cohesion import COHESION_HINTS, is_cohesion_edge
     from repowise.core.persistence.models import GraphEdge
 
     try:
@@ -694,7 +703,12 @@ async def _edges_predate_cohesion(session: Any, repo_id: str, graph_builder: Any
     row = (
         await session.execute(
             select(GraphEdge.id)
-            .where(GraphEdge.repository_id == repo_id, GraphEdge.hint_source.is_not(None))
+            .where(
+                GraphEdge.repository_id == repo_id,
+                # Cohesion hints only: other passes (pytest conftest) stamp a
+                # hint too, and one of theirs is not a cohesion stamp.
+                GraphEdge.hint_source.in_(COHESION_HINTS),
+            )
             .limit(1)
         )
     ).first()
@@ -797,7 +811,51 @@ async def persist_incremental_edges(
     # caller before the commit) leaves the old stamp, so the next update retries
     # rather than stranding the files it never reached.
     if parser_changed:
+        await _prune_vanished_symbol_nodes(session, repo_id, graph_builder, parsed_files)
         await stamp_edges_parser_fingerprint(session, repo_id, fingerprint)
+
+
+async def _prune_vanished_symbol_nodes(
+    session: Any, repo_id: str, graph_builder: Any, parsed_files: list[Any]
+) -> None:
+    """Delete symbol ``graph_nodes`` a re-extraction no longer produces.
+
+    ``persist_graph_nodes`` upserts the current graph and never deletes, so a
+    symbol whose id changed under a new parser (an overload gaining its own id)
+    would otherwise keep its old row beside the new ones. Scoped to files this
+    run parsed; a file that is gone is :func:`_prune_stale_file_rows`'s job.
+    Membership rows prune themselves on their next write, and ``graph_metrics``
+    holds files only.
+    """
+    from sqlalchemy import delete, or_, select
+
+    from repowise.core.persistence.models import GraphEdge, GraphNode
+
+    graph = graph_builder.graph()
+    paths = [pf.file_info.path for pf in parsed_files]
+    stale: list[str] = []
+    for i in range(0, len(paths), _PRUNE_CHUNK):
+        rows = await session.execute(
+            select(GraphNode.node_id).where(
+                GraphNode.repository_id == repo_id,
+                GraphNode.node_type != "file",
+                GraphNode.file_path.in_(paths[i : i + _PRUNE_CHUNK]),
+            )
+        )
+        stale.extend(node_id for node_id in rows.scalars() if node_id not in graph)
+    for i in range(0, len(stale), _PRUNE_CHUNK):
+        batch = stale[i : i + _PRUNE_CHUNK]
+        await session.execute(
+            delete(GraphEdge).where(
+                GraphEdge.repository_id == repo_id,
+                or_(GraphEdge.source_node_id.in_(batch), GraphEdge.target_node_id.in_(batch)),
+            )
+        )
+        await session.execute(
+            delete(GraphNode).where(GraphNode.repository_id == repo_id, GraphNode.node_id.in_(batch))
+        )
+    if stale:
+        logger.info("graph_nodes_parser_prune", repo_id=repo_id, nodes=len(stale))
 
 
 # Chunk size for IN (...) deletes — stays under SQLite's host-parameter limit.
@@ -1671,6 +1729,7 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
             session,
             repo_id,
             total_commit_count=totals.total_commit_count,
+            total_merge_commit_count=getattr(totals, "total_merge_commit_count", None),
             first_commit_at=totals.first_commit_at,
             total_contributor_count=totals.total_contributor_count,
             first_commit_author=totals.first_commit_author,
@@ -1735,16 +1794,31 @@ async def persist_git_refresh(
         await replace_git_history(session, repo_id, git_meta_map, full_git_summary)
         return
 
+    from sqlalchemy import select
+
     from repowise.core.persistence.crud import (
         recompute_git_percentiles,
         upsert_git_metadata_bulk,
     )
+    from repowise.core.persistence.models import GitMetadata
 
-    await upsert_git_metadata_bulk(
-        session,
-        repo_id,
-        [*git_meta_map.values(), *(git_decay_map or {}).values()],
-    )
+    decay_rows = list((git_decay_map or {}).values())
+    if decay_rows:
+        stored = set(
+            (
+                await session.execute(
+                    select(GitMetadata.file_path).where(GitMetadata.repository_id == repo_id)
+                )
+            ).scalars()
+        )
+        # A decay row is partial, so it only refreshes a stored row: inserted,
+        # it is a fragment with no totals or owner. History-tier rows are
+        # complete and upsert whole, which also fills the non-code rows an
+        # index built before that tier never wrote.
+        decay_rows = [
+            row for row in decay_rows if row.get("history_only") or row["file_path"] in stored
+        ]
+    await upsert_git_metadata_bulk(session, repo_id, [*git_meta_map.values(), *decay_rows])
     await recompute_git_percentiles(session, repo_id)
 
 
@@ -2121,6 +2195,21 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
                         logger.info("decision_staleness_recomputed", updated=updated)
             except Exception as _stale_err:
                 logger.debug("staleness_scoring_skipped", error=str(_stale_err))
+
+    # Retire records whose commits were reverted. Outside the block above: a
+    # new revert retires a decision stored by an earlier run just as well.
+    try:
+        from repowise.core.analysis.decisions.reverts import apply_revert_supersession
+
+        await apply_revert_supersession(session, repo_id, getattr(result, "repo_path", None))
+    except Exception as _revert_err:
+        logger.debug("revert_supersession_skipped", error=str(_revert_err))
+    try:
+        from repowise.core.analysis.decisions.head_artifacts import apply_head_artifact_check
+
+        await apply_head_artifact_check(session, repo_id, getattr(result, "repo_path", None))
+    except Exception as _artifact_err:
+        logger.debug("head_artifact_check_skipped", error=str(_artifact_err))
 
     # ---- Governance findings (additive pass, after decisions are persisted) ----
     # Runs after bulk_upsert_decisions + detect_supersessions_and_conflicts so

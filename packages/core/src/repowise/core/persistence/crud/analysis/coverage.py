@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 from .._shared import _BATCH_SIZE
 
 #: Ingest rows kept per repo for the coverage trend; older ones are pruned on write.
+#: One row per measured commit, so identical figures can repeat; the trend read
+#: (``load_coverage_history``) collapses consecutive repeats.
 COVERAGE_HISTORY_RETENTION: int = 50
 
 
@@ -36,8 +38,9 @@ async def save_coverage_files(
 
     Mirrors the delete-then-insert pattern used by the health writers for the
     per-file rows; the ingest row is appended, with the repo-wide figures of
-    *files*, unless the newest one already says exactly that (then it is
-    restamped), and ingests past ``COVERAGE_HISTORY_RETENTION`` are pruned.
+    *files*, unless the newest one already says exactly that at the same
+    commit (then it is restamped, see ``_record_ingest``), and ingests past
+    ``COVERAGE_HISTORY_RETENTION`` are pruned.
     *files* is a list of ``FileCoverage`` dataclasses (or dicts with the
     same shape). *provenance*, from a writer that resolved the report
     itself, supplies the formats, the path counts and ``mapping_partial``
@@ -113,10 +116,11 @@ def _ingest_figures(
         "branch_coverage_pct": branch_pct,
         "covered_lines": covered,
         "total_lines": total,
+        "scope_json": json.dumps(p.scope.to_dict()) if p.scope is not None else None,
     }
 
 
-async def _newest_ingest(session: AsyncSession, repository_id: str) -> CoverageIngest | None:
+async def load_newest_ingest(session: AsyncSession, repository_id: str) -> CoverageIngest | None:
     return (
         await session.execute(
             select(CoverageIngest)
@@ -135,15 +139,22 @@ async def _record_ingest(
     at: datetime,
     commit: str | None,
 ) -> None:
-    """Append the ingest, or restamp the newest when it measured exactly this.
+    """Append the ingest, or restamp the newest when it measured exactly this, there.
 
-    The same report ingested again (an update that re-ingests, a full
-    re-index) is one measurement, not a new trend point.
+    The same report ingested again at the same commit (an update that
+    re-ingests, a full re-index) is one measurement, not a new trend point.
+    The same figures at another commit, or at an unknown one, are a new row:
+    restamping would move the base's measurement to the head (a project delta
+    would lose its base), or leave a commit on a row whose files name none.
     """
-    newest = await _newest_ingest(session, repository_id)
-    if newest is not None and all(getattr(newest, k) == v for k, v in measured.items()):
+    newest = await load_newest_ingest(session, repository_id)
+    if (
+        newest is not None
+        and commit is not None
+        and commit == newest.ingested_commit_sha
+        and all(getattr(newest, k) == v for k, v in measured.items())
+    ):
         newest.ingested_at = at
-        newest.ingested_commit_sha = commit
         return
     session.add(
         CoverageIngest(
@@ -154,6 +165,23 @@ async def _record_ingest(
             **measured,
         )
     )
+
+
+async def load_ingest_at_commit(
+    session: AsyncSession, repository_id: str, commit_sha: str
+) -> CoverageIngest | None:
+    """The newest ingest measured at *commit_sha*, ``None`` when none was."""
+    return (
+        await session.execute(
+            select(CoverageIngest)
+            .where(
+                CoverageIngest.repository_id == repository_id,
+                CoverageIngest.ingested_commit_sha == commit_sha,
+            )
+            .order_by(CoverageIngest.ingested_at.desc(), CoverageIngest.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
 
 
 async def _prune_history(session: AsyncSession, repository_id: str) -> None:
@@ -213,11 +241,14 @@ def _row_columns(f: Any) -> dict[str, Any]:
             "total_coverable_lines": int(f.total_coverable_lines or 0),
             "covered_line_count": _covered_count(f),
             "coverable_lines_json": json.dumps(list(getattr(f, "coverable_lines", None) or [])),
+            "branch_lines_json": _branch_json(getattr(f, "branch_lines", None)),
         }
     data = dict(f)
     for key in ("covered_lines", "coverable_lines"):
         if key in data:
             data[f"{key}_json"] = json.dumps(list(data.pop(key) or []))
+    if "branch_lines" in data:
+        data["branch_lines_json"] = _branch_json(data.pop("branch_lines"))
     columns = {
         k: v for k, v in data.items() if k not in _INGEST_COLUMNS and hasattr(CoverageFile, k)
     }
@@ -228,8 +259,8 @@ def _row_columns(f: Any) -> dict[str, Any]:
     return columns
 
 
-#: Every column of ``CoverageFile`` except the two line-set blobs
-#: (``covered_lines_json``, ``coverable_lines_json``). They dominate the table:
+#: Every column of ``CoverageFile`` except the per-line blobs (``covered_lines_json``,
+#: ``coverable_lines_json``, ``branch_lines_json``). They dominate the table:
 #: the covered set alone was 467 KB of the 549 KB stored for this repo's 1,401
 #: rows, and only line-level readers need them.
 _COVERAGE_SCALAR_COLUMNS = (
@@ -275,10 +306,10 @@ async def load_coverage_for_repo(
     """Coverage rows for a repo, optionally scoped to *file_paths*.
 
     ``include_covered_lines=False`` returns ``Row`` objects carrying every
-    column except the two line-set blobs. They are attribute-accessed exactly
-    like the ORM entities, so a caller that reads named fields needs no change
-    — but a caller that touches ``covered_lines_json`` or
-    ``coverable_lines_json`` must ask for them.
+    column except the per-line blobs. They are attribute-accessed exactly
+    like the ORM entities, so a caller that reads named fields needs no change,
+    but a caller that touches ``covered_lines_json``,
+    ``coverable_lines_json`` or ``branch_lines_json`` must ask for them.
     """
     q = (
         select(CoverageFile)
@@ -291,6 +322,21 @@ async def load_coverage_for_repo(
     if include_covered_lines:
         return list(result.scalars().all())
     return list(result.all())
+
+
+def _branch_json(lines: dict | None) -> str | None:
+    """``{"line": [taken, total]}`` compact, ``None`` when there is no per-line branch data."""
+    if not lines:
+        return None
+    return json.dumps({str(k): list(v) for k, v in lines.items()}, separators=(",", ":"))
+
+
+def _branch_lines(raw: str | None) -> dict[int, tuple[int, int]]:
+    try:
+        data = json.loads(raw) if raw else {}
+        return {int(k): (int(v[0]), int(v[1])) for k, v in data.items()}
+    except (ValueError, TypeError, AttributeError, IndexError):
+        return {}
 
 
 def _line_list(raw: str | None) -> list[int]:
@@ -379,6 +425,7 @@ def file_coverage_from_row(row: Any) -> FileCoverage:
         total_coverable_lines=row.total_coverable_lines or 0,
         coverable_lines=_line_list(getattr(row, "coverable_lines_json", None)),
         covered_line_count=getattr(row, "covered_line_count", None),
+        branch_lines=_branch_lines(getattr(row, "branch_lines_json", None)),
     )
 
 
@@ -391,6 +438,19 @@ async def load_file_coverage(
     """Stored coverage as ``{path: FileCoverage}``, line sets included."""
     rows = await load_coverage_for_repo(session, repository_id, file_paths=file_paths)
     return {row.file_path: file_coverage_from_row(row) for row in rows}
+
+
+async def has_branch_lines(session: AsyncSession, repository_id: str) -> bool:
+    """Whether any stored row keeps per-line branch counts."""
+    found = await session.scalar(
+        select(CoverageFile.id)
+        .where(
+            CoverageFile.repository_id == repository_id,
+            CoverageFile.branch_lines_json.is_not(None),
+        )
+        .limit(1)
+    )
+    return found is not None
 
 
 async def load_coverage_map(session: AsyncSession, repository_id: str) -> dict[str, dict]:
@@ -490,6 +550,7 @@ async def load_coverage_history(
 
     Rows written before the figures existed are skipped, and so are partial
     ingests: their figure is a subset's coverage, not the repository's.
+    Consecutive rows with the same figures collapse into the newest of them.
     """
     result = await session.execute(
         select(
@@ -506,15 +567,22 @@ async def load_coverage_history(
         .order_by(CoverageIngest.ingested_at.desc(), CoverageIngest.id.desc())
         .limit(limit)
     )
-    return [
-        {
+    points: list[dict[str, Any]] = []
+    for row in reversed(result.all()):
+        point = {
             "ingested_at": row.ingested_at.isoformat(),
             "ingested_commit_sha": row.ingested_commit_sha,
             "line_coverage_pct": row.line_coverage_pct,
             "branch_coverage_pct": row.branch_coverage_pct,
         }
-        for row in reversed(result.all())
-    ]
+        figures = (row.line_coverage_pct, row.branch_coverage_pct)
+        if points and (points[-1]["line_coverage_pct"], points[-1]["branch_coverage_pct"]) == (
+            figures
+        ):
+            points[-1] = point
+        else:
+            points.append(point)
+    return points
 
 
 async def get_coverage_summary(
@@ -545,7 +613,7 @@ async def get_coverage_summary(
         )
     if not rows:
         return empty_coverage_summary()
-    ingest = await _newest_ingest(session, repository_id)
+    ingest = await load_newest_ingest(session, repository_id)
     covered, total, line_pct, branch_pct = _aggregate(
         (_covered_count(r), r.total_coverable_lines, r.branch_coverage_pct) for r in rows
     )
