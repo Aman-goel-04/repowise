@@ -51,6 +51,7 @@ from .dataflow import FileDataflowCache
 from .duplication import ClonePair, DuplicationReport
 from .duplication.isolation import detect_clones_with_isolation as detect_clones
 from .finding_identity import SYMBOL_INDEX_KEY, SYMBOL_KEY, SYMBOL_LINE_KEY
+from .function_blame_rollup import blame_commit_entries, commit_spans
 from .history_refresh import BLAME_MARKERS, as_biomarker_result
 from .models import HealthFileMetricData, HealthFindingData, HealthReport, Severity
 from .perf import (
@@ -108,7 +109,15 @@ log = structlog.get_logger(__name__)
 # Not a licence to move a calibrated scoring weight — those are frozen
 # independently of this stamp.
 #
-# Current stamp (v37): schema migrations are ``tooling`` in the performance
+# Current stamp (v38): Split File's co-change edge reads per-function commit
+# sets (the 50 newest distinct commits of each function, stored on
+# ``git_function_blame``), and a class takes the union of its methods' sets
+# instead of blame over its whole span. Group membership is a kernel input to
+# the ``split_file`` id, so ``REFACTORING_MODEL_VERSION`` moved 3 -> 4 with it:
+# every refactoring id now carries the ``refac4_`` prefix, and a held ``refac3_``
+# id reports ``stale_model``.
+#
+# v37: schema migrations are ``tooling`` in the performance
 # ``execution_context`` (any ``migrations/`` directory, Rails ``db/migrate``,
 # Alembic ``alembic/versions``). The context is stored on every performance
 # opportunity and is a kernel input to its id, so ``PERFORMANCE_MODEL_VERSION``
@@ -370,7 +379,7 @@ log = structlog.get_logger(__name__)
 # forms. Files that were counted untested and are not become tested, which
 # moves untested-hotspot findings and the scores that carry them, on every
 # language with a prefix or spec convention rather than Ruby alone.
-HEALTH_ANALYZER_VERSION = 37
+HEALTH_ANALYZER_VERSION = 38
 
 
 def _mark_deprecated(
@@ -504,6 +513,15 @@ def _log_duplication_diagnostics(report: DuplicationReport) -> None:
         )
     ):
         log.debug("health_duplication_limits", **diag)
+
+
+def _commit_entries(fcx: FileComplexity, git_meta: dict) -> list:
+    """Split File's per-function commit sets: from the blame index, the stored
+    rows, or the blame a re-score took for a file stored without them."""
+    idx = git_meta.get("blame_index") or git_meta.get("commit_set_blame")
+    if isinstance(idx, BlameIndex):
+        return blame_commit_entries(fcx.functions, idx)
+    return list(git_meta.get("function_commit_shas") or ())
 
 
 def _read_source_lines(abs_path: str, read_source: SourceReader) -> list[str] | None:
@@ -1625,7 +1643,8 @@ class HealthAnalyzer:
                 methods_by_file.get(file_path, ()) if methods_by_file is not None else None
             ),
             function_analyses=self._extract_method_analyses(pf, findings, dataflow_cache),
-            blame_index=blame_index,
+            # Stored sets when no blame index, so a re-score matches the index.
+            commit_spans=commit_spans(fcx.functions, _commit_entries(fcx, file_git_meta)),
             # The Extract Helper snippet; ``None`` unless the file carries clones.
             source_lines=source_lines,
         )
