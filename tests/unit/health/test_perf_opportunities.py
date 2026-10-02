@@ -230,7 +230,6 @@ def test_lock_fix_skips_a_test_owned_critical_section():
 
 def test_lock_fix_still_targets_a_production_owned_critical_section():
     """Same shape, production lock owner: the plan is unaffected by the fix."""
-    T = "server/src/test/java/org/elasticsearch/index/translog/TranslogTests.java"
     P = "server/src/main/java/org/elasticsearch/index/translog/Translog.java"
     rows = [
         _finding(
