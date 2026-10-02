@@ -306,6 +306,34 @@ def _warmup_dotnet(ctx: ResolverContext) -> None:
     get_or_build_index(ctx)
 
 
+def _warmup_rust(ctx: ResolverContext) -> None:
+    """Stamp Cargo ``[[bin]]``/``[[test]]``/``[[bench]]``/``[[example]]``
+    targets that name an explicit ``path`` as live, so a file Cargo discovers
+    only through the manifest (not convention) is not reported as dead (#2936).
+
+    ``[[bin]]`` targets are entry points: cargo runs them directly. The other
+    three are runner-loaded the same way a test file is, so they become
+    reachability roots instead — the same "roots, not entry points" split the
+    TypeScript warmup above makes for its own non-manifest entry paths.
+    """
+    from .resolvers.rust_workspace import get_or_build_cargo_workspace_index
+
+    index = get_or_build_cargo_workspace_index(ctx)
+    if index is None:
+        return
+    graph = getattr(ctx, "graph", None)
+    if graph is None:
+        return
+    parsed = getattr(ctx, "parsed_files", None) or {}
+    for crate in index.crates:
+        for path in crate.bin_paths:
+            _stamp_entry(graph, parsed, path)
+        for path in crate.reachability_root_paths:
+            node = graph.nodes.get(path)
+            if node is not None:
+                node["is_reachability_root"] = True
+
+
 def _warmup_go(ctx: ResolverContext) -> None:
     """Build the Go package index and stamp ``is_entry_point`` on every
     ``package main`` file declaring ``func main()``. Go's entry convention
@@ -517,6 +545,7 @@ _WARMUPS: dict[str, tuple[str, Warmup]] = {
     "kotlin": ("graph.jvm_index", _warmup_jvm),
     "csharp": ("graph.dotnet_index", _warmup_dotnet),
     "go": ("graph.go_index", _warmup_go),
+    "rust": ("graph.rust_targets", _warmup_rust),
     "typescript": ("graph.ts_index", _warmup_typescript),
     "javascript": ("graph.ts_index", _warmup_typescript),
     "cpp": ("graph.cpp_index", _warmup_cpp),
