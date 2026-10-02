@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from repowise.core.git_refs import find_path_removal
+
 
 def _expand_module_targets(
     metrics: list[Any], module_targets: list[str], file_targets: list[str]
@@ -35,7 +37,7 @@ def _unresolved_targets(
     excluded_paths: set[str],
     unscored_paths: set[str],
     repo_root: Any,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Name every requested target that produced no rows, with a reason.
 
     Otherwise an empty ``findings`` list reads as "this file is healthy". The
@@ -45,7 +47,7 @@ def _unresolved_targets(
     is not misreported as ``not_indexed``).
     """
     out = [
-        {"target": t, "reason": _miss_reason(t, excluded_paths, unscored_paths, repo_root)}
+        {"target": t, **_miss_reason(t, excluded_paths, unscored_paths, repo_root)}
         for t in file_targets
         if t not in resolved_paths
     ]
@@ -59,14 +61,27 @@ def _unresolved_targets(
 
 def _miss_reason(
     target: str, excluded_paths: set[str], unscored_paths: set[str], repo_root: Any
-) -> str:
-    """Why one file target produced no row."""
+) -> dict[str, Any]:
+    """Why one file target produced no row, plus a redirect when one is known."""
     if target in excluded_paths:
-        return "excluded"
+        return {"reason": "excluded"}
     if target in unscored_paths:
-        return "not_measured"
+        return {"reason": "not_measured"}
     try:
         on_disk = (Path(repo_root) / target).exists()
     except (OSError, ValueError):
         on_disk = False
-    return "not_indexed" if on_disk else "no_such_path"
+    if on_disk:
+        return {"reason": "not_indexed"}
+    return {"reason": "no_such_path", **_removal_hint(repo_root, target)}
+
+
+def _removal_hint(repo_root: Any, target: str) -> dict[str, Any]:
+    """``{}``, or ``moved_to``/``removed_by_commit`` when git can explain the miss (#2633)."""
+    try:
+        removal = find_path_removal(str(repo_root), target)
+    except (OSError, ValueError):
+        return {}
+    if removal is None:
+        return {}
+    return {"removed_by_commit": removal.commit, "moved_to": removal.moved_to}
