@@ -64,9 +64,11 @@ from .extractors.bindings.ts_js import (
 )
 from .extractors.synthetic_symbols import extract_synthetic_symbols
 from .extractors.visibility import (
+    py_module_all_names,
     refine_cpp_visibility,
     refine_csharp_visibility,
     refine_java_visibility,
+    refine_py_visibility,
     refine_rust_visibility,
     refine_ts_visibility,
     ts_deferred_export_names,
@@ -863,6 +865,7 @@ def _refine_visibility(
     visibility: str,
     name: str,
     ts_deferred_exports: frozenset[str] | None,
+    py_all_names: frozenset[str] | None,
     src: str,
 ) -> tuple[str, bool]:
     """``(visibility, is_exported_symbol)`` after the language's AST-context rules."""
@@ -885,6 +888,11 @@ def _refine_visibility(
     # inline, via ``export { x }`` lists, or ``export default x``.
     if language in _TS_JS_LANGUAGES:
         return refine_ts_visibility(def_node, visibility, name, ts_deferred_exports), False
+    # Python: a literal ``__all__`` raises the names it lists to public; it
+    # never demotes the ones it omits. GDScript shares ``py_visibility`` but
+    # has no ``__all__``, so the gate is on the language, not the fn.
+    if language == "python":
+        return refine_py_visibility(def_node, visibility, name, py_all_names), False
     # Rust: a trait's items may not write ``pub`` of their own, so the
     # trait's modifier is the only place their visibility is stated.
     if language == "rust":
@@ -1525,13 +1533,25 @@ class ASTParser:
         ts_deferred_exports: frozenset[str] | None = None
         if language in _TS_JS_LANGUAGES:
             ts_deferred_exports = ts_deferred_export_names(src)
+        # Literal module ``__all__`` names, once per file for the Python
+        # refinement. None means no signal (built at runtime or absent).
+        py_all_names: frozenset[str] | None = None
+        if language == "python":
+            py_all_names = py_module_all_names(src)
         cpp_exports = (
             collect_cpp_export_types(matches, src) if language == "cpp" else CppExportTypes()
         )
 
         for capture_dict in matches:
             built = self._symbol_from_match(
-                capture_dict, config, file_info, src, cpp_exports, ts_deferred_exports, seen
+                capture_dict,
+                config,
+                file_info,
+                src,
+                cpp_exports,
+                ts_deferred_exports,
+                py_all_names,
+                seen,
             )
             if built is None:
                 continue
@@ -1564,6 +1584,7 @@ class ASTParser:
         src: str,
         cpp_exports: CppExportTypes,
         ts_deferred_exports: frozenset[str] | None,
+        py_all_names: frozenset[str] | None,
         seen: set[tuple[int, str]],
     ) -> tuple[Symbol, Node] | None:
         """One query match as a symbol and its definition node, or None to drop it.
@@ -1612,6 +1633,7 @@ class ASTParser:
             config.visibility_fn(name, modifier_texts),
             name,
             ts_deferred_exports,
+            py_all_names,
             src,
         )
 
