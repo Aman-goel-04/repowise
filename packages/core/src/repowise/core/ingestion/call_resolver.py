@@ -355,9 +355,14 @@ class CallResolver(
         # {representative: ((member id, (fewest, most) arguments), ...)}.
         self._overload_rep: dict[str, str] = {}
         self._overload_members: dict[str, tuple[tuple[str, tuple[int, int | None]], ...]] = {}
+
         # Representatives of sets with a member whose range is unknown; a count
         # cannot choose there, since that member may admit it too.
         self._unranged_overload_sets: set[str] = set()
+
+        # Build variants (``f#cfg(unix)``, ``f#cfg(not(unix))``) are not chosen by
+        # arguments: a call means every one, so an edge fans out to each.
+        self._variant_siblings: dict[str, tuple[str, ...]] = {}
         self._symbols_by_id = {
             symbol.id: symbol for parsed in parsed_files.values() for symbol in parsed.symbols
         }
@@ -794,9 +799,16 @@ class CallResolver(
                 # tier that answered, so it is stamped once here.
                 if call.edge_type != "calls":
                     resolved = replace(resolved, edge_type=call.edge_type)
+
                 if call.spawned:
                     resolved = replace(resolved, spawned=True)
-                results.append(resolved)
+
+                for variant in self._variant_siblings.get(
+                    resolved.callee_id, (resolved.callee_id,)
+                ):
+                    if variant != resolved.caller_id:
+                        results.append(replace(resolved, callee_id=variant))
+
 
         return results
 
