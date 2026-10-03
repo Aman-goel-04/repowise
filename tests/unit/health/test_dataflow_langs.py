@@ -1880,3 +1880,149 @@ def test_rust_span_holding_an_exit_macro_is_not_offered():
     lmap = get_language_map("rust")
     fn = _first("rust", src)
     assert all(not (e.start_line <= 6 <= e.end_line) for e in find_extractions(fn, lmap))
+
+
+# == May-def bookkeeping is not a read ===========================================
+
+
+def test_rust_if_let_binder_inside_the_span_is_not_a_param():
+    # Both ``if let`` arms bind their own ``var``; the first one's binding is
+    # out of scope by the time the span runs, so it cannot be passed in.
+    src = """
+        fn flag_doc(flag: &Flag, out: &mut String) {
+            if let Some(var) = flag.doc_variable() {
+                out.push_str(var);
+            }
+            let name = flag.name_long();
+            out.push_str(name);
+            if let Some(var) = flag.doc_variable() {
+                if var.len() > 3 {
+                    out.push_str(var);
+                }
+            }
+            out.push_str("\n");
+            let doc = flag.doc_long();
+            if doc.len() > 10 {
+                out.push_str(doc);
+            }
+            out.push_str("\n");
+            out.push_str("\n");
+        }
+        """
+    lmap = get_language_map("rust")
+    spans = [e for e in find_extractions(_first("rust", src), lmap) if e.start_line <= 8 <= e.end_line]
+    assert spans
+    assert all("var" not in e.params for e in spans)
+
+
+def test_rust_let_inside_a_match_arm_is_not_a_param():
+    src = """
+        fn analyse(kind: &Kind, limit: usize) -> usize {
+            match kind {
+                Kind::One(items) => {
+                    let mut total = items.len();
+                    total
+                }
+                Kind::Many(items) => {
+                    let mut total = 0;
+                    for item in items.iter() {
+                        if item.len() > limit {
+                            total += limit;
+                        } else {
+                            total += item.len();
+                        }
+                    }
+                    total
+                }
+            }
+        }
+        """
+    lmap = get_language_map("rust")
+    fn = _first("rust", src)
+    spans = [e for e in find_extractions(fn, lmap) if e.start_line == 9]
+    assert spans
+    assert all("total" not in e.params for e in spans)
+
+
+def test_rust_span_ending_on_a_consumed_tail_if_is_not_offered():
+    # The ``else`` block's last ``if`` is its value, read by the ``let``.
+    src = """
+        fn matcher(names: &[String], dir: &str, case: bool) -> usize {
+            let found = if names.is_empty() {
+                0
+            } else {
+                let wanted: Vec<&String> = names.iter().filter(|n| n.len() > 2).collect();
+                log(dir);
+                log(case);
+                if wanted.is_empty() {
+                    0
+                } else {
+                    let m = wanted.len();
+                    m + 1
+                }
+            };
+            found
+        }
+        """
+    lmap = get_language_map("rust")
+    fn = _first("rust", src)
+    assert all(e.end_line != 14 for e in find_extractions(fn, lmap))
+
+
+def test_rust_span_ending_on_an_if_in_a_loop_body_is_still_offered():
+    src = """
+        fn tally(items: &[usize], limit: usize, out: &mut Vec<usize>) -> usize {
+            let count = items.len();
+            for item in items {
+                let doubled = item * 2;
+                log(doubled);
+                log(limit);
+                if doubled > limit {
+                    out.push(limit);
+                } else {
+                    out.push(doubled);
+                }
+            }
+            count
+        }
+        """
+    lmap = get_language_map("rust")
+    fn = _first("rust", src)
+    assert any(e.end_line == 12 for e in find_extractions(fn, lmap))
+
+
+def test_rust_match_arm_binders_are_params_of_a_span_in_the_arm():
+    src = """
+        fn class_regex(re: &mut String, tokens: &[Token]) {
+            for tok in tokens.iter() {
+                match *tok {
+                    Token::Class { negated, ref ranges } => {
+                        re.push('[');
+                        if negated {
+                            re.push('^');
+                        }
+                        for r in ranges {
+                            if r.0 == r.1 {
+                                re.push(r.0);
+                            } else {
+                                re.push(r.1);
+                            }
+                        }
+                        re.push(']');
+                    }
+                    None => {}
+                    std::i32::MAX => {}
+                    consts::PI => {}
+                    y if y > 2 => {}
+                }
+            }
+        }
+        """
+    fn = _first("rust", src)
+    defs = {(d.var, d.line) for d in fn.def_use.definitions}
+    assert ("negated", 5) in defs and ("ranges", 5) in defs
+    bogus = {"None", "Token", "Class", "std", "i32", "MAX", "consts", "PI"}
+    assert not any(var in bogus for var, _ in defs)
+    spans = [e for e in find_extractions(fn, get_language_map("rust")) if e.start_line <= 7]
+    assert spans
+    assert all({"negated", "ranges"} <= set(e.params) for e in spans)

@@ -142,6 +142,9 @@ def find_extractions(analysis: FunctionAnalysis, lmap: LanguageNodeMap) -> list[
         stmts = block.named_children
         n = len(stmts)
         is_body = block.id == body_container.id
+        keeps_tail = tail_stmt_kinds is not None and _tail_is_block_value(
+            stmts, tail_stmt_kinds, fn_node, lmap
+        )
         # One subtree walk per statement, then O(1) metrics per span via
         # prefix sums. _span_metrics processes each span statement's subtree
         # independently, so a span's decision count is the sum over its
@@ -176,11 +179,7 @@ def find_extractions(analysis: FunctionAnalysis, lmap: LanguageNodeMap) -> list[
                 # Never extract the whole function body (that is not a split).
                 if is_body and length == n:
                     continue
-                if (
-                    tail_stmt_kinds is not None
-                    and j == n - 1
-                    and stmts[j].type not in tail_stmt_kinds
-                ):
+                if keeps_tail and j == n - 1:
                     continue
                 decisions = dec_prefix[j + 1] - dec_prefix[i]
                 has_jump = jump_prefix[j + 1] > jump_prefix[i]
@@ -218,6 +217,58 @@ def find_extractions(analysis: FunctionAnalysis, lmap: LanguageNodeMap) -> list[
     return _sorted(out)
 
 
+def _tail_is_block_value(
+    stmts: list[Node], tail_stmt_kinds: frozenset[str], fn_node: Node, lmap: LanguageNodeMap
+) -> bool:
+    """True when the block's last statement is its value, which a span may not
+    end on (lifting it would drop the value).
+
+    That is a bare tail expression, and also an unterminated statement-wrapped
+    one (Rust parses a tail ``if`` / ``match`` with no ``;`` as an
+    ``expression_statement``) whose value something consumes: an ``else``
+    block in a ``let`` initializer, the body of a function with a return type.
+    A loop body's value, and that of a block in statement position, is
+    discarded, so ending there stays allowed.
+    """
+    if not stmts:
+        return False
+    last = stmts[-1]
+    if last.type not in tail_stmt_kinds:
+        return True
+    if last.type not in lmap.statement_wrapper_kinds or last.children[-1].type == ";":
+        return False
+    return _block_value_used(last.parent, fn_node, lmap)
+
+
+def _block_value_used(block: Node, fn_node: Node, lmap: LanguageNodeMap) -> bool:
+    """Whether the value of *block* reaches anything, climbing through the
+    conditional chain that carries it (``else`` / ``match`` arms)."""
+    node = block
+    while True:
+        parent = node.parent
+        if parent is None or parent.id == fn_node.id:
+            return fn_node.child_by_field_name("return_type") is not None
+        verdict = _value_hop(node, parent, lmap)
+        if verdict is not None:
+            return verdict
+        node = parent
+
+
+def _value_hop(node: Node, parent: Node, lmap: LanguageNodeMap) -> bool | None:
+    """One step of :func:`_block_value_used`: True or False when *parent*
+    settles whether *node*'s value is used, None to keep climbing."""
+    if parent.type in lmap.loop_kinds:
+        return False  # a loop body's value is discarded
+    if parent.type in lmap.block_kinds:
+        # Only the last statement carries a block's value onward.
+        return None if parent.named_children[-1].id == node.id else False
+    if parent.type in lmap.statement_wrapper_kinds:
+        return False if parent.children[-1].type == ";" else None
+    if parent.type in lmap.value_passthrough_kinds:
+        return None
+    return True  # a let initializer, an argument, an operand
+
+
 def _function_lines(fn_node: Node) -> list[str]:
     """Source rows indexed by absolute row, rebuilt from the function's own text.
 
@@ -253,7 +304,10 @@ def _var_lines(def_use: FunctionDefUse) -> tuple[dict[str, list[int]], dict[str,
         def_lines[d.var].append(d.line)
     for bdu in def_use.blocks.values():
         for u in bdu.uses:
-            use_lines[u.name].append(u.line)
+            # A may-def's paired use is bookkeeping, not a read: counted, a
+            # binder declared inside a ``match`` arm became its own parameter.
+            if not u.echo:
+                use_lines[u.name].append(u.line)
     # A closure's read counts where the closure is written: lifting the code
     # around it moves the read with it. Only names this function binds matter.
     for u in def_use.captured:
@@ -281,6 +335,8 @@ def _declared_before_read(def_use: FunctionDefUse) -> dict[str, frozenset[int]]:
     first_read: dict[tuple[str, int], int] = {}
     for bdu in def_use.blocks.values():
         for u in bdu.uses:
+            if u.echo:
+                continue
             key = (u.name, u.line)
             first_read[key] = min(u.column, first_read.get(key, u.column))
     declared: dict[str, set[int]] = defaultdict(set)
