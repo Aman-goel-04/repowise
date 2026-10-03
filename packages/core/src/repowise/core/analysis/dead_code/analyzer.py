@@ -11,7 +11,9 @@ this package.
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
+import os
 import re
 from collections.abc import Iterable, Iterator
 from collections.abc import Set as AbstractSet
@@ -25,6 +27,7 @@ import structlog
 from ...code_origin import is_build_file
 from ...entry_candidacy import is_reachability_root
 from ...ingestion.models import REACHABILITY_USE_EDGE_TYPES
+from ...ingestion.package_roots import package_manifest_names
 from ...ingestion.symbol_identity import base_symbol_id, overload_sets
 from .c_name_uses import (
     DEFINITION_HEADER_LINES,
@@ -42,6 +45,7 @@ from .constants import (
     _NAMESPACE_IMPORT_LANGUAGES,
     _NEVER_PACKAGE_DIRS,
     _PREPROCESSED_LANGUAGES,
+    _PROJECT_FILE_SUFFIXES,
     _PURE_WRAPPER_DECORATOR_ATTRS,
     _PURE_WRAPPER_DECORATOR_MODULES,
     _RUN_NOT_IMPORTED_LANGUAGES,
@@ -55,7 +59,7 @@ from .dynamic_markers import (
     find_dynamic_import_files,
     read_source_text,
 )
-from .entry_shape import clamp_entry_shaped, drop_program_entries
+from .entry_shape import clamp_entry_shaped, drop_program_entries, is_program
 from .file_reachability import (
     PackageFileMap,
     ReachabilityRescues,
@@ -2044,6 +2048,17 @@ class DeadCodeAnalyzer:
         # and any other dotfile directory at the repo root.
         if pkg in _NEVER_PACKAGE_DIRS or pkg.startswith("."):
             return False
+        # A folder is a package only when it declares itself one: a Next.js
+        # ``app/``, a ``benchmarks/`` folder or a Go ``cmd/`` has no manifest
+        # and nothing is meant to import it.
+        if not self._has_package_manifest(pkg, files):
+            return False
+        # Tests are run, never imported, and so is a package that ships a
+        # program (a CLI started by its shebang). One program file is enough,
+        # even a stray script: this errs toward not calling a package dead.
+        files = [f for f in files if not self.graph.nodes.get(f, {}).get("is_test")]
+        if any(is_program(f, self._source_map.get(f, b"")) for f in files):
+            return False
         # A real package contains at least one source file something could
         # import. Config and data (YAML, JSON, MD, TOML) is metadata, and a
         # folder of Dockerfiles, shell scripts and build files is run, never
@@ -2054,6 +2069,20 @@ class DeadCodeAnalyzer:
             and not is_build_file(f)
             for f in files
         )
+
+    def _has_package_manifest(self, pkg: str, files: list[str]) -> bool:
+        """Whether *pkg* holds a package manifest of its own, on disk or indexed.
+
+        A top-level folder whose manifest sits at the repository root (a
+        Python package built by the root ``pyproject.toml``) is the repository
+        itself, not a package of it, so it is never a candidate.
+        """
+        names = {f.partition("/")[2] for f in files if f.count("/") == 1}
+        if self._repo_root is not None:
+            with contextlib.suppress(OSError):
+                names.update(os.listdir(Path(self._repo_root) / pkg))
+        manifests = package_manifest_names()
+        return any(n in manifests or n.endswith(_PROJECT_FILE_SUFFIXES) for n in names)
 
     def _has_cross_package_importer(self, pkg: str, files: list[str]) -> bool:
         """Whether anything outside *pkg* depends on a file inside it."""

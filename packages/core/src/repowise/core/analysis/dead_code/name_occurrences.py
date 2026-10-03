@@ -45,12 +45,14 @@ where this answers it from the repository in front of us.
 
 from __future__ import annotations
 
+import posixpath
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 
-from .constants import is_runner_file
+from .constants import _TOOL_CONFIG_LOAD_KEYS, is_runner_file, is_tool_config
+from .entry_shape import export_shape
 from .models import DeadCodeFindingData, DeadCodeKind
 from .risk_factors import RISK_CAP_CONFIDENCE
 
@@ -444,26 +446,47 @@ def _files_naming(targets: set[str], source_map: dict[str, bytes]) -> dict[str, 
 
     named_in: dict[str, list[str]] = {}
     for path, blob in sorted(source_map.items()):
-        for target in _targets_in(blob, wanted, tails) - {path}:
+        base = path.rpartition("/")[0]
+        for target in _targets_in(blob, wanted, tails, base) - {path}:
             named_in.setdefault(target, []).append(path)
     return named_in
 
 
-def _targets_in(blob: bytes, wanted: dict[str, set[str]], tails: set[str]) -> set[str]:
-    """The targets any path-shaped token of *blob* names."""
+def _targets_in(
+    blob: bytes, wanted: dict[str, set[str]], tails: set[str], base: str
+) -> set[str]:
+    """The targets any path-shaped token of *blob*, a file in *base*, names."""
     return {
         target
         for match in _PATH_TOKEN_RE.finditer(blob)
-        for target in _targets_named_by(match.group().decode("ascii"), wanted, tails)
+        for target in _targets_named_by(match.group().decode("ascii"), wanted, tails, base)
     }
 
 
-def _targets_named_by(token: str, wanted: dict[str, set[str]], tails: set[str]) -> set[str]:
-    """The targets one path-shaped *token* names, through any of its spellings."""
+def _targets_named_by(
+    token: str, wanted: dict[str, set[str]], tails: set[str], base: str
+) -> set[str]:
+    """The targets one path-shaped *token* names, through any of its spellings.
+
+    A tool resolves a relative path against the directory of the file that
+    writes it (``setupFiles: ["./vitest.setup.ts"]`` in ``src/vitest.config.ts``
+    is ``src/vitest.setup.ts``), so that resolution is one more spelling.
+    """
     tail = token.strip(".").rpartition("/")[2]
     if tail not in tails and tail.rpartition(".")[0] not in tails:
         return set()
-    return {target for spelling in _token_spellings(token) for target in wanted.get(spelling, ())}
+    spellings = _token_spellings(token)
+    if base and not token.startswith("/"):
+        # Not through ``_token_spellings``: its dot strip would eat the
+        # leading dot of a dot-directory (``.changeset/``).
+        resolved = posixpath.normpath(f"{base}/{token}")
+        spellings += [resolved, resolved.rpartition(".")[0]]
+    return {target for spelling in spellings for target in wanted.get(spelling, ())}
+
+
+#: What a file named by path can be used as: a file a runner loads, or a module
+#: whose exports a tool config reads.
+_PATH_LOADED_KINDS = frozenset({DeadCodeKind.UNREACHABLE_FILE, DeadCodeKind.UNUSED_EXPORT})
 
 
 def clamp_path_mentions(
@@ -478,25 +501,68 @@ def clamp_path_mentions(
     A mention in a doc is not proof of use, so that finding is capped to the
     review tier. A CI workflow, build file, manifest or shell script runs or
     ships what it names (``python scripts/emit_sample_dsl.py`` in a workflow),
-    so a file one of those names is dropped.
+    so a file one of those names is dropped. A tool config that loads a module
+    reads what the module exports by default (a changesets changelog module,
+    a docs site's sidebars), so the unused exports of a default-exporting
+    module a tool config names are dropped too; a setup file the config runs
+    for its side effects keeps them.
 
     One scan over the indexed source. That already holds JSON, YAML, Markdown,
     shell and ``package.json``: each has a language spec, so ingestion reads
     it. A file's mention of itself is not a use. Returns a new list; never
     raises a confidence.
     """
-    unreachable = [f for f in findings if f.kind is DeadCodeKind.UNREACHABLE_FILE]
-    if not source_map or not unreachable:
+    in_scope = [f for f in findings if f.kind in _PATH_LOADED_KINDS]
+    if not source_map or not in_scope:
         return findings
 
-    named_in = _files_naming({f.file_path for f in unreachable}, source_map)
-    run = {
-        id(f) for f in unreachable if any(map(is_runner_file, named_in.get(f.file_path, ())))
-    }
-    for finding in unreachable:
-        if id(finding) not in run:
+    named_in = _files_naming({f.file_path for f in in_scope}, source_map)
+    run = {id(f) for f in in_scope if _loaded(f, named_in.get(f.file_path, ()), source_map)}
+    kept = [f for f in findings if id(f) not in run]
+    for finding in kept:
+        if finding.kind is DeadCodeKind.UNREACHABLE_FILE:
             _cap_named_by_path(finding, named_in.get(finding.file_path))
-    return [f for f in findings if id(f) not in run]
+    return kept
+
+
+def _loaded(
+    finding: DeadCodeFindingData, namers: Iterable[str], source_map: dict[str, bytes]
+) -> bool:
+    """Whether *namers* load the file of *finding* in the way the finding denies.
+
+    A tool config is read only through its load keys, even when it is also a
+    runner by name (a bundler config is a build file): a path it mentions in a
+    comment or an ignore list is not loaded.
+    """
+    path = finding.file_path
+    configs = [n for n in namers if is_tool_config(n)]
+    loaders = [n for n in configs if _config_loads(n, path, source_map)]
+    if finding.kind is DeadCodeKind.UNREACHABLE_FILE:
+        others = (n for n in namers if n not in configs)
+        return bool(loaders) or any(map(is_runner_file, others))
+    return bool(loaders) and "default" in export_shape(path, frozenset(), source_map.get(path))
+
+
+#: ``<load key>: <value>`` in a tool config, the key quoted or bare; the value a
+#: string, a list or an object (``input: { main: "src/a.ts" }``).
+_LOAD_VALUE_RE = re.compile(
+    rb"""["']?\b(?:"""
+    + b"|".join(k.encode() for k in _TOOL_CONFIG_LOAD_KEYS)
+    + rb""")\b["']?\s*[:=]\s*(\[[^\]]*\]|\{[^}]*\}|"[^"]*"|'[^']*')"""
+)
+# Comments, so a path a config only mentions in one is not loaded. A ``//``
+# after ``:`` is a URL (``https://``), not a comment.
+_LINE_COMMENT_RE = re.compile(rb"(?<![:\w])//[^\n]*")
+_BLOCK_COMMENT_RE = re.compile(rb"/\*.*?\*/", re.DOTALL)
+
+
+def _config_loads(config: str, target: str, source_map: dict[str, bytes]) -> bool:
+    """Whether *config* names *target* under one of its load keys."""
+    text = _LINE_COMMENT_RE.sub(b"", _BLOCK_COMMENT_RE.sub(b"", source_map.get(config, b"")))
+    values = b"\n".join(m.group(1) for m in _LOAD_VALUE_RE.finditer(text))
+    wanted = {key: {target} for key in _path_keys(target)}
+    tails = {key.rpartition("/")[2] for key in wanted}
+    return target in _targets_in(values, wanted, tails, config.rpartition("/")[0])
 
 
 def _cap_named_by_path(finding: DeadCodeFindingData, namers: list[str] | None) -> None:
