@@ -143,11 +143,14 @@ class CohesionGroup:
     by the Extract Class refactoring detector — when a class has
     ``lcom4 >= 2`` each group is a candidate extracted class. ``methods``
     and ``fields`` are stable-sorted (by first appearance / name) so the
-    same class yields the same split across runs.
+    same class yields the same split across runs. ``calls`` are the members
+    the cluster only calls (a base-class, abstract or trait-provided method):
+    a use of the class, not state of its own.
     """
 
     methods: list[str]
     fields: list[str]
+    calls: tuple[str, ...] = ()
 
 
 @dataclass
@@ -189,6 +192,9 @@ class ClassComplexity:
     # safety valve. A cohesive Extract Class split raises the worst split
     # class's TCC toward ``1``; the enrich self-check reads it before/after.
     tcc: float = 1.0
+    # Every method is fixed by a contract the class implements (a Rust
+    # ``impl Trait for T``): none can move out, and cohesion is not scored.
+    contract_impl: bool = False
 
 
 @dataclass(frozen=True)
