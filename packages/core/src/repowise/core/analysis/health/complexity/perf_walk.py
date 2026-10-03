@@ -232,6 +232,26 @@ def _enclosing_loop_iterables(
     return names
 
 
+def _is_lock_acquire_spin(
+    node: Node,
+    func: str | None,
+    dialect: BasePerfDialect,
+    loop_kinds: frozenset[str],
+    fn_kinds: frozenset[str],
+) -> bool:
+    """Is *node* inside the unbounded retry loop of a lock-acquiring function?
+
+    Only the nearest enclosing loop counts: a per-item loop nested in (or
+    instead of) the spin loop still takes a lock per iteration.
+    """
+    cur = node.parent
+    while cur is not None and cur.type not in fn_kinds:
+        if cur.type in loop_kinds and cur.is_named:
+            return dialect.is_lock_acquire_spin(func, cur)
+        cur = cur.parent
+    return False
+
+
 def _enclosing_loops(
     node: Node, dialect: BasePerfDialect, loop_kinds: frozenset[str], fn_kinds: frozenset[str]
 ) -> list[Node]:
@@ -668,6 +688,10 @@ def _collect_perf_hits(
                         if do_loop_call_marker
                         else None
                     )
+                    if marker == "lock_in_loop" and _is_lock_acquire_spin(
+                        call_node, next_func, dialect, loop_kinds, fn_kinds
+                    ):
+                        marker = None
                     if marker is not None:
                         hits.append(
                             PerfHit(
@@ -729,6 +753,10 @@ def _collect_perf_hits(
                     )
                 elif do_loop_stmt_marker:
                     sm = dialect.loop_stmt_marker(node, list_names)
+                    if sm == "lock_in_loop" and _is_lock_acquire_spin(
+                        node, next_func, dialect, loop_kinds, fn_kinds
+                    ):
+                        sm = None
                     if sm is not None:
                         hits.append(
                             PerfHit(
