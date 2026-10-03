@@ -25,8 +25,11 @@ from repowise.core.analysis.health.refactoring import (
 )
 from repowise.core.analysis.health.refactoring.split_file import (
     SplitFileDetector,
+    _CallSignals,
     _dominant_token,
+    _module_label,
     _shim_required,
+    _weighted_graph,
 )
 from repowise.core.ingestion.git_indexer.function_blame import BlameIndex
 
@@ -576,3 +579,19 @@ def test_overloads_are_listed_once_in_the_residual():
     out = _detect(g, _CPP, language="cpp")
     assert len(out) == 1
     assert out[0].plan["residual"] == {"symbols": ["Trim"]}
+
+
+def test_direct_call_edges_are_added_in_sorted_order():
+    # A set of pairs iterates in hash order, and the community partitioner reads
+    # edges in insertion order, so the order must not follow the hash seed.
+    signals = _CallSignals()
+    for pair in [("z", "a"), ("m", "a"), ("c", "a"), ("q", "a"), ("x", "a")]:
+        signals.add_local_call(*pair)
+    wg, _ = _weighted_graph(["a", "c", "m", "q", "x", "z"], set(), signals, {})
+    assert list(wg.adj["a"]) == ["c", "m", "q", "x", "z"]
+
+
+def test_a_two_area_community_label_never_names_a_group():
+    foreign_of = {"a": {"tpl, resources"}, "b": {"tpl, resources", "path/to/layout.go"}}
+    assert _module_label(foreign_of, ["a"], set()) == ""
+    assert _module_label(foreign_of, ["a", "b"], set()) == "layout"

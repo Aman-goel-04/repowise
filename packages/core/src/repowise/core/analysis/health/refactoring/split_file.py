@@ -251,7 +251,8 @@ def _module_label(
         lab
         for m in members
         for lab in foreign_of.get(m, set())
-        if _label_identifier(lab).lower() not in _PRECOMPILED_HEADER_STEMS
+        # "tpl, resources" is a two-area community label, not a module name.
+        if "," not in lab and _label_identifier(lab).lower() not in _PRECOMPILED_HEADER_STEMS
     )
     if not labels:
         return ""
@@ -544,7 +545,7 @@ def _weighted_graph(
 
     # Signals are added strongest first (see module docstring).
     edges = _EdgeWeights(spine)
-    for a, b in signals.local_pairs:
+    for a, b in sorted(signals.local_pairs):
         edges.add(a, b, _DIRECT_CALL_WEIGHT)
     cochange_edges = _add_cochange_edges(edges, commits_of)
     _add_shared_helper_edges(edges, signals.callers_of)
