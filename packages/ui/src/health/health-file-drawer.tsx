@@ -51,6 +51,7 @@ import type {
 import type { RefactoringOpportunity } from "@repowise-dev/types/refactoring";
 import { SeverityMark } from "./severity-mark";
 import { VerificationTag } from "./verification-tag";
+import { LowerPriorityTag } from "./lower-priority-tag";
 import { ImpactFigure } from "./impact-figure";
 
 export interface HealthDrawerFinding {
@@ -68,6 +69,7 @@ export interface HealthDrawerFinding {
   dimension?: BiomarkerDimension | string;
   /** `"unverified"` for a provisional finding type. */
   verification?: string | null;
+  lower_priority?: string | null;
 }
 
 export interface HealthDrawerMetric {
@@ -232,6 +234,7 @@ export function HealthFileDrawer({
             {CATEGORY_LABEL[info.category]}
           </span>
           <VerificationTag verification={f.verification} />
+          <LowerPriorityTag reason={f.lower_priority} />
           {(() => {
             // A history marker wears a neutral "Watch" chip instead of its
             // pillar's: it is scored, but nothing in this file will clear it.
