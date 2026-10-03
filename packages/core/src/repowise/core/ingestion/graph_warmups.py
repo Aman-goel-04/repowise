@@ -24,6 +24,8 @@ import contextlib
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+import structlog
+
 from .languages.specs.cpp import INCLUDE_FRAGMENT_EXTENSIONS
 
 if TYPE_CHECKING:
@@ -315,9 +317,17 @@ def _warmup_rust(ctx: ResolverContext) -> None:
     three are runner-loaded the same way a test file is, so they become
     reachability roots instead — the same "roots, not entry points" split the
     TypeScript warmup above makes for its own non-manifest entry paths.
+
+    First, ``mod`` items a ``macro_rules!`` body declares join the imports of
+    the files that call the macro, before any import is resolved.
     """
+    from .resolvers.rust import add_macro_rules_mod_imports
     from .resolvers.rust_workspace import get_or_build_cargo_workspace_index
 
+    try:
+        add_macro_rules_mod_imports(ctx)
+    except Exception as exc:  # the pass must not abort the build
+        structlog.get_logger(__name__).debug("rust_macro_mods_failed", error=str(exc))
     index = get_or_build_cargo_workspace_index(ctx)
     if index is None:
         return
