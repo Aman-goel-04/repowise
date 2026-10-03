@@ -50,9 +50,18 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import PurePosixPath
 
-from .constants import _TOOL_CONFIG_LOAD_KEYS, is_runner_file, is_tool_config
+from ...ingestion.languages.registry import REGISTRY
+from .constants import (
+    _BARE_NAME_USE_LANGUAGES,
+    _NON_CODE_LANGUAGES,
+    _TOOL_CONFIG_LOAD_KEYS,
+    is_runner_file,
+    is_tool_config,
+)
 from .entry_shape import export_shape
+from .jvm_name_scope import JvmNameScope
 from .models import DeadCodeFindingData, DeadCodeKind
 from .risk_factors import RISK_CAP_CONFIDENCE
 
@@ -96,6 +105,8 @@ class _Answer(Enum):
 class _Verdict:
     answer: _Answer
     used_at: str | None = None
+    # ``used_at`` is a code file, not documentation or config.
+    in_code: bool = False
 
 
 _NOT_SEARCHABLE = _Verdict(_Answer.NOT_SEARCHABLE)
@@ -178,7 +189,7 @@ def _uses_in_own_file(
                     continue
                 if lineno in headers[token]:
                     continue  # a sibling declaration of the same name
-                out[id(finding)] = _Verdict(_Answer.USED, f"{path}:{lineno}")
+                out[id(finding)] = _Verdict(_Answer.USED, f"{path}:{lineno}", in_code=True)
     return out
 
 
@@ -253,10 +264,41 @@ def _is_own_type_sibling(occurrence: str, declaring: str) -> bool:
     return stem == base
 
 
+def _used_in(paths: list[str]) -> _Verdict:
+    """A use in *paths*, preferring a code file to a doc or config."""
+    in_code = [path for path in paths if _language(path) not in _NON_CODE_LANGUAGES]
+    return _Verdict(_Answer.USED, (in_code or paths)[0], in_code=bool(in_code))
+
+
+def _uses_elsewhere(
+    finding: DeadCodeFindingData, files: set[str], scope: JvmNameScope | None
+) -> list[str]:
+    """The files other than *finding*'s own whose mention of its name is a use.
+
+    With *scope*, only the first such file is returned, code files first: one
+    is all :func:`_used_in` needs, and a common name has hundreds of writers.
+    """
+    declaring = finding.file_path
+    others = sorted(f for f in files - {declaring} if not _is_own_type_sibling(f, declaring))
+    if scope is None:
+        return others
+    others.sort(key=lambda path: _language(path) in _NON_CODE_LANGUAGES)
+    first = next(
+        (f for f in others if scope.can_refer(finding.symbol_name, declaring, files, f)), None
+    )
+    return [first] if first is not None else []
+
+
 def _verdicts(
-    source_map: dict[str, bytes], candidates: list[DeadCodeFindingData]
+    source_map: dict[str, bytes],
+    candidates: list[DeadCodeFindingData],
+    scope: JvmNameScope | None = None,
 ) -> dict[int, _Verdict]:
-    """One verdict per candidate, from one repo-wide scan plus targeted reads."""
+    """One verdict per candidate, from one repo-wide scan plus targeted reads.
+
+    With *scope*, another file's mention counts only when its bare name can
+    refer to the candidate's own class.
+    """
     # Built from the candidates alone, which is what keeps a whole-repo scan
     # affordable: the index only ever holds the names some finding asks about.
     answerable = {searchable_token(f.symbol_name) for f in candidates} - {b""}
@@ -275,13 +317,9 @@ def _verdicts(
             out[id(finding)] = _NOT_SEARCHABLE
             continue
         files = occurrences.get(token, set())
-        elsewhere = sorted(
-            f
-            for f in files - {finding.file_path}
-            if not _is_own_type_sibling(f, finding.file_path)
-        )
+        elsewhere = _uses_elsewhere(finding, files, scope)
         if elsewhere:
-            out[id(finding)] = _Verdict(_Answer.USED, elsewhere[0])
+            out[id(finding)] = _used_in(elsewhere)
         elif finding.file_path in files:
             same_file_only.setdefault(finding.file_path, []).append(finding)
         else:
@@ -357,6 +395,41 @@ def clamp_unverified_absence(
             f"'{name}' {detail}, so the absence of an import does not establish disuse"
         )
     return findings
+
+
+def _language(path: str) -> str | None:
+    return REGISTRY.from_extension(PurePosixPath(path).suffix)
+
+
+def drop_bare_name_uses(
+    findings: list[DeadCodeFindingData], source_map: dict[str, bytes]
+) -> list[DeadCodeFindingData]:
+    """Drop unused exports whose name another code file, or their own, writes.
+
+    For a language that uses a type from its own package by its bare name (a
+    Java class, a nested type used further down its own file), the name
+    written in code outside the declaration is the use the import graph
+    cannot see, so the finding is wrong rather than doubtful. A mention only
+    in documentation or config is left to :func:`clamp_unverified_absence`.
+    A mention whose name means another type there (a same-named nested type,
+    a generated message class) is not a use; see :mod:`.jvm_name_scope`.
+    Returns a new list.
+    """
+    candidates = [f for f in findings if _uses_bare_names(f)]
+    if not candidates or not source_map:
+        return findings
+    verdicts = _verdicts(source_map, candidates, JvmNameScope(source_map))
+    used = {key for key, verdict in verdicts.items() if verdict.in_code}
+    return [f for f in findings if id(f) not in used]
+
+
+def _uses_bare_names(finding: DeadCodeFindingData) -> bool:
+    """An unused export in a language that uses a type by its bare name."""
+    return (
+        finding.kind is DeadCodeKind.UNUSED_EXPORT
+        and bool(finding.symbol_name)
+        and _language(finding.file_path) in _BARE_NAME_USE_LANGUAGES
+    )
 
 
 def drop_internals_used_in_own_file(
