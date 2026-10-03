@@ -34,6 +34,7 @@ from ....analysis.health.ranking import (
 from ....analysis.health.rows import detail_map, split_tests, split_unscored
 from ....analysis.health.scope import scores_language
 from ....analysis.health.scoring import ADVISORY_DIMENSION, SCORE_FIELDS, nloc_weighted_attr
+from ....analysis.health.worth import LowPriority, finding_priorities
 from ....test_paths import is_test_related_path
 from ...models import (
     DocDriftFinding,
@@ -474,7 +475,8 @@ async def get_health_findings(
     include_withheld: bool = False,
     limit: int | None = None,
 ) -> list[HealthFinding]:
-    """Findings for one repository, ordered by health impact.
+    """Findings for one repository: worth doing first ahead of lower-priority
+    ones (``worth.finding_priorities``), each part ordered by health impact.
 
     Finding types the registry withholds (``finding_registry``) are left out,
     so every surface built on this read shows only what has earned a place; a
@@ -494,7 +496,7 @@ async def get_health_findings(
     reviewed without a second read.
 
     ``file_paths`` scopes to a set of files in one read; an empty sequence
-    matches nothing. ``limit`` caps the rows read, highest impact first.
+    matches nothing. ``limit`` caps the rows returned, in that order.
     """
     q = select(HealthFinding).where(HealthFinding.repository_id == repository_id)
     statuses = [s.strip() for s in status.split(",") if s.strip()]
@@ -538,13 +540,45 @@ async def get_health_findings(
         allowed = [k for k, v in order.items() if v >= threshold]
         q = q.where(HealthFinding.severity.in_(allowed))
     q = q.order_by(HealthFinding.health_impact.desc())
-    if limit is not None:
-        q = q.limit(limit)
     result = await session.execute(q)
-    return _filter_excluded_paths(
+    kept = _filter_excluded_paths(
         list(result.scalars().all()),
         await _health_exclude_spec(session, repository_id),
     )
+    # A filter that drops some of a function's findings would misread its
+    # shape, so the tier then reads every open finding on the kept files.
+    narrowed = bool(types or exact or min_severity or dimension) or statuses != ["open"]
+    reasons = (
+        await health_finding_priorities(session, repository_id, kept)
+        if narrowed
+        else dict(zip((f.id for f in kept), finding_priorities(kept), strict=True))
+    )
+    # Stable: each tier keeps the impact order. The cap applies after the tier.
+    ordered = sorted(kept, key=lambda f: reasons[f.id] is not None)
+    return ordered if limit is None else ordered[:limit]
+
+
+async def health_finding_priorities(
+    session: AsyncSession, repository_id: str, findings: Sequence[HealthFinding]
+) -> dict[str, LowPriority | None]:
+    """Each finding's ``worth`` reason by id, measured over every open,
+    shown finding on its file: a list filtered by marker, severity or status
+    still tiers a function by its whole shape."""
+    paths = sorted({f.file_path for f in findings})
+    peers: list[HealthFinding] = []
+    for i in range(0, len(paths), _BATCH_SIZE):
+        q = select(HealthFinding).where(
+            HealthFinding.repository_id == repository_id,
+            HealthFinding.status == "open",
+            HealthFinding.file_path.in_(paths[i : i + _BATCH_SIZE]),
+            HealthFinding.biomarker_type.not_in(excluded_types()),
+        )
+        peers.extend((await session.execute(q)).scalars().all())
+    known = {f.id for f in peers}
+    # A finding outside the open set (resolved, acknowledged) is measured with it.
+    peers.extend(f for f in findings if f.id not in known)
+    reasons = dict(zip((f.id for f in peers), finding_priorities(peers), strict=True))
+    return {f.id: reasons[f.id] for f in findings}
 
 
 async def get_deduction_by_path(

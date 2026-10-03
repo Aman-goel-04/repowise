@@ -313,7 +313,24 @@ def _value(**facets) -> str:
     row = _perf("perf3_v", "src/db.py::fetch")
     row["details"] = {**row["details"], "facets": facets}
     item = _perf_queue(row).lead
-    return next(f.value for f in item.why_ranked if f.factor == "value")
+    return next(f.value for f in item.why_ranked if f.factor in ("value", "value within later"))
+
+
+def test_only_a_loop_known_to_grow_leads() -> None:
+    from repowise.core.analysis.health.worth import LOW_PRIORITY_LABEL
+    from tests.unit.health.fix_first_rows import _perf
+
+    def lead(**facets):
+        row = _perf("perf3_t", "src/db.py::fetch")
+        row["details"] = {**row["details"], "facets": facets}
+        return _perf_queue(row).lead
+
+    unknown = lead(loop_magnitude="unknown", exposure="entry_reachable")
+    assert unknown.tier == "later"
+    assert ("tier", LOW_PRIORITY_LABEL["unmeasured_cost"]) in [
+        (f.factor, f.value) for f in unknown.why_ranked
+    ]
+    assert lead(loop_magnitude="grows_with_data").tier != "later"
 
 
 def test_an_unknown_loop_no_entry_reaches_drops_a_step() -> None:
@@ -336,7 +353,9 @@ def _ranked(item, factor: str) -> str:
 def test_a_duplicate_inside_lifts_a_complexity_unit_one_step() -> None:
     plain = _queue([_finding()]).lead
     lifted = _queue([_finding()], plans=[_helper()]).lead
-    assert int(_ranked(lifted, "value")) == int(_ranked(plain, "value")) + 1
+    # CCN 14 is near the bar, so both are later; the lift still orders them.
+    value = "value within later"
+    assert int(_ranked(lifted, value)) == int(_ranked(plain, value)) + 1
     assert _ranked(lifted, "duplicate inside") == "yes"
     assert "duplicated" in lifted.why and "duplicated" not in plain.why
 
