@@ -49,13 +49,14 @@ need a back-compat re-export shim, surfaced as ``shim_required``.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any
 
 from repowise.core.analysis.execution_graph import is_reliable_call_edge
 
+from ....code_origin import is_migration_path, is_vendored_or_generated_path
 from ....test_paths import is_test_related_path
 from ...dead_code.file_reachability import BARREL_FILENAMES
 from .models import RefactoringContext, RefactoringSuggestion
@@ -115,18 +116,11 @@ _HIGH_CONFIDENCE_MODULARITY = 0.45
 def _is_generated_path(path: str) -> bool:
     """Generated / vendored / append-only code: a migration or a barrel
     re-export file must stay self-contained, so it is never a split target."""
-    p = path.lower().replace("\\", "/")
-    base = p.rsplit("/", 1)[-1]
     return (
-        "/migrations/" in p
-        or "/alembic/versions/" in p
-        or "/node_modules/" in p
-        or "/vendor/" in p
-        or "/__generated__/" in p
-        or ".generated." in base
-        or base.endswith(".min.js")
+        is_vendored_or_generated_path(path)
+        or is_migration_path(path)
         # Barrel / package-init re-export files: nothing of substance to split.
-        or base in BARREL_FILENAMES
+        or path.replace("\\", "/").rsplit("/", 1)[-1].lower() in BARREL_FILENAMES
     )
 
 
@@ -244,11 +238,22 @@ def _label_identifier(label: str) -> str:
     return "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in seg).strip("_")
 
 
+# Every C++ function in a project with a precompiled header calls into it, so
+# it wins the vote and names nothing; ``pch.cpp`` is also the file that builds it.
+_PRECOMPILED_HEADER_STEMS = frozenset({"pch", "stdafx", "precomp", "precompiled"})
+
+
 def _module_label(
     foreign_of: dict[str, set[str]], members: list[str], self_segments: set[str]
 ) -> str:
     """The group's most-called foreign module label as a file name, or ``""``."""
-    labels = Counter(lab for m in members for lab in foreign_of.get(m, set()))
+    labels = Counter(
+        lab
+        for m in members
+        for lab in foreign_of.get(m, set())
+        # "tpl, resources" is a two-area community label, not a module name.
+        if "," not in lab and _label_identifier(lab).lower() not in _PRECOMPILED_HEADER_STEMS
+    )
     if not labels:
         return ""
     best = min(labels, key=lambda lab: (-labels[lab], lab))
@@ -540,7 +545,7 @@ def _weighted_graph(
 
     # Signals are added strongest first (see module docstring).
     edges = _EdgeWeights(spine)
-    for a, b in signals.local_pairs:
+    for a, b in sorted(signals.local_pairs):
         edges.add(a, b, _DIRECT_CALL_WEIGHT)
     cochange_edges = _add_cochange_edges(edges, commits_of)
     _add_shared_helper_edges(edges, signals.callers_of)
@@ -617,7 +622,7 @@ class SplitFileDetector(RefactoringDetector):
     ) -> RefactoringSuggestion:
         groups = self._shape_groups(ctx, fg, partition.groups)
         residual = (
-            {"symbols": sorted(self._sym_name(fg.defined, m) for m in partition.residual)}
+            {"symbols": self._sym_names(fg.defined, partition.residual)}
             if partition.residual
             else None
         )
@@ -761,7 +766,7 @@ class SplitFileDetector(RefactoringDetector):
             groups.append(
                 {
                     "name": label or None,
-                    "symbols": sorted(self._sym_name(fg.defined, m) for m in members),
+                    "symbols": self._sym_names(fg.defined, members),
                     "suggested_file": suggested,
                 }
             )
@@ -792,6 +797,11 @@ class SplitFileDetector(RefactoringDetector):
     @staticmethod
     def _sym_name(defined: dict[str, dict], sid: str) -> str:
         return defined.get(sid, {}).get("name") or sid.rsplit("::", 1)[-1]
+
+    @classmethod
+    def _sym_names(cls, defined: dict[str, dict], sids: Iterable[str]) -> list[str]:
+        """Sorted bare names, each once: overloads are separate ids with one name."""
+        return sorted({cls._sym_name(defined, sid) for sid in sids})
 
     def _blast_radius(
         self, ctx: RefactoringContext, defined: dict[str, dict], *, shim_required: bool

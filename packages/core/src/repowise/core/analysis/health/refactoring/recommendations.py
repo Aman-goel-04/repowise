@@ -33,7 +33,8 @@ from repowise.core.analysis.test_reachability import (
     tests_reaching_by_tier,
 )
 from repowise.core.analysis.test_selection import expand_test_scopes
-from repowise.core.test_paths import is_test_related_path, is_test_support_path, paired_test_names
+from repowise.core.code_origin import ship_rank
+from repowise.core.test_paths import is_test_support_path, paired_test_names
 
 from .models import RefactoringSuggestion
 
@@ -528,6 +529,10 @@ def _commands(tests: list[str], files: list[str], *, total: int | None = None) -
     read as a complete validation run while silently skipping the rest, so the
     selection widens to the files those tests live in: bounded by file count
     rather than test count, and never narrower than the evidence.
+
+    An empty list means the plan has no command to suggest. Nothing here looks
+    at the repository's tooling, so a language other than Python or JS/TS gets
+    none in place of a guess that would fail when run.
     """
     if total is not None and total > len(tests):
         tests = sorted({test.split("::", 1)[0] for test in tests})
@@ -546,7 +551,7 @@ def _commands(tests: list[str], files: list[str], *, total: int | None = None) -
         return ["pytest"]
     if any(path.endswith((".ts", ".tsx", ".js", ".jsx")) for path in files):
         return ["npm test", "npm run type-check"]
-    return ["npm run test"]
+    return []
 
 
 def _line_ranges(suggestion: RefactoringSuggestion) -> dict[str, set[int] | None]:
@@ -858,11 +863,12 @@ def build_recommendations(
 
 
 def canonical_order(recommendations: Sequence[Recommendation]) -> list[Recommendation]:
-    """Rank order, production files first so a test plan never leads the list."""
+    """Rank order, production files first: a plan on a build script, a tool or
+    copied code comes after them, and a test plan last."""
     return sorted(
         recommendations,
         key=lambda recommendation: (
-            is_test_related_path(recommendation.suggestion.file_path),
+            ship_rank(recommendation.suggestion.file_path),
             -recommendation.rank_score,
             recommendation.suggestion.refactoring_type,
             recommendation.suggestion.file_path,

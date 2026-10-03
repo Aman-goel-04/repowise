@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from repowise.core.analysis.health.complexity.languages import NO_DIALECT_STATUS
 from repowise.core.git_refs import find_path_removal
 
 
@@ -37,6 +38,7 @@ def _unresolved_targets(
     excluded_paths: set[str],
     unscored_paths: set[str],
     repo_root: Any,
+    unanalysed_paths: set[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """Name every requested target that produced no rows, with a reason.
 
@@ -44,10 +46,18 @@ def _unresolved_targets(
     reason is actionable: ``not_indexed`` (run ``repowise update``),
     ``no_such_path`` (a typo), ``excluded`` (repo config), ``not_measured``
     (indexed, but no stored split for the ``counts`` reading; passed in so it
-    is not misreported as ``not_indexed``).
+    is not misreported as ``not_indexed``), ``language_not_supported`` (health
+    has no dialect for the file's language, so it carries no score).
     """
     out = [
-        {"target": t, **_miss_reason(t, excluded_paths, unscored_paths, repo_root)}
+        {
+            "target": t,
+            **(
+                {"reason": NO_DIALECT_STATUS}
+                if t in unanalysed_paths
+                else _miss_reason(t, excluded_paths, unscored_paths, repo_root)
+            ),
+        }
         for t in file_targets
         if t not in resolved_paths
     ]

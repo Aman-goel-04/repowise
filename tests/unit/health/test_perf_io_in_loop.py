@@ -23,6 +23,7 @@ from repowise.core.analysis.health.biomarkers.string_concat_in_loop import (
     StringConcatInLoopDetector,
 )
 from repowise.core.analysis.health.complexity import PerfHit, walk_file
+from repowise.core.analysis.health.perf.io_boundaries import collect_io_names
 from repowise.core.analysis.health.scoring import score_file
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "lang_samples"
@@ -367,6 +368,27 @@ def test_a_use_block_naming_two_io_modules_takes_the_first(use_block, expected):
     assert set(fc.io_boundary_names.values()) == {expected}
 
 
+class _FakeImportNode:
+    def __init__(self, node_type: str, text: bytes, children: list[_FakeImportNode] | None = None):
+        self.type = node_type
+        self.text = text
+        self.children = children or []
+
+
+def test_rust_local_use_paths_are_not_io_boundaries():
+    root = _FakeImportNode(
+        "source_file",
+        b"",
+        [
+            _FakeImportNode("use_declaration", b"use crate::request::Foo;"),
+            _FakeImportNode("use_declaration", b"use super::http::fetch;"),
+            _FakeImportNode("use_declaration", b"use self::fs::helper;"),
+        ],
+    )
+
+    assert collect_io_names(root, "rust") == {}
+
+
 def test_typescript_fixture_counts():
     fc = _walk("typescript/perf_io_in_loop.ts", "typescript")
     counts = _kinds(fc.perf_hits)
@@ -411,6 +433,16 @@ def test_detectors_only_consume_their_own_kind():
     assert len(IoInLoopDetector().detect(ctx)) == 1
     assert len(StringConcatInLoopDetector().detect(ctx)) == 1
     assert len(BlockingSyncInAsyncDetector().detect(ctx)) == 1
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [("src/render.ts", 1), ("src/__tests__/render.spec.ts", 0), ("tests/test_render.py", 0)],
+)
+def test_string_concat_not_reported_in_test_files(path, expected):
+    ctx = _ctx([PerfHit("string_concat_in_loop", 2, "f", "")])
+    ctx.file_path = path
+    assert len(StringConcatInLoopDetector().detect(ctx)) == expected
 
 
 def test_no_perf_hits_yields_no_findings():

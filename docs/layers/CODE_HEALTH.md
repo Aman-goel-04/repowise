@@ -42,9 +42,14 @@ this is not a linter.
 **`nested_complexity` — pure AST.** tree-sitter parses the file into a syntax
 tree. A walker descends it tracking control-flow depth, incrementing on each
 `if` / `for` / `while` / `try` / `switch` node. If any function reaches depth 4
-or more, the marker fires, and severity scales with the depth it reached. No
-heuristics about intent, no model, no sampling. The same commit produces the
-same finding forever.
+or more, the marker fires, and severity scales with the depth it reached. A
+function that is mostly one dispatch on one value (a `switch`, `match` or
+same-subject `if` chain holding at least 60% of its decision points) is judged
+by the code around that dispatch and its heaviest arm: `nested_complexity`
+does not count the two levels the `switch` and its `case` open, and
+`complex_method`, `brain_method` and `bumpy_road` read the CCN outside the
+dispatch plus the CCN of its most complex arm. No heuristics about intent, no model, no
+sampling. The same commit produces the same finding forever.
 
 **`io_in_loop` — AST plus call graph.** The walker finds a call inside a loop
 body and resolves the callee through the same resolver the dependency graph
@@ -509,8 +514,11 @@ churn, lock contention, serial awaits that could fan out, membership tests
 against lists, and language-specific shapes.
 
 Two markers use call-graph centrality as a *precision gate* rather than a sort
-key, firing only in hot functions (top-quintile in-degree, or in a churny
-hotspot file), which keeps a noisy shape reviewable.
+key, firing only in a repo's most-called functions (at least the 80th-percentile
+number of distinct direct callers, and never fewer than two), which keeps a
+noisy shape reviewable. That shows how widely a function is called, not that a
+request reaches it. The blocking-call marker is also skipped in tests, tooling,
+examples, and generated or vendored code.
 
 **Standard linters do not find this class of problem.** On a 12,600-file
 benchmark, clippy, ruff, ESLint and golangci-lint together found **0** of the
@@ -648,7 +656,7 @@ that is worth doing. Everything else is left out and counted in
 | Reason | What it leaves out |
 |---|---|
 | `test` | Test files. `scope=all` keeps them, labelled. |
-| `tooling` | Scripts, tools, benchmarks, build and CI files, migrations, and code under a directory whose role is unknown (docs, demos). |
+| `tooling` | Scripts, tools, benchmarks, CI files, migrations, code under a directory whose role is unknown (docs, demos), and build files by type wherever they sit (Gradle scripts, `CMakeLists.txt`, `*.cmake`, Makefiles, Bazel files, MSBuild `.props` / `.targets`, root `setup.py`, `noxfile.py`, crate-root `build.rs`, bundler configs). |
 | `generated` | Generated files. |
 | `vendored` | Third-party code: `vendor/`, `third_party/`, `node_modules/` and similar directories, minified files, and a library with its own license header among served assets. |
 | `docs_example` | Documentation code and examples: `docs/`, `docs_src/`, `examples/`, tutorials, samples. |
@@ -659,7 +667,7 @@ that is worth doing. Everything else is left out and counted in
 | `below_min_worth` | A refactoring that recovers under 0.5 health on its file, or has no steps; a string built in a loop that is bounded or not in production code. |
 | `history_only` | A file whose only findings come from git history (churn, ownership, co-change). History is context on an item, never the item. |
 | `deprecated` | A function marked deprecated. |
-| `inherent_dispatch` | A function where one dispatch on one value holds 60% or more of its decision points, unless a duplicate also sits in it. On the dev labels that share held 9 complexity rows, 8 of them rejected. |
+| `inherent_dispatch` | A function where one dispatch on one value holds 60% or more of its decision points, unless a duplicate also sits in it (then it is listed as `later`). On the dev labels that share held 9 complexity rows, 8 of them rejected. |
 | `small_function` | A complexity unit under 30 code lines and under CCN 15. On the 67 labelled dev rows that cut drops 13 rejected and 4 accepted. |
 | `no_concrete_step` | No first edit with a file and a line or a named group: a cycle with no import line to cut, a move with no destination, a split with no named groups, a class finding with no member groups. |
 | `low_value_kind` | A kind raters found not worth doing: Extract Class (0 of 14), Move Method (0 of 34), low cohesion (0 of 46), long method (0 of 10), and long parameter lists (0 of 2, thinly measured). |
@@ -673,6 +681,25 @@ loop that grows with the data shares the top band. Then tier: `now` (worth doing
 and the plan is safe to start), `next` (worth doing, the fix needs judgment),
 `later`. No kind takes more than 3 of the first 5 places while another has an item
 worth doing.
+
+**Lower priority.** A `later` item is real and stays listed, after every `now` and
+`next` item, with the reason it can wait as its tier reason. Code shape decides
+(`analysis/health/worth.py`, one rule for every default list); the hot-file bonus
+orders items but never lifts one out of `later`, and a later item's rank facts
+read "value within later" and its shape-only size. A function-size problem is
+`later` when the function is under CCN 40, 200 lines and nesting 6 (nesting under
+8 counts only in a function of 100 lines or more) and not both CCN 25 and nesting
+5; when one dispatch on one value holds 60% of its decisions; when its nesting is
+one else-if or ternary chain; or when it is long with CCN under 20 and nesting
+under 5, however long. Otherwise, from CCN 80, 400 lines or nesting 8 a
+function is worth doing whatever its branching. A complex condition and a single error site (a swallowed or broad
+catch, an unwrap or panic) are `later` too: each is a local fix. The same rule orders the
+default findings list (`get_health`, the REST findings list): findings worth doing
+first lead, and each other one carries `lower_priority`, the reason it can wait.
+Class-design findings (god class, low cohesion, long parameter lists) and findings
+that rest on git history alone are lower priority there. A performance
+opportunity carries `lower_priority` unless production code runs it over data
+that grows.
 
 **Verify.** Each item carries up to 5 tests from its stored validation profile,
 each with how it reaches the changed code (call graph, import graph, a matching
