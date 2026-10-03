@@ -36,7 +36,6 @@ another is generated after it.
 | 3 | `scc_page` | dependency cycle | structure |
 | 4 | `module_page` | subsystem in the concept tree | model, structure when keyless |
 | 6 | `repo_overview` | repository | model, structure when keyless |
-| 6 | `architecture_diagram` | repository | model, structure when keyless |
 | 7 | `infra_page` | infrastructure file (Dockerfile, CI, IaC) | structure |
 | 8 | `onboarding` | slot | model, structure when keyless |
 
@@ -45,9 +44,11 @@ Works, Active Landscape and Glossary. Project Overview is not generated
 separately, the repository overview is tagged into that slot, and Glossary is
 rendered from mined terms with no model in every run, keyed or not.
 
-`layer_page` was retired. Layers stopped being pages and became grouping rows in
-the docs tree, built from provenance stamped on their members. An inbound link
-to a retired layer page lands on the repository overview.
+Layers are grouping rows in the docs tree, built from provenance stamped on
+their members, not pages of their own. The repository overview carries the
+system map, a tiered diagram of who uses the system, the ways in, the server,
+the engine and the data store. Structure picks its boxes and arrows; a
+configured model only names them.
 
 ## Which pages exist
 
@@ -70,8 +71,8 @@ at all.
 
 ## What a model writes
 
-Four page types are model-written when a provider is configured: `module_page`,
-`repo_overview`, `architecture_diagram` and `onboarding`. That is the layer
+Three page types are model-written when a provider is configured: `module_page`,
+`repo_overview` and `onboarding`. That is the layer
 where prose earns its keep, the one that explains how the codebase fits together
 above the file level. Everything else is rendered from the parse, the import
 graph and git history, and no model ever sees it.
