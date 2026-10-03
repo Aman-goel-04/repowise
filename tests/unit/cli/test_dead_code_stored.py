@@ -87,10 +87,7 @@ def _json(root: Path, *args: str) -> list[dict]:
         dead_code_command, [str(root), "--format", "json", "--no-workspace", *args]
     )
     assert result.exit_code == 0, result.output
-    try:
-        return json.loads(result.output[result.output.index("[") :])
-    except json.JSONDecodeError as exc:
-        raise AssertionError(f"DEBUG_OUTPUT_REPR={result.output!r}") from exc
+    return json.loads(result.output[result.output.index("[") :])
 
 
 def test_default_flags_read_the_store_without_parsing(indexed_repo, monkeypatch):
