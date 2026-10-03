@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,8 @@ __all__ = ["STORED_SNIPPET_CHARS", "LanceDBVectorStore", "read_recorded_vector_d
 # state. A several-thousand-path generation level can otherwise commit
 # gigabytes before returning even though the selected result is small.
 _SUMMARY_PATH_BATCH_SIZE = 100
+
+logger = logging.getLogger(__name__)
 
 # LanceDB caches each table version's manifest (default cap 1 GiB), and every
 # manifest lists all fragments so far. Writes are batched below, but update runs
@@ -472,8 +475,20 @@ class LanceDBVectorStore(VectorStore):
         await self._ensure_connected()
         if self._table is None:
             return set()
-        rows = await self._table.query().select(["page_id"]).to_list()  # type: ignore[union-attr]
-        return {r["page_id"] for r in rows}
+
+        try:
+            rows = await self._table.query().select(["page_id"]).to_list()  # type: ignore[union-attr]
+            return {r["page_id"] for r in rows}
+        except Exception as exc:
+            logger.warning(
+                "Failed to read page IDs from LanceDB vector store at %s. "
+                "The vector store may be damaged. Repowise will regenerate "
+                "pages instead. Run 'repowise reindex' to rebuild the vector store. "
+                "Error: %s",
+                self._db_path,
+                exc,
+            )
+            return set()
 
     async def get_page_summary_by_path(self, path: str) -> dict | None:
         """Return {'summary': str, 'key_exports': list[str]} for a previously-indexed page, or None.
