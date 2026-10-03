@@ -59,6 +59,7 @@ function fakeDollar(mcp: (tool: string, args: Record<string, unknown>) => Promis
       blit: async () => ({}),
     },
     command: { register: async () => ({}) },
+    config: { list: async () => [] },
     settings: { read: async () => ({}) },
   };
   return { $, calls };
@@ -105,19 +106,38 @@ describe("/lens routing and tabs", () => {
     expect(d.calls.mcp).toEqual([]);
   });
 
-  it("a tab press switches the body: Map, then Ask with its field", async () => {
+  it("a tab press switches the body: Flow, Map, Ask, Recap; /lens ask opens the Ask tab", async () => {
     const d = await session();
     await lens(d, "recap");
     const tabs = buttonsOf(await pane(d));
-    expect(tabs.map((b) => [b.props.hotkey, b.props.label])).toEqual([["1", "Map"], ["2", "Ask"], ["3", "Recap"]]);
+    expect(tabs.map((b) => [b.props.hotkey, b.props.label])).toEqual([["1", "Flow"], ["2", "Map"], ["3", "Ask"], ["4", "Recap"]]);
     tabs[1]!.props.onPress();
+    expect(textOf(await pane(d))).toEqual(["Lens map needs the local server: repowise serve --no-ui"]);
+    tabs[2]!.props.onPress();
+    expect(flatten(await pane(d)).find((n) => n.el === "Input")?.props).toMatchObject({ key: "lens-ask", autoFocus: true });
+    tabs[0]!.props.onPress();
+    expect(flatten(await pane(d)).some((n) => n.props.key === "lens-flow")).toBe(true);
+    await lens(d, "ask");
     const ask = flatten(await pane(d)).find((n) => n.el === "Input");
     expect(ask?.props).toMatchObject({ key: "lens-ask", autoFocus: true });
-    tabs[0]!.props.onPress();
-    expect(textOf(await pane(d))).toEqual(["Lens map needs the local server: repowise serve --no-ui"]);
   });
 
-  it("/lens ask starts the lookup inside the command's own hook and shows the reply with its evidence", async () => {
+  it("a session starts on Flow; with lens_flow off it starts on the Map and Flow leaves the bar", async () => {
+    const d = await session();
+    expect(flatten(await pane(d)).some((n) => n.props.key === "lens-flow")).toBe(true);
+    ({ hooks, events } = await load({ lens_flow: false }));
+    expect(events).not.toContain("turn.step");
+    const off = await session();
+    const shown = await pane(off);
+    expect(buttonsOf(shown).map((b) => b.props.label)).toEqual(["Map", "Ask", "Recap"]);
+    expect(textOf(shown)).toEqual(["Lens map needs the local server: repowise serve --no-ui"]);
+    // A question shows in the Ask tab, with Flow on or off.
+    await lens(off, "ask why does Session merge environment settings?");
+    await settle();
+    expect(textOf(await pane(off)).at(-1)).toContain("**Built from the index** · basis archaeology");
+  });
+
+  it("/lens ask starts the lookup inside the command's own hook; the answer lands in the Ask tab, not in Flow", async () => {
     const d = await session();
     await lens(d, "ask why does Session merge environment settings?");
     // Started before the hook returned: approved as Lens's own call.
@@ -126,6 +146,8 @@ describe("/lens routing and tabs", () => {
     const md = textOf(await pane(d)).at(-1)!;
     expect(md).toContain("**Built from the index** · basis archaeology");
     expect(md).toContain("`ev_8964f795d9001bd297ca`");
+    buttonsOf(await pane(d))[0]!.props.onPress();
+    expect(textOf(await pane(d))).not.toContain("get_why");
   });
 });
 
@@ -192,6 +214,7 @@ describe("the Ask field", () => {
     await submit(d, "how?");
     await settle();
     expect(d.calls.mcp).toEqual([]);
+    await lens(d, "ask");
     expect(textOf(await pane(d)).at(-1)).toBe("Could not answer: repowise MCP server name not resolved yet");
   });
 

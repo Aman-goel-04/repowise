@@ -25,6 +25,10 @@ export interface FileContext {
   /** Files that import this one or call into it (the server's file-level rollup). */
   callerFiles: number | null;
   contributors: number | null;
+  /** The index marks the file a hotspot; null when it did not say. */
+  hotspot: boolean | null;
+  /** Who changed it most lately, and their share of its recent commits (0 to 1). */
+  recentOwner: { name: string; share: number } | null;
 }
 
 /** A Read, Edit or Write running on a file inside the indexed repo. */
@@ -121,7 +125,7 @@ export const initialSession: SessionState = {
   review: initialReview,
   lastReview: null,
   touched: [],
-  pane: { tab: "map", draft: "" },
+  pane: { tab: "flow", draft: "" },
   ask: { phase: "idle" },
   modelAsks: 0,
   compacted: false,
@@ -131,6 +135,16 @@ export function hintFor(mode: Mode, liteReason: LiteReason | undefined): HintKin
   if (mode === "full" || mode === "no-repo") return null;
   if (mode === "lite") return liteReason ?? "no-server";
   return mode;
+}
+
+/**
+ * After a `/clear`: what the index said stays (mode, freshness, hints, the repo,
+ * file cards) and so does the pane's tab; everything the old conversation did
+ * goes (its tools, notes, savings, review, touched files, Ask, compaction).
+ */
+export function clearedConversation(state: SessionState): SessionState {
+  const { mode, freshness, hint, hintsShown, repoRoot, contexts } = state;
+  return { ...initialSession, mode, freshness, hint, hintsShown, repoRoot, contexts, pane: { tab: state.pane.tab, draft: "" } };
 }
 
 export function reduce(state: SessionState, action: SessionAction): SessionState {
