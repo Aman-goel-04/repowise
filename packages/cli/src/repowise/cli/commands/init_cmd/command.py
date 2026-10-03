@@ -1431,6 +1431,9 @@ def init_command(
                         )
                     )
                 except ProviderError as exc:
+                    from repowise.cli.hints import maybe_hint
+
+                    maybe_hint("provider_fail")
                     raise reasoned_error(
                         f"Provider validation failed: {exc}",
                         reason="provider_validation_failed",
@@ -1562,6 +1565,9 @@ def init_command(
                 f"\n{mini(EYES_SLEEPY)} [{WARN}]Interrupted.[/] Indexed work so far has been "
                 "saved — run [bold]repowise init --resume[/] to continue where it stopped."
             )
+            from repowise.cli.hints import maybe_hint
+
+            maybe_hint("interrupt")
             return
 
     # What the run degraded on, in a place an agent can read after the
