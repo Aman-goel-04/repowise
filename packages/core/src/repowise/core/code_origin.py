@@ -7,8 +7,11 @@ under ``docs_src/`` or a vendored ``typeahead.jquery.js`` can carry a perfectly
 real finding that nobody should be asked to fix first.
 
 The answer is one of :data:`CODE_ORIGINS`, decided in precedence order, so a
-file has exactly one: ``generated`` beats ``vendored`` beats ``test`` beats
-``docs_example`` beats ``tooling``, and everything else is ``production``.
+file has exactly one: ``generated`` beats ``vendored`` beats ``build`` beats
+``test`` beats ``docs_example`` beats ``tooling``, and everything else is
+``production``. ``build`` is decided by the file's type (a Gradle script, a
+``CMakeLists.txt``, a bundler config), wherever it sits; :func:`is_build_file`
+answers it for a caller that needs only that.
 
 The generated-file banner rule is the one ingestion already applies before it
 indexes a file (:func:`is_generated_header`, moved here from the traverser so
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import re
 from functools import cache, lru_cache
+from itertools import pairwise
 from pathlib import PurePosixPath
 from typing import Literal
 
@@ -33,11 +37,17 @@ __all__ = [
     "CODE_ORIGINS",
     "CodeOrigin",
     "code_origin",
+    "is_build_file",
     "is_generated_header",
+    "is_migration_path",
     "is_vendored_or_generated_path",
+    "path_origin",
+    "ship_rank",
 ]
 
-CodeOrigin = Literal["production", "test", "vendored", "docs_example", "generated", "tooling"]
+CodeOrigin = Literal[
+    "production", "test", "vendored", "docs_example", "generated", "tooling", "build"
+]
 
 CODE_ORIGINS: tuple[CodeOrigin, ...] = (
     "production",
@@ -46,6 +56,7 @@ CODE_ORIGINS: tuple[CodeOrigin, ...] = (
     "docs_example",
     "generated",
     "tooling",
+    "build",
 )
 
 # --------------------------------------------------------------------------
@@ -302,6 +313,135 @@ def _third_party_header(header: str, project: str | None) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Build
+# --------------------------------------------------------------------------
+
+# Build files, by type: what a build tool reads to configure, compile, package
+# or run the project. A build tool loads each by its name, nothing imports one,
+# and none ships, in whatever directory it sits. Exact names, spelled as the
+# tool spells them (Bazel's ``BUILD`` is not a ``build`` script), by ecosystem.
+_BUILD_FILE_NAMES = frozenset(
+    {
+        # Gradle, Maven, sbt, Mill and their wrappers
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "gradlew",
+        "gradlew.bat",
+        "pom.xml",
+        "mvnw",
+        "mvnw.cmd",
+        "build.sbt",
+        "build.sc",
+        "build.mill",
+        # CMake, Make, Autotools, Meson, SCons, Premake, xmake, Zig, Just
+        "CMakeLists.txt",
+        "Makefile",
+        "makefile",
+        "GNUmakefile",
+        "Makefile.am",
+        "Makefile.in",
+        "configure.ac",
+        "configure.in",
+        "meson.build",
+        "meson_options.txt",
+        "meson.options",
+        "SConstruct",
+        "SConscript",
+        "premake4.lua",
+        "premake5.lua",
+        "xmake.lua",
+        "build.zig",
+        "Justfile",
+        "justfile",
+        # Bazel, Buck
+        "BUILD",
+        "BUILD.bazel",
+        "WORKSPACE",
+        "WORKSPACE.bazel",
+        "MODULE.bazel",
+        "BUCK",
+        # Cargo, SwiftPM, Mage, Mix, Leiningen, tools.build, Perl, Conan, nox
+        "Cargo.toml",
+        "Package.swift",
+        "magefile.go",
+        "mix.exs",
+        "project.clj",
+        "build.clj",
+        "Makefile.PL",
+        "Build.PL",
+        "conanfile.py",
+        "noxfile.py",
+        # Ruby and JS task runners
+        "Rakefile",
+        "Gruntfile.js",
+        "Gruntfile.coffee",
+    }
+)
+# Suffixes that only a build file carries: Gradle scripts and precompiled
+# script plugins, CMake modules, Make includes, Starlark, MSBuild imports
+# (``Directory.Build.props``), package specs.
+_BUILD_SUFFIXES = (
+    ".gradle",
+    ".gradle.kts",
+    ".cmake",
+    ".mk",
+    ".bzl",
+    ".props",
+    ".targets",
+    ".gemspec",
+    ".podspec",
+    # Cake (C# make): ``build.cake`` and its loaded ``*.cake`` scripts
+    ".cake",
+    ".rockspec",
+)
+# Bundler configs and gulp files, any extension a JS tool's config takes.
+_BUILD_NAME_RE = re.compile(
+    r"^(?:gulpfile|(?:webpack|vite|rollup|rolldown|rspack|esbuild|tsup)\.config(?:\.[\w-]+)*)"
+    r"\.[cm]?[jt]s$"
+)
+# Names a build tool reads only at the root: a nested ``setup.py`` is as often
+# a module (``homeassistant/setup.py`` sets up integrations).
+_BUILD_ROOT_NAMES = frozenset({"setup.py"})
+# Cargo runs ``build.rs`` from a crate root; directly in ``src/`` it is a
+# module (``mod build;``). A crate root can sit under ``src/`` too
+# (``src/bootstrap/build.rs`` in rust-lang/rust), so as a dead-code root every
+# ``build.rs`` not directly in ``src/`` counts: a module there is reached by
+# its ``mod`` edge anyway. As an origin, which hides code from fix lists, only
+# one with no ``src/`` above it counts (``cli/src/commands/build.rs`` is a
+# module).
+_CRATE_ROOT_NAMES = frozenset({"build.rs"})
+_SOURCE_DIR = "src"
+
+
+def _is_build_name(name: str, dirs: list[str], *, as_origin: bool = False) -> bool:
+    lowered = name.lower()
+    return (
+        name in _BUILD_FILE_NAMES
+        or lowered.endswith(_BUILD_SUFFIXES)
+        or bool(_BUILD_NAME_RE.match(lowered))
+        or (not dirs and name in _BUILD_ROOT_NAMES)
+        or (name in _CRATE_ROOT_NAMES and _at_crate_root(dirs, as_origin=as_origin))
+    )
+
+
+def _at_crate_root(dirs: list[str], *, as_origin: bool) -> bool:
+    return _SOURCE_DIR not in dirs if as_origin else dirs[-1:] != [_SOURCE_DIR]
+
+
+@lru_cache(maxsize=65536)
+def is_build_file(path: str) -> bool:
+    """Whether *path* is a build file: a build tool runs it, nothing imports it.
+
+    Decided by the file's type alone, so it holds under ``vendor/`` or a test
+    tree too. Dead code reads this as a root: such a file is never unreachable.
+    """
+    split = _split(path)
+    return split is not None and _is_build_name(split[1], split[2])
+
+
+# --------------------------------------------------------------------------
 # Docs, examples, tooling
 # --------------------------------------------------------------------------
 
@@ -326,10 +466,10 @@ def _is_docs_example(dirs: list[str]) -> bool:
     return any(d in _DOCS_ROOT_TOKENS for d in dirs) or bool(dirs and _is_example_dir(dirs[0]))
 
 
-# Close to ``perf/causal.py``'s tooling parts, with two differences: the
-# benchmark spellings ``bench`` / ``benches`` join ``benchmarks``, and there is
-# no ``/cli/`` rule, since a CLI's source ships and its findings are real work.
-# Migrations join too: they run once at deploy time and are append-only.
+# No ``/cli/`` rule: a CLI's source ships and its findings are real work (only
+# performance treats a CLI loop as off the request path, in
+# ``perf/causal.execution_context``). Migrations join: they run once at deploy
+# time and are append-only.
 _TOOLING_DIR_TOKENS = frozenset(
     {
         ".github",
@@ -350,12 +490,18 @@ _TOOLING_DIR_TOKENS = frozenset(
 _TOOLING_ROOT_DIRS = frozenset(
     {"buildsrc", "build-logic", "build-conventions", "build-tools", "build-tools-internal"}
 )
-_TOOLING_ROOT_NAMES = frozenset(
-    {"setup.py", "noxfile.py", "fabfile.py", "Rakefile", "Gruntfile.js"}
-)
+# Schema migrations: a ``migrations/`` directory (above), or adjacent
+# directories where neither name does alone. Rails keeps them in
+# ``db/migrate``, Alembic in ``alembic/versions``; a bare ``versions/`` is too
+# common (API versions) to class on its own. Ceiling: an Alembic script
+# directory with another name is recognised only by its sibling ``env.py``,
+# which a path-only classifier cannot see.
+_MIGRATION_DIR = "migrations"
+_MIGRATION_DIR_PAIRS = frozenset({("db", "migrate"), ("alembic", "versions")})
+_TOOLING_ROOT_NAMES = frozenset({"fabfile.py"})
+# Lint, test and transpiler configs. Bundler configs are build files (above).
 _TOOLING_NAME_RE = re.compile(
-    r"^(?:gulpfile|webpack\.config|vite\.config|rollup\.config|eslint\.config|"
-    r"jest\.config|vitest\.config|babel\.config|karma\.conf)\.[cm]?[jt]s$"
+    r"^(?:eslint\.config|jest\.config|vitest\.config|babel\.config|karma\.conf)\.[cm]?[jt]s$"
 )
 
 
@@ -402,11 +548,22 @@ def is_vendored_or_generated_path(path: str) -> bool:
     return _is_generated_path(name, dirs) or _is_vendored_path(name.lower(), dirs)
 
 
-def _is_tooling(normalized: str, name: str, dirs: list[str]) -> bool:
+def _is_migration_dir(dirs: list[str]) -> bool:
+    return _MIGRATION_DIR in dirs or any(pair in _MIGRATION_DIR_PAIRS for pair in pairwise(dirs))
+
+
+def is_migration_path(path: str) -> bool:
+    """Whether *path* is a schema migration: generated once, append-only, and
+    meant to stay self-contained, so no shared helper or split belongs in it."""
+    split = _split(path)
+    return split is not None and _is_migration_dir(split[2])
+
+
+def _is_tooling(name: str, dirs: list[str]) -> bool:
     return (
         any(d in _TOOLING_DIR_TOKENS for d in dirs)
         or bool(dirs and dirs[0] in _TOOLING_ROOT_DIRS)
-        or "/alembic/versions/" in f"/{normalized.lower()}"
+        or _is_migration_dir(dirs)
         or (not dirs and name in _TOOLING_ROOT_NAMES)
         or bool(_TOOLING_NAME_RE.match(name.lower()))
     )
@@ -448,14 +605,40 @@ def code_origin(
         and _third_party_header(header, project)
     ):
         return "vendored"
+    return _maintained_origin(normalized, name, dirs, is_test)
 
+
+def _maintained_origin(
+    normalized: str, name: str, dirs: list[str], is_test: bool | None
+) -> CodeOrigin:
+    """The origin of code this repository maintains: build, test, docs or
+    examples, tooling, or production, in that precedence."""
+    if _is_build_name(name, dirs, as_origin=True):
+        return "build"
     if is_test if is_test is not None else is_test_related_path(normalized):
         return "test"
-
     if _is_docs_example(dirs):
         return "docs_example"
-
-    if _is_tooling(normalized, name, dirs):
+    if _is_tooling(name, dirs):
         return "tooling"
-
     return "production"
+
+
+@lru_cache(maxsize=65536)
+def path_origin(path: str) -> CodeOrigin:
+    """:func:`code_origin` from the path alone, memoised.
+
+    For callers holding no file content and no stored origin. A caller holding
+    the stored ``code_origin`` reads that instead: it also saw the file's head.
+    """
+    return code_origin(path)
+
+
+def ship_rank(path: str) -> int:
+    """Sort key for ranked lists: product code 0, other non-test code 1, tests 2.
+
+    A build script, a tool or a copied library can carry a real finding, but it
+    never leads a list of things to fix ahead of the code that ships.
+    """
+    origin = path_origin(path)
+    return 0 if origin == "production" else 2 if origin == "test" else 1
