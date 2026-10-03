@@ -24,6 +24,7 @@ a caller holding a bare path gets the same answer.
 
 from __future__ import annotations
 
+import os
 import re
 from functools import cache, lru_cache
 from itertools import pairwise
@@ -492,12 +493,83 @@ def _is_tool_example(name: str, dirs: list[str]) -> bool:
     return _SOURCE_ROOT not in dirs[: dirs.index(example_dir)]
 
 
-def _is_docs_example(name: str, dirs: list[str]) -> bool:
+# A docs-named folder that is not plainly ``docs`` counts only with evidence:
+# a docs-site generator's config in it or one level down (Writerside keeps its
+# under ``Writerside/``). Without one it may be a shipped package.
+_DOCS_SITE_NAMES = frozenset({"doc", "documentation"})
+# ``documentation-website``, ``docs-site``: a suffixed name is as often a
+# service (``doc-service``, ``docs-api``), so it needs a generator-specific file.
+_DOCS_SITE_SUFFIXED_RE = re.compile(r"^(?:docs?|documentation)[-_.]")
+_DOCS_SITE_MARKERS = frozenset(
+    {
+        "writerside.cfg",
+        "mkdocs.yml",
+        "mkdocs.yaml",
+        "docusaurus.config.js",
+        "docusaurus.config.ts",
+        "docusaurus.config.mjs",
+        "book.toml",  # mdBook
+        "antora.yml",
+        "docfx.json",
+        ".vitepress",
+    }
+)
+# Generic config names that mean a docs site only beside the site's own files,
+# and only under a plain ``doc`` / ``documentation`` folder.
+_DOCS_SITE_PAIRED_MARKERS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("conf.py", frozenset({"index.rst", "index.md"})),  # Sphinx
+    ("_config.yml", frozenset({"_posts", "_layouts"})),  # Jekyll
+)
+
+
+def _has_docs_site_config(names: set[str], paired: bool) -> bool:
+    if names & _DOCS_SITE_MARKERS:
+        return True
+    return paired and any(
+        config in names and names & companions
+        for config, companions in _DOCS_SITE_PAIRED_MARKERS
+    )
+
+
+def _entry_names(folder: str) -> tuple[set[str], list[str]]:
+    """Lower-cased entry names in *folder*, and its subfolders' paths."""
+    try:
+        with os.scandir(folder) as entries:
+            listed = [(e.name.lower(), e.path, e.is_dir()) for e in entries]
+    except OSError:
+        return set(), []
+    return {name for name, _, _ in listed}, [path for _, path, is_dir in listed if is_dir]
+
+
+@lru_cache(maxsize=4096)
+def _is_docs_site(folder: str, paired: bool) -> bool:
+    """Whether *folder* (an absolute path) or a direct subfolder holds a
+    docs-site generator's config."""
+    names, subfolders = _entry_names(folder)
+    return _has_docs_site_config(names, paired) or any(
+        _has_docs_site_config(_entry_names(sub)[0], paired) for sub in subfolders
+    )
+
+
+def _is_docs_example(
+    normalized: str, dirs: list[str], repo_root: str | os.PathLike[str] | None
+) -> bool:
     # Anything under a docs root already counts, examples beneath it included.
-    return (
+    if (
         any(d in _DOCS_ROOT_TOKENS for d in dirs)
         or bool(dirs and _is_example_dir(dirs[0]))
-        or _is_tool_example(name, dirs)
+        or _is_tool_example(normalized, dirs)
+    ):
+        return True
+    if repo_root is None:
+        return False
+    parts = normalized.split("/")
+    return any(
+        (d in _DOCS_SITE_NAMES or _DOCS_SITE_SUFFIXED_RE.match(d))
+        and _is_docs_site(
+            os.path.join(os.fspath(repo_root), *parts[: i + 1]), d in _DOCS_SITE_NAMES
+        )
+        for i, d in enumerate(dirs)
     )
 
 
@@ -621,6 +693,7 @@ def code_origin(
     *,
     is_test: bool | None = None,
     project: str | None = None,
+    repo_root: str | os.PathLike[str] | None = None,
 ) -> CodeOrigin:
     """The one origin of the file at repo-relative *path*.
 
@@ -634,6 +707,10 @@ def code_origin(
 
     *project* is the repository's name, so its own release banner is not
     taken for someone else's.
+
+    *repo_root* lets a docs-named folder other than ``docs`` count as docs
+    when it holds a docs-site generator's config. ``None`` skips that check,
+    so such a folder stays production and only the path rules apply.
     """
     split = _split(path)
     if split is None:
@@ -651,11 +728,15 @@ def code_origin(
         and _third_party_header(header, project)
     ):
         return "vendored"
-    return _maintained_origin(normalized, name, dirs, is_test)
+    return _maintained_origin(normalized, name, dirs, is_test, repo_root)
 
 
 def _maintained_origin(
-    normalized: str, name: str, dirs: list[str], is_test: bool | None
+    normalized: str,
+    name: str,
+    dirs: list[str],
+    is_test: bool | None,
+    repo_root: str | os.PathLike[str] | None,
 ) -> CodeOrigin:
     """The origin of code this repository maintains: build, test, docs or
     examples, tooling, or production, in that precedence."""
@@ -663,7 +744,7 @@ def _maintained_origin(
         return "build"
     if is_test if is_test is not None else is_test_related_path(normalized):
         return "test"
-    if _is_docs_example(name, dirs):
+    if _is_docs_example(normalized, dirs, repo_root):
         return "docs_example"
     if _is_tooling(name, dirs):
         return "tooling"

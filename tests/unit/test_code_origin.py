@@ -480,3 +480,57 @@ def test_build_rs_under_src_is_a_dead_code_root_but_keeps_its_origin() -> None:
 )
 def test_deps_benchmarks_and_cargo_examples(path: str, expected: str) -> None:
     assert code_origin(path) == expected
+
+
+def _docs_site(tmp_path, folder: str, marker: str) -> None:
+    (tmp_path / folder).mkdir(parents=True)
+    (tmp_path / folder / marker).write_text("")
+
+
+def test_docs_named_folder_with_a_site_config_is_docs(tmp_path) -> None:
+    _docs_site(tmp_path, "documentation-website/Writerside", "writerside.cfg")
+    _docs_site(tmp_path, "doc", "mkdocs.yml")
+    _docs_site(tmp_path, "web/docs-site", "docusaurus.config.ts")
+    snippet = "documentation-website/Writerside/snippets/dao/src/main/kotlin/Tables.kt"
+    assert code_origin(snippet, repo_root=tmp_path) == "docs_example"
+    assert code_origin("doc/gen.go", repo_root=tmp_path) == "docs_example"
+    assert code_origin("web/docs-site/src/a.ts", repo_root=tmp_path) == "docs_example"
+    # Without the repository root only the path rules apply.
+    assert code_origin(snippet) == "production"
+
+
+def test_docs_named_package_without_a_site_config_stays_production(tmp_path) -> None:
+    (tmp_path / "doc").mkdir()
+    (tmp_path / "doc" / "man_docs.go").write_text("package doc\n")
+    (tmp_path / "documentation" / "api").mkdir(parents=True)
+    (tmp_path / "documentation" / "api" / "handlers.go").write_text("")
+    _docs_site(tmp_path, "doctor", "mkdocs.yml")  # not a docs name
+    assert code_origin("doc/man_docs.go", repo_root=tmp_path) == "production"
+    assert code_origin("documentation/api/handlers.go", repo_root=tmp_path) == "production"
+    assert code_origin("doctor/check.py", repo_root=tmp_path) == "production"
+
+
+@pytest.mark.parametrize(
+    ("folder", "files", "path"),
+    [
+        ("doc-service/src", ("conf.py", "index.md"), "doc-service/src/conf.py"),
+        ("doc_utils", ("conf.py", "index.rst"), "doc_utils/conf.py"),
+        ("docs-api/app", ("conf.py", "_config.yml", "index.md"), "docs-api/app/conf.py"),
+        ("doc", ("conf.py",), "doc/conf.py"),  # Sphinx needs its index beside conf.py
+        ("doc", ("_config.yml",), "doc/site.py"),  # Jekyll needs _posts or _layouts
+    ],
+)
+def test_generic_config_names_are_not_docs_site_evidence(tmp_path, folder, files, path) -> None:
+    (tmp_path / folder).mkdir(parents=True)
+    for name in files:
+        (tmp_path / folder / name).write_text("")
+    assert code_origin(path, repo_root=tmp_path) == "production"
+
+
+def test_sphinx_and_jekyll_count_under_a_plain_doc_folder(tmp_path) -> None:
+    _docs_site(tmp_path, "doc/source", "conf.py")
+    (tmp_path / "doc" / "source" / "index.rst").write_text("")
+    _docs_site(tmp_path, "documentation", "_config.yml")
+    (tmp_path / "documentation" / "_layouts").mkdir()
+    assert code_origin("doc/source/ext/roles.py", repo_root=tmp_path) == "docs_example"
+    assert code_origin("documentation/plugins/x.rb", repo_root=tmp_path) == "docs_example"
