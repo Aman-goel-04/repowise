@@ -160,6 +160,7 @@ def _find_extractions_reference(analysis, lmap):
         Extraction,
         _all_blocks,
         _declared_before_read,
+        _exit_macros,
         _function_lines,
         _infer_in_out,
     _loop_carry_free,
@@ -189,7 +190,13 @@ def _find_extractions_reference(analysis, lmap):
         | lmap.catch_kinds
         | lmap.boolean_operator_kinds
     )
-    jump_kinds = lmap.return_kinds | lmap.raise_kinds | lmap.break_kinds | lmap.continue_kinds
+    jump_kinds = (
+        lmap.return_kinds
+        | lmap.raise_kinds
+        | lmap.break_kinds
+        | lmap.continue_kinds
+        | lmap.yield_kinds
+    )
     scope_kinds = lmap.function_kinds | lmap.lambda_kinds
     tail_stmt_kinds = (
         lmap.statement_wrapper_kinds | lmap.local_decl_kinds
@@ -220,7 +227,9 @@ def _find_extractions_reference(analysis, lmap):
                 ):
                     continue
                 span = stmts[i : j + 1]
-                decisions, has_jump = _span_metrics(span, decision_kinds, jump_kinds, scope_kinds)
+                decisions, has_jump = _span_metrics(
+                    span, decision_kinds, jump_kinds, scope_kinds, _exit_macros(lmap)
+                )
                 if has_jump or decisions < _MIN_CCN_REMOVED:
                     continue
                 slice_nloc = _stmts_nloc(span, lines)
