@@ -53,7 +53,7 @@ from .constants import (
     never_flag_path,
 )
 from .contract_methods import is_com_method_implementation, is_contract_method
-from .csharp_reachability import build_csharp_named_files
+from .csharp_reachability import build_csharp_named_files, build_csharp_named_types
 from .dynamic_markers import (
     find_dynamic_edge_files,
     find_dynamic_import_files,
@@ -61,6 +61,7 @@ from .dynamic_markers import (
 )
 from .entry_shape import clamp_entry_shaped, drop_program_entries, is_program
 from .file_reachability import (
+    CSHARP_SUFFIX,
     PackageFileMap,
     ReachabilityRescues,
     build_package_file_map,
@@ -75,9 +76,11 @@ from .name_occurrences import (
     clamp_named_types,
     clamp_path_mentions,
     clamp_unverified_absence,
+    demote_used_in_own_file,
     drop_internals_used_in_own_file,
     drop_reference_assembly_api,
 )
+from .published_api import BuildFacts, demote_published_api
 from .risk_factors import (
     NO_GIT_SIGNAL_CONFIDENCE,
     RISK_CAP_CONFIDENCE,
@@ -809,6 +812,23 @@ def _nested_class_used(node_data: dict, sym: dict) -> bool:
     return f"{parent}.{name}" in (node_data.get("local_refs") or ())
 
 
+def _csharp_exports(findings: list[DeadCodeFindingData]) -> list[DeadCodeFindingData]:
+    """The unused-export findings in ``.cs`` files."""
+    return [
+        f
+        for f in findings
+        if f.kind is DeadCodeKind.UNUSED_EXPORT and f.file_path.endswith(CSHARP_SUFFIX)
+    ]
+
+
+def _names_by_file(findings: list[DeadCodeFindingData]) -> dict[str, set[str]]:
+    """File -> the symbol names *findings* report there."""
+    out: dict[str, set[str]] = {}
+    for f in findings:
+        out.setdefault(f.file_path, set()).add(f.symbol_name or "")
+    return out
+
+
 def _symbol_span(data: dict) -> dict[str, int | None]:
     """``lines``/``start_line``/``end_line`` for a symbol finding.
 
@@ -971,8 +991,10 @@ class DeadCodeAnalyzer:
             if on_step:
                 on_step("zombie_packages")
 
-        # First: a C/C++ name written outside its declaration is a use, which
-        # settles the finding before any clamp re-scores it.
+        # First: a C# type another file in its scope names is used, and a
+        # C/C++ name written outside its declaration is a use. Both settle the
+        # finding before any clamp re-scores it.
+        findings = self._drop_csharp_named_exports(findings)
         findings = drop_preprocessed_named_elsewhere(
             findings,
             self._source_map,
@@ -1004,6 +1026,12 @@ class DeadCodeAnalyzer:
             findings, self._source_map, self._public_top_level_names(findings)
         )
 
+        findings = demote_published_api(
+            findings,
+            self._published_api_languages(findings, type_names),
+            BuildFacts(repo_root=self._repo_root, dotnet_index=self._dotnet_index),
+        )
+
         min_conf = cfg.get("min_confidence", RISK_CAP_CONFIDENCE)
         hidden_below_threshold = sum(1 for f in findings if f.confidence < min_conf)
         findings = [f for f in findings if f.confidence >= min_conf]
@@ -1011,6 +1039,51 @@ class DeadCodeAnalyzer:
         return DeadCodeReport.from_findings(
             findings, hidden_below_threshold=hidden_below_threshold
         )
+
+    def _drop_csharp_named_exports(
+        self, findings: list[DeadCodeFindingData]
+    ) -> list[DeadCodeFindingData]:
+        """Drop C# unused exports whose type a file that can see it names.
+
+        The symbol-level counterpart of the file rescue in
+        :func:`build_csharp_named_files`: a C# type is used from its own
+        namespace with no import, so "no importer" says nothing about it. A
+        project-scoped name is the same evidence the file pass drops on. One
+        its own file uses is capped below the floor instead (see
+        :func:`demote_used_in_own_file`). Returns a new list.
+        """
+        exports = _csharp_exports(findings)
+        if not exports:
+            return findings
+        named = build_csharp_named_types(
+            self.graph,
+            self._source_map,
+            _names_by_file(exports),
+            dotnet_index=self._dotnet_index,
+            repo_root=self._repo_root,
+        )
+        dropped = {id(f) for f in exports if (f.file_path, f.symbol_name) in named}
+        demote_used_in_own_file([f for f in exports if id(f) not in dropped], self._source_map)
+        return [f for f in findings if id(f) not in dropped]
+
+    def _published_api_languages(
+        self, findings: list[DeadCodeFindingData], type_names: dict[str, frozenset[str]]
+    ) -> dict[str, str]:
+        """Language of each file whose finding is about public API.
+
+        Every unused export is; an unreachable file only when it declares a
+        public type (*type_names*).
+        """
+        files = {
+            f.file_path
+            for f in findings
+            if f.kind is DeadCodeKind.UNUSED_EXPORT or type_names.get(f.file_path)
+        }
+        return {
+            path: self.graph.nodes[path].get("language", "")
+            for path in files
+            if self.graph.has_node(path)
+        }
 
     # ------------------------------------------------------------------
     # Detection methods
