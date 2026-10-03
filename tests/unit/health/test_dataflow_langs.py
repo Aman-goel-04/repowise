@@ -1650,3 +1650,169 @@ def test_a_local_declared_and_read_on_one_line_in_the_span_is_not_a_parameter():
     assert extractions, "expected the second loop as an extraction"
     assert all("t" not in x.params for x in extractions)
     assert (("a", "n"), ("total",)) in [(x.params, x.returns) for x in extractions]
+
+
+# == Reads inside nested closures ===============================================
+
+
+def _covering(fn, lmap, first: int, last: int):
+    return [e for e in find_extractions(fn, lmap) if e.start_line <= first and e.end_line >= last]
+
+
+def test_go_closure_read_of_a_parameter_makes_it_a_param():
+    # ``ps`` is read only inside the func literal; the span still needs it.
+    src = """
+        package main
+
+        func load(m *Map, ps *Page) []int {
+            key := ps.Path()
+            if key == "/" {
+                key = ""
+            }
+            v, err := m.cache.GetOrCreate(key, func(string) ([]int, error) {
+                res := m.find(ps)
+                if len(res) > 2 {
+                    res = res[:2]
+                }
+                return res, nil
+            })
+            if err != nil {
+                panic(err)
+            }
+            m.count++
+            m.last = key
+            m.seen = true
+            return v
+        }
+        """
+    lmap = get_language_map("go")
+    spans = _covering(_first("go", src), lmap, 9, 18)
+    assert spans
+    assert all("ps" in e.params for e in spans)
+
+
+def test_ts_closure_read_after_the_span_makes_a_return():
+    # ``seen`` is read after the span only inside the arrow function.
+    src = """
+        function prune(messages: Msg[], limit: number): Msg[] {
+            const seen = new Set<string>()
+            for (const msg of messages) {
+                if (msg.id && msg.size < limit) {
+                    seen.add(msg.id)
+                }
+            }
+            log(messages.length)
+            log(limit)
+            log(seen.size)
+            return messages.filter((m) => seen.has(m.parent))
+        }
+        """
+    lmap = get_language_map("typescript")
+    spans = _covering(_first("typescript", src), lmap, 3, 8)
+    assert spans
+    assert all("seen" in e.returns for e in spans)
+
+
+def test_ts_closure_parameter_is_not_a_read_of_the_outer_name():
+    src = """
+        function scale(items: number[], x: number): number[] {
+            let out: number[] = []
+            if (x > 1) {
+                out = items.map((x) => x * 2)
+                out.push(0)
+            } else {
+                out = items.slice()
+            }
+            log(out.length)
+            log(items.length)
+            log(out.length)
+            return out
+        }
+        """
+    lmap = get_language_map("typescript")
+    spans = _covering(_first("typescript", src), lmap, 4, 9)
+    assert spans
+    assert all("x" in e.params for e in spans)  # the condition reads the outer x
+    fn = _first("typescript", src)
+    captured = {u.name for u in fn.def_use.captured}
+    assert "x" not in captured and "items" not in captured
+
+
+@pytest.mark.parametrize(
+    ("language", "src", "captured", "not_captured"),
+    [
+        (
+            "python",
+            """
+            def f(rows, k):
+                total = 0
+                def inner(v):
+                    return v + total + k
+                return list(map(lambda total: total * 2, rows)), inner
+            """,
+            {"total", "k"},
+            {"v", "inner"},
+        ),
+        (
+            "java",
+            """
+            class A {
+                int f(java.util.List<Integer> rows, int k) {
+                    int total = 1;
+                    rows.forEach(v -> System.out.println(v + total + k));
+                    return total;
+                }
+            }
+            """,
+            {"total", "k"},
+            {"v"},
+        ),
+        (
+            "rust",
+            """
+            fn f(rows: Vec<i32>, k: i32) -> i32 {
+                let total = 1;
+                let s: i32 = rows.iter().map(|v| v + total + k).sum();
+                s
+            }
+            """,
+            {"total", "k"},
+            {"v"},
+        ),
+        (
+            "typescript",
+            """
+            function f(rows: number[], k: number) {
+                const total = 1
+                return rows.map((v) => rows.filter((w) => w + v + total > k))
+            }
+            """,
+            {"total", "k", "rows"},
+            {"v", "w"},
+        ),
+    ],
+)
+def test_closure_reads_are_captured_per_language(language, src, captured, not_captured):
+    fn = _first(language, src)
+    names = {u.name for u in fn.def_use.captured}
+    assert captured <= names
+    assert not (not_captured & names)
+
+
+def test_a_closure_local_shadowing_an_outer_name_is_not_a_capture():
+    src = """
+        function f(items: number[], t: number): number[] {
+            let t2 = 0
+            if (t > 1) {
+                t2 = t * 3
+                log(t2)
+            }
+            log(t)
+            return items.map((v) => {
+                const t2 = v * 2
+                return t2 + t
+            })
+        }
+        """
+    fn = _first("typescript", src)
+    assert "t2" not in {u.name for u in fn.def_use.captured}
