@@ -3448,6 +3448,17 @@ export interface WorkspaceCoChangesResponse {
   truncated_by?: "total" | "per_repo_pair" | null;
 }
 
+export interface WorkspaceCodeApiCoverage {
+  manifests?: number;
+  published?: number;
+  unsupported_ecosystem?: number;
+  providers?: number;
+  consumers?: number;
+  linked_providers?: number;
+  published_ratio?: number | null;
+  linked_ratio?: number | null;
+}
+
 export interface WorkspaceConformanceResponse {
   version?: number;
   generated_at?: string | null;
@@ -3570,6 +3581,10 @@ export interface WorkspaceExtractionDiagnostics {
   consumers_by_layer?: Record<string, number>;
   http_consumers_unresolved?: number;
   http_consumer_coverage?: number | null;
+  symbol_identity?: Record<string, WorkspaceSymbolIdentity>;
+  schema_coverage?: WorkspaceSchemaCoverage;
+  code_api?: WorkspaceCodeApiCoverage;
+  openapi?: WorkspaceOpenApiCoverage;
 }
 
 export interface WorkspaceGraphEdge {
@@ -3624,6 +3639,19 @@ export interface WorkspaceNodeArchitectureRole {
   visibility_fan_in?: number;
   visibility_fan_out?: number;
   role?: string;
+}
+
+export interface WorkspaceOpenApiCoverage {
+  documents?: number;
+  parsed_documents?: number;
+  unresolved_documents?: number;
+  operations?: number;
+  providers?: number;
+  schemas_merged?: number;
+  spec_only_providers?: number;
+  request_states?: Record<string, number>;
+  response_states?: Record<string, number>;
+  refusal_reasons?: Record<string, number>;
 }
 
 export interface WorkspaceOrphanProvider {
@@ -3685,6 +3713,26 @@ export interface WorkspaceResponse {
   default_repo?: string | null;
   cross_repo_summary?: WorkspaceCrossRepoSummary | null;
   contract_summary?: WorkspaceContractSummary | null;
+}
+
+export interface WorkspaceSchemaCoverage {
+  total?: number;
+  bound?: number;
+  recovered?: number;
+  shared_symbol?: number;
+  unsupported_language?: number;
+  non_callable?: number;
+  eligible?: number;
+  recovered_ratio?: number | null;
+  recovered_ratio_eligible?: number | null;
+}
+
+export interface WorkspaceSymbolIdentity {
+  total?: number;
+  bound?: number;
+  unindexed_file?: number;
+  bound_ratio?: number | null;
+  bound_ratio_indexed?: number | null;
 }
 
 export interface WorkspaceSyncResponse {
