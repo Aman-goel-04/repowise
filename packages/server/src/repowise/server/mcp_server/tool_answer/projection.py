@@ -328,8 +328,8 @@ def _default_shape(payload: dict[str, Any], question: str) -> None:
 
 
 def _record_reductions(
-    payload: dict[str, Any], totals: dict[str, int], *, question: str, scope: str | None,
-    repo: str | None, expanded: bool
+    payload: dict[str, Any], totals: dict[str, int], *, scope: str | None, repo: str | None,
+    expanded: bool
 ) -> None:
     reduced = False
     for key in _COLLECTIONS:
@@ -344,12 +344,19 @@ def _record_reductions(
         reduced = True
     if reduced and not expanded:
         projection = payload.setdefault("_meta", {}).setdefault("projection", {})
-        arguments: dict[str, Any] = {"question": question, "include": ["evidence"]}
+        # The caller already holds the question; restating a long one costs
+        # tokens on every reduced reply. Short scope and repo stay, so a caller
+        # that rebuilds the call from this block cannot widen it silently.
+        arguments: dict[str, Any] = {"include": ["evidence"]}
         if scope is not None:
             arguments["scope"] = scope
         if repo is not None:
             arguments["repo"] = repo
-        projection["recovery"] = {"tool": "get_answer", "arguments": arguments}
+        projection["recovery"] = {
+            "tool": "get_answer",
+            "same_arguments": True,
+            "arguments": arguments,
+        }
 
 
 def project_answer_payload(
@@ -370,9 +377,7 @@ def project_answer_payload(
     for key in _COLLECTIONS:
         if not payload.get(key):
             payload.pop(key, None)
-    _record_reductions(
-        payload, totals, question=question, scope=scope, repo=repo, expanded=expanded
-    )
+    _record_reductions(payload, totals, scope=scope, repo=repo, expanded=expanded)
     unknown = sorted(set(include or []) - {"evidence"})
     if unknown:
         payload.setdefault("_meta", {})["ignored_arguments"] = {"include": unknown}
