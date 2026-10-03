@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from ....analysis.health.perf.coverage import PerfCoverage
 
 from ....analysis.finding_registry import excluded_types
+from ....analysis.health.complexity.languages import has_health_dialect
 from ....analysis.health.finding_identity import (
     finding_public_id,
     legacy_finding_public_id,
@@ -30,9 +31,9 @@ from ....analysis.health.ranking import (
     sort_metrics_worst_first,
     worst_metric,
 )
-from ....analysis.health.rows import detail_map, split_tests
+from ....analysis.health.rows import detail_map, split_tests, split_unscored
 from ....analysis.health.scope import scores_language
-from ....analysis.health.scoring import ADVISORY_DIMENSION, nloc_weighted_attr
+from ....analysis.health.scoring import ADVISORY_DIMENSION, SCORE_FIELDS, nloc_weighted_attr
 from ....test_paths import is_test_related_path
 from ...models import (
     DocDriftFinding,
@@ -205,13 +206,18 @@ async def replace_governance_findings(
     await _insert_keeping_triage(session, repository_id, findings, scope)
 
 
+def _opt(cast: Any, value: Any) -> Any:
+    """*value* through *cast*, keeping ``None`` (a file health never walked)."""
+    return None if value is None else cast(value)
+
+
 def _health_metric_row_data(metric: Any) -> dict:
     """One metric dataclass as column values. Both writers go through here."""
     return {
         "file_path": metric.file_path,
-        "score": float(metric.score),
-        "max_ccn": int(metric.max_ccn),
-        "max_nesting": int(metric.max_nesting),
+        "score": _opt(float, metric.score),
+        "max_ccn": _opt(int, metric.max_ccn),
+        "max_nesting": _opt(int, metric.max_nesting),
         "nloc": int(metric.nloc),
         "duplication_pct": metric.duplication_pct,
         "has_test_file": bool(metric.has_test_file),
@@ -340,6 +346,34 @@ async def prune_unscored_health_rows(session: AsyncSession, repository_id: str) 
                 removed += 1
         await session.flush()
     return removed
+
+
+async def clear_unanalysed_scores(session: AsyncSession, repository_id: str) -> int:
+    """Drop the numbers stored for files in a language health has no dialect for.
+
+    A store written before such files were left unscored holds a 10.0 and a
+    max_ccn of 1 for each, which every average would keep counting until a full
+    rescore. The answer comes from the language alone, so an update fixes it in
+    place, git history or not. Files with no graph node are left alone, as in
+    ``prune_unscored_health_rows``. Returns the number of rows cleared.
+    """
+    languages = await get_file_language_map(session, repository_id)
+    paths = [p for p, lang in languages.items() if lang and not has_health_dialect(lang)]
+    cleared = 0
+    for i in range(0, len(paths), _BATCH_SIZE):
+        rows = await session.execute(
+            select(HealthFileMetric).where(
+                HealthFileMetric.repository_id == repository_id,
+                HealthFileMetric.file_path.in_(paths[i : i + _BATCH_SIZE]),
+                HealthFileMetric.score.is_not(None),
+            )
+        )
+        for row in rows.scalars().all():
+            for name in (*SCORE_FIELDS, "max_ccn", "max_nesting"):
+                setattr(row, name, None)
+            cleared += 1
+    await session.flush()
+    return cleared
 
 
 async def backfill_module_attribution(
@@ -617,14 +651,9 @@ async def get_average_health(session: AsyncSession, repository_id: str) -> float
         ),
         await _health_exclude_spec(session, repository_id),
     )
-    if not rows:
-        return None
-    total_nloc = sum(max(r.nloc, 1) for r in rows)
-    if total_nloc:
-        avg = sum(r.score * max(r.nloc, 1) for r in rows) / total_nloc
-    else:
-        avg = sum(r.score for r in rows) / len(rows)
-    return round(avg, 2)
+    # Files with no score (no health dialect for their language) are skipped,
+    # so a repository of nothing else reads unmeasured, never 10.0.
+    return _rounded(nloc_weighted_attr(rows, "score"))
 
 
 async def get_file_language_map(session: AsyncSession, repository_id: str) -> dict[str, str]:
@@ -675,10 +704,14 @@ async def get_health_summary(
     """
     if metrics is None:
         metrics = await get_health_metrics(session, repository_id)
+    # A file in a language health has no dialect for is stored unscored. It is
+    # counted apart and left out of every figure below.
+    metrics, unanalysed = split_unscored(metrics)
     if not metrics:
         return {
             "file_count": 0,
-            "average_health": 10.0,
+            "unanalysed_file_count": unanalysed,
+            "average_health": None if unanalysed else 10.0,
             "worst_performer_path": None,
             "worst_performer_score": None,
             "worst_test_path": None,
@@ -699,42 +732,14 @@ async def get_health_summary(
             "worst_performance_path": None,
             "worst_performance_score": None,
         }
-    total_nloc = sum(max(m.nloc, 1) for m in metrics)
-    if total_nloc:
-        avg = sum(m.score * max(m.nloc, 1) for m in metrics) / total_nloc
-    else:
-        avg = sum(m.score for m in metrics) / len(metrics)
+    avg = nloc_weighted_attr(metrics, "score")
 
-    # Maintainability headline: NLOC-weighted average over the per-file
-    # maintainability scores (skipping rows that predate the split / lack one).
-    # ``None`` when no row carries a maintainability score so the surface reads
-    # "not measured" rather than a misleading 10.0.
-    maint_scored = [m for m in metrics if getattr(m, "maintainability_score", None) is not None]
-    maintainability_average: float | None = None
-    if maint_scored:
-        maint_nloc = sum(max(m.nloc, 1) for m in maint_scored)
-        if maint_nloc:
-            maintainability_average = (
-                sum(m.maintainability_score * max(m.nloc, 1) for m in maint_scored) / maint_nloc
-            )
-        else:
-            maintainability_average = sum(m.maintainability_score for m in maint_scored) / len(
-                maint_scored
-            )
-
-    # Performance headline: same NLOC-weighted average over the per-file
-    # performance scores (static performance RISK). ``None`` when no row carries
-    # a performance score so the surface reads "not measured" rather than 10.0.
+    # The two co-surfaced pillars: the same NLOC weighting over their own
+    # columns, ``None`` when no row carries one so a surface reads "not
+    # measured" rather than a misleading 10.0.
+    maintainability_average = nloc_weighted_attr(metrics, "maintainability_score")
+    performance_average = nloc_weighted_attr(metrics, "performance_score")
     perf_scored = [m for m in metrics if getattr(m, "performance_score", None) is not None]
-    performance_average: float | None = None
-    if perf_scored:
-        perf_nloc = sum(max(m.nloc, 1) for m in perf_scored)
-        if perf_nloc:
-            performance_average = (
-                sum(m.performance_score * max(m.nloc, 1) for m in perf_scored) / perf_nloc
-            )
-        else:
-            performance_average = sum(m.performance_score for m in perf_scored) / len(perf_scored)
 
     # Worst-performance file: the lowest per-file performance score, surfaced only
     # when there is genuine risk (score < 10) so a clean repo shows no actionable
@@ -782,7 +787,8 @@ async def get_health_summary(
         )
     return {
         "file_count": len(metrics),
-        "average_health": round(avg, 2),
+        "unanalysed_file_count": unanalysed,
+        "average_health": _rounded(avg),
         "worst_performer_path": worst.file_path,
         "worst_performer_score": round(worst.score, 2),
         "worst_test_path": worst_test.file_path if worst_test is not None else None,
