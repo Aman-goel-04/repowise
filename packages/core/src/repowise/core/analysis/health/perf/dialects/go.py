@@ -82,6 +82,7 @@ GO_REGEX_COMPILE: frozenset[str] = frozenset(
     {"MustCompile", "Compile", "MustCompilePOSIX", "CompilePOSIX"}
 )
 _GO_STRING_KINDS: frozenset[str] = frozenset({"interpreted_string_literal", "raw_string_literal"})
+_GO_LOOP_KINDS: frozenset[str] = frozenset({"for_statement"})
 
 # Heavy connection / client constructors, keyed ``(package, func)``. Opening one
 # per ``for ... range`` iteration is the connection-churn anti-pattern.
@@ -98,6 +99,18 @@ GO_RESOURCE_CTORS: frozenset[tuple[str, str]] = frozenset(
 )
 # ``sync.Mutex`` / ``sync.RWMutex`` acquisition (the contention side only).
 GO_LOCK_METHODS: frozenset[str] = frozenset({"Lock", "RLock"})
+# ``slices.Chunk`` (Go 1.23) and hand-rolled peers, matched on the call's
+# rightmost name so a local helper (``Batch(xs, n)``) counts too.
+GO_CHUNK_CALLS: frozenset[str] = frozenset({"Chunk", "chunk", "Batch", "batch", "Chunks", "chunks"})
+
+
+def _single_identifier(node: Node | None) -> bytes | None:
+    if node is None:
+        return None
+    targets = node.named_children if node.type == "expression_list" else [node]
+    if len(targets) != 1 or targets[0].type != "identifier":
+        return None
+    return targets[0].text
 
 
 class GoPerfDialect(BasePerfDialect):
@@ -118,6 +131,9 @@ class GoPerfDialect(BasePerfDialect):
             "goroutine_in_unbounded_loop",
         }
     )
+    # ``exec.Command`` only builds a Cmd; the process runs at ``Run`` / ``Output``
+    # / ``CombinedOutput`` / ``Start``, which are sinks of their own.
+    hot_path_excluded_methods = frozenset({"Command"})
 
     def sink_kind(
         self,
@@ -183,7 +199,24 @@ class GoPerfDialect(BasePerfDialect):
         if right is None:
             return False
         targets = right.named_children if right.type == "expression_list" else [right]
-        return any(c.type in _GO_STRING_KINDS for c in targets)
+        if not any(c.type in _GO_STRING_KINDS for c in targets):
+            return False
+        left = _single_identifier(node.child_by_field_name("left"))
+        return left is None or not self.resets_per_iteration(node, left, _GO_LOOP_KINDS)
+
+    def binds_name(self, node: Node, name: bytes) -> bool:
+        if node.type == "short_var_declaration":
+            return _single_identifier(node.child_by_field_name("left")) == name
+        if node.type == "var_spec":
+            identifier = node.child_by_field_name("name")
+            return (
+                identifier is not None
+                and identifier.type == "identifier"
+                and identifier.text == name
+            )
+        if node.type != "assignment_statement" or not any(c.type == "=" for c in node.children):
+            return False
+        return _single_identifier(node.child_by_field_name("left")) == name
 
     def loop_call_marker(
         self, root: str, method: str, node: Node, list_names: frozenset[str]
@@ -216,6 +249,21 @@ class GoPerfDialect(BasePerfDialect):
         if named and named[-1].type in ("identifier", "selector_expression"):
             return self._dotted_path(named[-1])
         return None
+
+    def is_chunked_loop(self, node: Node) -> bool:
+        """``for i := 0; i < n; i += step``, or ``range slices.Chunk(xs, n)``."""
+        if node.type != "for_statement":
+            return False
+        clause = next((c for c in node.children if c.type == "for_clause"), None)
+        if clause is not None:
+            return self._steps_by_chunk(clause.child_by_field_name("update"))
+        clause = next((c for c in node.children if c.type == "range_clause"), None)
+        if clause is None:
+            return False
+        right = clause.child_by_field_name("right")
+        if right is None or right.type != "call_expression":
+            return False
+        return self.callee_method_name(right) in GO_CHUNK_CALLS
 
     @staticmethod
     def _has_static_pattern_arg(node: Node) -> bool:

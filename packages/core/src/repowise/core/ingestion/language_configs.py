@@ -90,6 +90,10 @@ class LanguageConfig:
     # the edge they produce is ``references`` rather than ``calls``.
     reference_call_node_types: frozenset[str] = field(default_factory=frozenset)
 
+    # Children of a declaration that hold its keyword modifiers (C#
+    # ``modifier``, Kotlin ``modifiers``), read into ``Symbol.modifiers``.
+    modifier_node_types: frozenset[str] = field(default_factory=frozenset)
+
 
 LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
     "python": LanguageConfig(
@@ -117,16 +121,27 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "type_alias_declaration": "type_alias",
             "enum_declaration": "enum",
             "method_definition": "method",
+            # Class properties holding a function (``static create = (...) => {}``,
+            # ``handler = function () {}``). The .scm pattern gates on the value
+            # being an arrow_function / function_expression, so no plain data
+            # property (``count = 0``) ever reaches this mapping; a class member
+            # is a member, so the kind is "method".
+            "public_field_definition": "method",
             "lexical_declaration": "function",  # const foo = () => {}
             # Top-level const/let with a literal value (the .scm pattern is
             # program-anchored). Refined in the parser like Python assignments.
             "variable_declarator": "constant",
+            # Overload signatures (the .scm keeps method ones to class bodies).
+            "function_signature": "function",
+            "method_signature": "method",
         },
         import_node_types=["import_statement"],
         export_node_types=["export_statement"],
         visibility_fn=ts_visibility,
+        modifier_node_types=frozenset({"override_modifier"}),
         parent_extraction="nesting",
         parent_class_types=frozenset({"class_declaration", "abstract_class_declaration"}),
+        declaration_node_types=frozenset({"function_signature", "method_signature"}),
     ),
     "javascript": LanguageConfig(
         symbol_node_types={
@@ -161,6 +176,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
     "rust": LanguageConfig(
         symbol_node_types={
             "function_item": "function",
+            "function_signature_item": "function",
             "struct_item": "struct",
             "enum_item": "enum",
             "trait_item": "trait",
@@ -184,6 +200,11 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
         # keeps its kind at ``function``, since that upgrade is gated on having
         # a parent.
         parent_class_types=frozenset({"impl_item", "mod_item", "trait_item"}),
+        # A bodiless ``fn foo();`` is a declaration in the same sense a C
+        # prototype is: it promises a body it does not carry. Unmarked it reads
+        # as a definition, which puts a trait's method names into the global
+        # bare-name index that call resolution consults for unqualified calls.
+        declaration_node_types=frozenset({"function_signature_item"}),
         reference_call_node_types=frozenset({"macro_invocation"}),
     ),
     "java": LanguageConfig(
@@ -255,6 +276,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
         import_node_types=["import"],
         export_node_types=[],
         visibility_fn=kotlin_visibility,
+        modifier_node_types=frozenset({"modifiers"}),
         parent_extraction="nesting",
         parent_class_types=frozenset({"class_declaration", "object_declaration"}),
     ),
@@ -293,6 +315,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
         import_node_types=["using_directive", "global_using_directive"],
         export_node_types=[],
         visibility_fn=csharp_visibility,
+        modifier_node_types=frozenset({"modifier"}),
         parent_extraction="nesting",
         parent_class_types=frozenset(
             {
@@ -322,6 +345,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
         import_node_types=["imports_statement"],
         export_node_types=[],
         visibility_fn=vbnet_visibility,
+        modifier_node_types=frozenset({"modifiers"}),
         parent_extraction="nesting",
         parent_class_types=frozenset(
             {
@@ -346,6 +370,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
         import_node_types=["import_declaration"],
         export_node_types=[],
         visibility_fn=swift_visibility,
+        modifier_node_types=frozenset({"modifiers"}),
         parent_extraction="nesting",
         parent_class_types=frozenset({"class_declaration", "protocol_declaration"}),
     ),
@@ -393,6 +418,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
         import_node_types=["import_declaration"],
         export_node_types=[],
         visibility_fn=scala_visibility,
+        modifier_node_types=frozenset({"modifiers"}),
         parent_extraction="nesting",
         parent_class_types=frozenset({"class_definition", "trait_definition", "object_definition"}),
     ),
