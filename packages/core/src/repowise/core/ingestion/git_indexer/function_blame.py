@@ -241,31 +241,37 @@ def build_blame_index(
         except OSError:
             return BlameIndex()
     ignore_revs_args = _blame_ignore_revs_args(repo, repo_path)
-    try:
-        # ``repo.git.blame`` invokes the git binary directly (shell=False).
-        # ``--line-porcelain`` repeats headers on every line which makes the
-        # parser robust to out-of-order line emission from --incremental.
-        raw = repo.git.blame("--line-porcelain", *ignore_revs_args, "HEAD", "--", file_path)
-    except Exception as exc:
-        if ignore_revs_args:
-            # A malformed .git-blame-ignore-revs line that is not a valid
-            # object name makes git exit 128 (#3056) — retry once without the
-            # flag so a bad ignore-revs file degrades to ordinary blame
-            # instead of losing the signal entirely.
-            try:
-                raw = repo.git.blame("--line-porcelain", "HEAD", "--", file_path)
-            except Exception as retry_exc:
-                logger.debug(
-                    "blame_index_failed", path=file_path, error=str(retry_exc)
-                )
-                return BlameIndex()
-        else:
-            logger.debug("blame_index_failed", path=file_path, error=str(exc))
-            return BlameIndex()
+    raw = _run_blame(repo, file_path, ignore_revs_args)
     if not raw:
         return BlameIndex()
     lines, authors = _parse_porcelain(raw)
     return BlameIndex(lines=lines, authors=authors)
+
+
+def _run_blame(repo: Any, file_path: str, ignore_revs_args: list[str]) -> str | None:
+    """Run ``git blame --line-porcelain``, retrying once without
+    *ignore_revs_args* on failure.
+
+    A malformed ``.git-blame-ignore-revs`` line that is not a valid object
+    name makes git exit 128 (#3056); retrying once without the flag lets a
+    bad ignore-revs file degrade to ordinary blame instead of losing the
+    signal entirely. Returns ``None`` (never raises) on any subprocess
+    error, same as every other ``repo.git`` call site in this module.
+    """
+    try:
+        # ``repo.git.blame`` invokes the git binary directly (shell=False).
+        # ``--line-porcelain`` repeats headers on every line which makes the
+        # parser robust to out-of-order line emission from --incremental.
+        return repo.git.blame("--line-porcelain", *ignore_revs_args, "HEAD", "--", file_path)
+    except Exception as exc:
+        if not ignore_revs_args:
+            logger.debug("blame_index_failed", path=file_path, error=str(exc))
+            return None
+        try:
+            return repo.git.blame("--line-porcelain", "HEAD", "--", file_path)
+        except Exception as retry_exc:
+            logger.debug("blame_index_failed", path=file_path, error=str(retry_exc))
+            return None
 
 
 def _blame_ignore_revs_args(repo: Any, repo_path: Path | None) -> list[str]:
