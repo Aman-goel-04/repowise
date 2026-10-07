@@ -46,6 +46,10 @@ __all__ = [
 # per-function mod counts cannot exceed file mod counts, and noise dominates.
 _MIN_COMMITS_FOR_BLAME = 5
 
+# GitHub's and git's own convention: a repo-root file listing bulk/formatting
+# commits whose lines blame should skip past to the real prior author (#3056).
+_BLAME_IGNORE_REVS_FILENAME = ".git-blame-ignore-revs"
+
 
 @dataclass
 class BlameIndex:
@@ -236,22 +240,55 @@ def build_blame_index(
                 return BlameIndex()
         except OSError:
             return BlameIndex()
+    ignore_revs_args = _blame_ignore_revs_args(repo, repo_path)
     try:
         # ``repo.git.blame`` invokes the git binary directly (shell=False).
         # ``--line-porcelain`` repeats headers on every line which makes the
         # parser robust to out-of-order line emission from --incremental.
-        raw = repo.git.blame("--line-porcelain", "HEAD", "--", file_path)
+        raw = repo.git.blame("--line-porcelain", *ignore_revs_args, "HEAD", "--", file_path)
     except Exception as exc:
-        logger.debug(
-            "blame_index_failed",
-            path=file_path,
-            error=str(exc),
-        )
-        return BlameIndex()
+        if ignore_revs_args:
+            # A malformed .git-blame-ignore-revs line that is not a valid
+            # object name makes git exit 128 (#3056) — retry once without the
+            # flag so a bad ignore-revs file degrades to ordinary blame
+            # instead of losing the signal entirely.
+            try:
+                raw = repo.git.blame("--line-porcelain", "HEAD", "--", file_path)
+            except Exception as retry_exc:
+                logger.debug(
+                    "blame_index_failed", path=file_path, error=str(retry_exc)
+                )
+                return BlameIndex()
+        else:
+            logger.debug("blame_index_failed", path=file_path, error=str(exc))
+            return BlameIndex()
     if not raw:
         return BlameIndex()
     lines, authors = _parse_porcelain(raw)
     return BlameIndex(lines=lines, authors=authors)
+
+
+def _blame_ignore_revs_args(repo: Any, repo_path: Path | None) -> list[str]:
+    """``["--ignore-revs-file", path]`` when a ``.git-blame-ignore-revs`` file
+    exists at the repo root and nothing already configures one, else ``[]``.
+
+    A repo whose ``blame.ignoreRevsFile`` is already set in git config applies
+    it automatically on every blame call; adding our own flag on top of that
+    would be redundant, not wrong, but checking first avoids the extra
+    subprocess work being pointless.
+    """
+    if repo_path is None:
+        return []
+    ignore_file = repo_path / _BLAME_IGNORE_REVS_FILENAME
+    if not ignore_file.is_file():
+        return []
+    try:
+        configured = repo.git.config("--get", "blame.ignoreRevsFile")
+    except Exception:
+        configured = ""
+    if configured.strip():
+        return []
+    return ["--ignore-revs-file", str(ignore_file)]
 
 
 def distinct_commits_in_range(idx: BlameIndex, start_line: int, end_line: int) -> set[str]:
