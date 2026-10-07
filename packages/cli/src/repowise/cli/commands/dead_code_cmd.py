@@ -16,7 +16,7 @@ from repowise.cli.helpers import (
     repo_index_session,
     resolve_command_target,
     run_async,
-    silence_logs_for_machine_output,
+    silence_logs_for_machine_output_until_close,
 )
 from repowise.cli.output import notice_console
 from repowise.core.analysis.dead_code.models import DeadCodeFindingData, DeadCodeReport
@@ -193,6 +193,7 @@ def _analyze_live(repo_path: Path, config: dict, notices: Any) -> DeadCodeReport
                 *traverser.stats.unknown_language_files,
             )
         ],
+        dotnet_index=getattr(graph_builder, "dotnet_index", None),
     )
     return analyzer.analyze(config)
 
@@ -282,7 +283,7 @@ def dead_code_command(
     detection is not yet supported — run once per repo for now.
     """
     if fmt != "table":
-        silence_logs_for_machine_output()
+        silence_logs_for_machine_output_until_close()
 
     target = resolve_command_target(
         path=path,

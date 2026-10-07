@@ -31,6 +31,7 @@ from ..type_names import (
     bare_type_name,
     is_resolvable_type_name,
     strip_type_arguments,
+    type_argument_count,
     type_qualifier,
     unwrap_pointer_like,
 )
@@ -267,6 +268,28 @@ _CPP_DECLARATION = re.compile(
 )
 
 
+# Rust annotates after the name: parameters, `let x: Foo`, closure parameters.
+# A path is kept only when it starts inside the crate (`crate::`, `self::`,
+# `super::`): `std::process::Child` bares to a `Child` the repo may also
+# declare. A borrow (`&Foo`, `&'a mut Foo`) and a `Box<Foo>` still reach
+# `Foo` by auto-deref, so both are read through; `dyn`/`impl` heads are
+# lowercase and match nothing. A bare `Foo` path is still refused downstream
+# when a `use` binds it outside the repo.
+_RUST_TYPE = r"(?:(?:crate|self|super)::(?:\w+::)*)?[A-Z]\w*"
+_RUST_ANNOTATED = re.compile(
+    rf"(?<![\w.:'])(?P<name>[a-z_]\w*)\s*:\s*(?:&(?:'\w+\s+)?(?:mut\s+)?)?(?P<box>Box<)?"
+    rf"(?P<type>{_RUST_TYPE}(?:<(?:[^<>]|<[^<>]*>)*>)?)(?(box)>)\s*(?=[=,;)|])"
+)
+
+# `let x = Foo::new(..)` and the other constructor-named associated functions,
+# the Rust spelling of `_KT_CONSTRUCTED`. A chain is refused as there
+# (`Foo::new().build()` is whatever `build` returns); a `?` is read through,
+# since it unwraps the `Result<Foo>` a fallible constructor returns.
+_RUST_CONSTRUCTED = re.compile(
+    rf"(?<![\w.])let\s+(?:mut\s+)?(?P<name>[a-z_]\w*)\s*=\s*(?P<type>{_RUST_TYPE})"
+    r"::(?:new|default|from|with_\w+)\s*\((?![^()]*\)\s*\??\s*\.)"
+)
+
 _C_FAMILY = (_TYPED_DECLARATION, _INFERRED_FROM_NEW)
 # Only the field shapes reach class scope. Go is still not in
 # IMPLICIT_FIELD_LANGUAGES: a field is read through its receiver (``c.parent``),
@@ -284,6 +307,7 @@ _LANGUAGE_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "java": _C_FAMILY,
     "kotlin": _KT_FAMILY,
     "python": _PY_FAMILY,
+    "rust": (_RUST_ANNOTATED, _RUST_CONSTRUCTED),
     "swift": _SWIFT_FAMILY,
     "typescript": _TS_FAMILY,
 }
@@ -296,6 +320,13 @@ RECEIVER_TYPE_LANGUAGES = frozenset(_LANGUAGE_PATTERNS)
 # for, so class scope could only bind a bare local to a field. Membership rests
 # on the scan actually finding typed fields in the language's idiom.
 IMPLICIT_FIELD_LANGUAGES = frozenset({"csharp", "java", "kotlin", "swift"})
+
+# Languages whose scan keeps a declaration of a builtin type, marked external,
+# so the resolver can refuse a call on it instead of matching the method name.
+# Only where nothing in the repo can add a method to a builtin type: C#
+# extension methods, Kotlin and Swift extensions and Rust trait impls all can.
+EXTERNAL_TYPE_LANGUAGES = frozenset({"java"})
+_EXTERNAL_TYPE = "external:"
 
 # A decorator that changes what the symbol it wraps *is*: `@shared_task` leaves
 # no function behind, so `add.s(...)` is a method call on `Task`. A table, since
@@ -578,6 +609,7 @@ _LANGUAGE_COMMENTS: dict[str, re.Pattern[str]] = {
     "go": _LINE_COMMENT,
     "java": _LINE_COMMENT,
     "kotlin": _LINE_COMMENT,
+    "rust": _LINE_COMMENT,
     "swift": _LINE_COMMENT,
     "python": _HASH_COMMENT,
     "typescript": _LINE_COMMENT,
@@ -651,7 +683,9 @@ def _usable_type_name(raw: str, language: str) -> tuple[str | None, bool]:
     """``(bare name, unwrapped)`` for *raw*, or ``(None, False)``.
 
     Only C++ looks inside the spelling: ``shared_ptr<Foo>`` is a ``Foo`` behind
-    the arrow. Elsewhere the generic head is the value's real type.
+    the arrow. Elsewhere the generic head is the value's real type. A C# head
+    keeps its arity, ``IFoo`1``, since a same-file ``IFoo`` may be another type;
+    the lookup falls back to the bare name.
     """
     if _nests_in_a_builtin(raw, language):
         return None, False
@@ -659,6 +693,8 @@ def _usable_type_name(raw: str, language: str) -> tuple[str | None, bool]:
     name = inner or (raw if raw.isidentifier() else bare_type_name(raw))
     if not is_resolvable_type_name(name, language):
         return None, False
+    if language == "csharp" and (arity := type_argument_count(raw)):
+        name = f"{name}`{arity}"
     return name, inner is not None
 
 
@@ -682,6 +718,8 @@ def scan_declarations(text: str, language: str) -> tuple[Declaration, ...]:
             raw = match.group("type")
             if raw not in resolved:
                 resolved[raw] = _usable_type_name(raw, language)
+                if resolved[raw][0] is None and language in EXTERNAL_TYPE_LANGUAGES:
+                    resolved[raw] = (_builtin_type_name(raw, language), False)
             type_name, unwrapped = resolved[raw]
             if type_name is None:
                 continue
@@ -704,6 +742,26 @@ def scan_declarations(text: str, language: str) -> tuple[Declaration, ...]:
 
     found.sort()
     return tuple(found)
+
+
+def _builtin_type_name(raw: str, language: str) -> str | None:
+    """The marked builtin *raw* spells, ``Map.Entry`` for a member type, or None.
+
+    Kept where ``_usable_type_name`` drops it, so a call on the value can be
+    refused rather than left to name matching. A generic parameter (``T``) or
+    any other unknown name stays dropped: unknown is not external.
+    """
+    if _nests_in_a_builtin(raw, language):
+        return _EXTERNAL_TYPE + strip_type_arguments(raw).strip()
+    name = raw if raw.isidentifier() else bare_type_name(raw)
+    return _EXTERNAL_TYPE + name if name in get_builtin_types(language) else None
+
+
+def external_type_name(type_name: str | None) -> str | None:
+    """The builtin a marked type names, or None for any other type."""
+    if type_name is None or not type_name.startswith(_EXTERNAL_TYPE):
+        return None
+    return type_name[len(_EXTERNAL_TYPE) :]
 
 
 class CallAssignment(NamedTuple):
@@ -783,11 +841,17 @@ def _record(types: dict[str, str | None], declaration: Declaration) -> None:
     A name declared with two types maps to ``None`` rather than being dropped:
     only "says nothing" may fall through to a wider scope, not "says something
     unusable".
+
+    A builtin type is the weakest answer: it fills only a name nothing else
+    types, so every non-builtin reading is what it was without it.
     """
-    if declaration.name not in types:
-        types[declaration.name] = declaration.type_name
-    elif types[declaration.name] != declaration.type_name:
-        types[declaration.name] = None
+    name, type_name = declaration.name, declaration.type_name
+    if name not in types or (
+        external_type_name(types[name]) is not None and external_type_name(type_name) is None
+    ):
+        types[name] = type_name
+    elif external_type_name(type_name) is None and types[name] != type_name:
+        types[name] = None
 
 
 def types_in_span(

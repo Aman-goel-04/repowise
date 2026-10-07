@@ -7,39 +7,35 @@
 ; Symbols
 ; ---------------------------------------------------------------------------
 
+; One pattern per declaration, modifiers optional: with a second pattern
+; that captured them, the bare one matched first and a class's annotations
+; (``@Component``, ``@State``) never reached its symbol.
 (class_declaration
-  name: (identifier) @symbol.name
-) @symbol.def
-
-(class_declaration
-  (modifiers) @symbol.modifiers
+  (modifiers)? @symbol.modifiers
   name: (identifier) @symbol.name
 ) @symbol.def
 
 (interface_declaration
-  name: (identifier) @symbol.name
-) @symbol.def
-
-(interface_declaration
-  (modifiers) @symbol.modifiers
+  (modifiers)? @symbol.modifiers
   name: (identifier) @symbol.name
 ) @symbol.def
 
 (enum_declaration
+  (modifiers)? @symbol.modifiers
   name: (identifier) @symbol.name
 ) @symbol.def
 
 ; Java 16+ records: record Point(double x, double y) {}
 (record_declaration
+  (modifiers)? @symbol.modifiers
   name: (identifier) @symbol.name
 ) @symbol.def
 
-(record_declaration
-  (modifiers) @symbol.modifiers
-  name: (identifier) @symbol.name
-) @symbol.def
-
+; One pattern, modifiers optional: two overlapping patterns kept whichever
+; matched first, which dropped either the modifiers or the parameters that
+; name an overload.
 (method_declaration
+  (modifiers)? @symbol.modifiers
   name: (identifier) @symbol.name
   parameters: (formal_parameters) @symbol.params
 ) @symbol.def
@@ -47,12 +43,6 @@
 (constructor_declaration
   name: (identifier) @symbol.name
   parameters: (formal_parameters) @symbol.params
-) @symbol.def
-
-; Public modifier capture
-(method_declaration
-  (modifiers) @symbol.modifiers
-  name: (identifier) @symbol.name
 ) @symbol.def
 
 ; ---------------------------------------------------------------------------
