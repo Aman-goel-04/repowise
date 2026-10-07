@@ -17,7 +17,7 @@ from __future__ import annotations
 import math
 import os
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from sqlalchemy import select, text
@@ -40,6 +40,31 @@ def rank_tests_by_reach(by_file: Mapping[str, Iterable[str]]) -> list[str]:
     """
     reach = Counter(test_id for tests in by_file.values() for test_id in tests)
     return sorted(reach, key=lambda t: (-reach[t], t))
+
+
+def promote_edited_tests(
+    ranked: Iterable[str],
+    changed_paths: Iterable[str],
+    *,
+    path_of: Callable[[str], str] = lambda t: t,
+) -> list[str]:
+    """Move a test already in *changed_paths* to the front of *ranked*.
+
+    A test the change itself edits runs by definition (the plan-ranker
+    precedent in ``recommendations.py``), so it leads ``tests_to_run`` rather
+    than losing to a test that merely imports more of the changed files. The
+    reach order from :func:`rank_tests_by_reach` is kept within both the
+    promoted group and the rest, so this reorders rather than re-sorts.
+
+    *path_of* maps a ranked entry to the file path to check against
+    *changed_paths*: the identity for a file-level list, or the part before
+    ``::`` for a test id.
+    """
+    changed = set(changed_paths)
+    edited, rest = [], []
+    for test in ranked:
+        (edited if path_of(test) in changed else rest).append(test)
+    return edited + rest
 
 
 #: Prefixes that name a module for its slot in a dispatch table rather than for

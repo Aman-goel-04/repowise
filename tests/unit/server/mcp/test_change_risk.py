@@ -346,6 +346,179 @@ async def test_impacted_tests_falls_back_to_the_graph_without_a_map(tmp_path, mo
 
 
 @pytest.mark.asyncio
+async def test_impacted_tests_promotes_an_edited_test_file_inferred(tmp_path, monkeypatch) -> None:
+    """A test file the change itself edits leads, even if it reaches less.
+
+    ``tests/test_aaa_generic.py`` reaches both changed source files and would
+    otherwise outrank ``tests/test_duplication.py``, the test the change
+    actually edits, on reach count alone (#2901).
+    """
+    from repowise.core.persistence.models import GraphEdge, GraphNode
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(["init", "-q"], repo)
+    _commit(repo, {"src/dup.py": "a\n", "src/tok.py": "a\n"}, "chore: seed")
+    _commit(
+        repo,
+        {
+            "src/dup.py": "a\nb\n",
+            "src/tok.py": "a\nb\n",
+            "tests/test_duplication.py": "d\n",
+        },
+        "feat: dedupe",
+    )
+
+    factory = await _factory_with_repo(None)
+    async with factory() as s:
+        for path, is_test in (
+            ("tests/test_duplication.py", True),
+            ("tests/test_aaa_generic.py", True),
+            ("src/dup.py", False),
+            ("src/tok.py", False),
+        ):
+            s.add(GraphNode(repository_id="repo1", node_id=path, node_type="file", is_test=is_test))
+        for source, target in (
+            ("tests/test_duplication.py", "src/dup.py"),
+            ("tests/test_aaa_generic.py", "src/dup.py"),
+            ("tests/test_aaa_generic.py", "src/tok.py"),
+        ):
+            s.add(
+                GraphEdge(
+                    repository_id="repo1",
+                    source_node_id=source,
+                    target_node_id=target,
+                    edge_type="imports",
+                )
+            )
+        await s.commit()
+
+    module = importlib.import_module("repowise.server.mcp_server.tool_change_risk")
+
+    async def _context(_: str | None) -> SimpleNamespace:
+        return SimpleNamespace(path=str(repo), session_factory=factory)
+
+    monkeypatch.setattr(module, "_resolve_repo_context", _context)
+    it = (await module.get_change_risk(baseline=0))["impacted_tests"]
+
+    assert it["tests_to_run"] == ["tests/test_duplication.py", "tests/test_aaa_generic.py"]
+    assert it["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_impacted_tests_promotion_survives_the_overflow_cap(tmp_path, monkeypatch) -> None:
+    """An edited test file stays inside the cap even if 12 others reach more.
+
+    Twelve generic tests each reach both changed source files (reach 2) and
+    would fill the cap of 10 on their own; the edited test only reaches one
+    (reach 1) and would fall off the end without promotion.
+    """
+    from repowise.core.persistence.models import GraphEdge, GraphNode
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(["init", "-q"], repo)
+    _commit(repo, {"src/hot.py": "a\n", "src/extra.py": "a\n"}, "chore: seed")
+    _commit(
+        repo,
+        {
+            "src/hot.py": "a\nb\n",
+            "src/extra.py": "a\nb\n",
+            "tests/test_edited.py": "e\n",
+        },
+        "feat: touch",
+    )
+
+    factory = await _factory_with_repo(None)
+    async with factory() as s:
+        for path, is_test in (
+            [("tests/test_edited.py", True)]
+            + [(f"tests/test_g{i:02d}.py", True) for i in range(12)]
+            + [("src/hot.py", False), ("src/extra.py", False)]
+        ):
+            s.add(GraphNode(repository_id="repo1", node_id=path, node_type="file", is_test=is_test))
+        s.add(
+            GraphEdge(
+                repository_id="repo1",
+                source_node_id="tests/test_edited.py",
+                target_node_id="src/hot.py",
+                edge_type="imports",
+            )
+        )
+        for i in range(12):
+            for target in ("src/hot.py", "src/extra.py"):
+                s.add(
+                    GraphEdge(
+                        repository_id="repo1",
+                        source_node_id=f"tests/test_g{i:02d}.py",
+                        target_node_id=target,
+                        edge_type="imports",
+                    )
+                )
+        await s.commit()
+
+    module = importlib.import_module("repowise.server.mcp_server.tool_change_risk")
+
+    async def _context(_: str | None) -> SimpleNamespace:
+        return SimpleNamespace(path=str(repo), session_factory=factory)
+
+    monkeypatch.setattr(module, "_resolve_repo_context", _context)
+    it = (await module.get_change_risk(baseline=0))["impacted_tests"]
+
+    assert it["total"] == 13
+    assert it["truncated"] is True
+    assert len(it["tests_to_run"]) == 10
+    assert it["tests_to_run"][0] == "tests/test_edited.py"
+    assert "tests/test_edited.py" in it["tests_to_run"]
+
+
+@pytest.mark.asyncio
+async def test_impacted_tests_promotes_an_edited_test_file_measured(tmp_path, monkeypatch) -> None:
+    """Measured branch: an edited test file's id leads when the map covers it.
+
+    ``tests/test_other.py`` covers two changed files (reach 2) and would
+    otherwise outrank ``tests/test_edited.py`` (reach 1), the test file the
+    change itself edits.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(["init", "-q"], repo)
+    _commit(
+        repo,
+        {"src/hot.py": "a\nb\n", "src/cold.py": "a\nb\n", "tests/test_edited.py": "x\ny\n"},
+        "chore: seed",
+    )
+    _commit(
+        repo,
+        {
+            "src/hot.py": "a2\nb\n",
+            "src/cold.py": "a2\nb\n",
+            "tests/test_edited.py": "x2\ny\n",
+        },
+        "feat: touch",
+    )
+
+    factory = await _factory_with_repo(
+        [
+            _tc("tests/test_other.py::test_a", "src/hot.py", [1], "tests/test_other.py"),
+            _tc("tests/test_other.py::test_a", "src/cold.py", [1], "tests/test_other.py"),
+            _tc("tests/test_edited.py::test_b", "src/hot.py", [1], "tests/test_edited.py"),
+        ]
+    )
+
+    module = importlib.import_module("repowise.server.mcp_server.tool_change_risk")
+
+    async def _context(_: str | None) -> SimpleNamespace:
+        return SimpleNamespace(path=str(repo), session_factory=factory)
+
+    monkeypatch.setattr(module, "_resolve_repo_context", _context)
+    it = (await module.get_change_risk(baseline=0))["impacted_tests"]
+
+    assert it["basis"] == "measured"
+    assert it["tests_to_run"] == ["tests/test_edited.py::test_b", "tests/test_other.py::test_a"]
+
+
+@pytest.mark.asyncio
 async def test_impacted_tests_overflow_cap_is_honest(tmp_path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

@@ -25,7 +25,7 @@ from repowise.core.analysis.change_risk import (
     normalize_extensions,
     score_live_change,
 )
-from repowise.core.analysis.pr_blast import rank_tests_by_reach
+from repowise.core.analysis.pr_blast import promote_edited_tests, rank_tests_by_reach
 from repowise.core.analysis.prior_fix_impact import (
     FixRecord,
     PriorFixFile,
@@ -1127,6 +1127,11 @@ async def _inferred_impacted(
     tests = rank_tests_by_reach(
         {path: expand_test_scopes(found, test_files) for path, found in reaching.items()}
     )
+    changed_set = set(changed_files)
+    # A changed test file the graph never reached (no resolved import into it)
+    # is still a test the change edits, so it is not silently dropped here.
+    missing_edited = sorted((test_files & changed_set) - set(tests))
+    tests = promote_edited_tests([*tests, *missing_edited], changed_set)
     if not tests:
         return _empty_impacted(
             "no_map",
@@ -1381,6 +1386,7 @@ async def _impacted_tests_block(
         return _empty_impacted("unknown", "Could not read the coverage map.")
 
     tests = rank_tests_by_reach(by_file)
+    tests = promote_edited_tests(tests, changed, path_of=lambda t: t.split("::", 1)[0])
     total = len(tests)
     return {
         "status": "map_present",
