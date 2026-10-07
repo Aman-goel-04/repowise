@@ -243,6 +243,25 @@ def _classify_rust_leaf(path: str) -> str | None:
     return None
 
 
+def _bind_rust_use_names(node: _NodeLike, names: dict[str, str]) -> None:
+    """Bind the I/O names one Rust ``use_declaration`` brings in.
+
+    A Rust ``use`` statement is flattened to one leaf per imported member
+    and each leaf classified on its own, so a grouped import
+    (``use std::{fs::File, collections::HashMap};``) cannot let one
+    member's kind leak onto another (#2894). A single-path ``use`` flattens
+    to one leaf too, so behaviour there is unchanged.
+    """
+    arg = _rust_use_argument(node)
+    if arg is None:
+        return
+    for path, bound in _rust_use_leaves(arg):
+        kind = _classify_rust_leaf(path)
+        if kind is not None:
+            for name in bound:
+                names.setdefault(name, kind)
+
+
 def collect_io_names(tree_root: _NodeLike, language: str) -> dict[str, str]:
     """Map every imported identifier that resolves to an I/O library → io_kind.
 
@@ -311,18 +330,7 @@ def _io_visit(
                 for name in bound:
                     names.setdefault(name, kind)
     elif node_type == "use_declaration" and language == "rust":
-        # A Rust ``use`` statement is flattened to one leaf per imported
-        # member and each leaf classified on its own, so a grouped import
-        # (``use std::{fs::File, collections::HashMap};``) cannot let one
-        # member's kind leak onto another (#2894). A single-path ``use``
-        # flattens to one leaf too, so behaviour there is unchanged.
-        arg = _rust_use_argument(node)
-        if arg is not None:
-            for path, bound in _rust_use_leaves(arg):
-                kind = _classify_rust_leaf(path)
-                if kind is not None:
-                    for name in bound:
-                        names.setdefault(name, kind)
+        _bind_rust_use_names(node, names)
     elif "import" in node_type or node_type in ("using_directive", "use_declaration"):
         # Classify only the *leaf* import node. A Go grouped
         # ``import ( "database/sql"; "regexp" )`` is an ``import_declaration``
