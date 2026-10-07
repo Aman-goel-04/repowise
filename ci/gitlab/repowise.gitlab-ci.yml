@@ -22,9 +22,24 @@
 #   REPOWISE_COVERAGE_MIN_COVERABLE_LINES
 #                                   Small-change tolerance: fewer changed executable
 #                                   lines than this never fails the coverage gate.
+#   REPOWISE_COVERAGE_FAIL_UNDER_RISKY
+#                                   Minimum patch coverage percent over risky files only.
+#   REPOWISE_COVERAGE_FAIL_UNDER_BRANCHES
+#                                   Minimum percent of branches taken on changed lines.
+#   REPOWISE_COVERAGE_BASE_REPORT   Coverage reports measured at the merge request's base
+#                                   commit, space separated like REPOWISE_COVERAGE_REPORT:
+#                                   project coverage and coverage outside the change.
+#   REPOWISE_COVERAGE_MAX_DROP      Most project coverage may fall from the base, in points.
 #   REPOWISE_DOC_DRIFT_BASELINE     Committed doc-drift baseline file.
 #   REPOWISE_SECURITY_BASELINE      Committed security baseline file.
 #   REPOWISE_SECURITY_FAIL_ON       Lowest severity that fails: high (default), med, low.
+#   REPOWISE_RISK_FAIL_ABOVE_PERCENTILE
+#                                   Fail when the change ranks above this percentile of
+#                                   recent commits. The risk job runs only when it is set.
+#   REPOWISE_IMPACTED_TESTS         "true" adds repowise-impacted-tests, which selects the
+#                                   tests the change needs from a cached index.
+#   REPOWISE_IMPACTED_TESTS_RUNNER  Runner its arguments are for: auto (default), pytest,
+#                                   go, jest or files.
 
 .repowise:
   image: python:3.12
@@ -48,6 +63,10 @@ repowise-coverage:
       $(printf -- '--report %s ' $REPOWISE_COVERAGE_REPORT)
       ${REPOWISE_COVERAGE_FAIL_UNDER:+--fail-under "$REPOWISE_COVERAGE_FAIL_UNDER"}
       ${REPOWISE_COVERAGE_MIN_COVERABLE_LINES:+--min-coverable-lines "$REPOWISE_COVERAGE_MIN_COVERABLE_LINES"}
+      ${REPOWISE_COVERAGE_FAIL_UNDER_RISKY:+--fail-under-risky "$REPOWISE_COVERAGE_FAIL_UNDER_RISKY"}
+      ${REPOWISE_COVERAGE_FAIL_UNDER_BRANCHES:+--fail-under-branches "$REPOWISE_COVERAGE_FAIL_UNDER_BRANCHES"}
+      ${REPOWISE_COVERAGE_BASE_REPORT:+$(printf -- '--base-report %s ' $REPOWISE_COVERAGE_BASE_REPORT)}
+      ${REPOWISE_COVERAGE_MAX_DROP:+--max-drop "$REPOWISE_COVERAGE_MAX_DROP"}
       --format markdown > repowise-coverage.md
   after_script:
     - cat repowise-coverage.md
@@ -130,3 +149,53 @@ repowise-code-quality:
       codequality: gl-code-quality-doc-drift.json
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+repowise-risk:
+  extends: .repowise
+  script:
+    - >
+      repowise risk "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD"
+      --fail-above-percentile "$REPOWISE_RISK_FAIL_ABOVE_PERCENTILE"
+      --format markdown > repowise-risk.md
+  after_script:
+    - cat repowise-risk.md
+  artifacts:
+    when: always
+    paths: [repowise-risk.md]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $REPOWISE_RISK_FAIL_ABOVE_PERCENTILE
+
+# Test selection, opt-in with REPOWISE_IMPACTED_TESTS: "true". It fails
+# closed: RUN_ALL_TESTS in the dotenv report is "false" only when the arguments
+# in the impacted-tests.txt artifact are safe to run alone; a test job should
+# run everything unless it reads "false". It needs a cached Repowise index
+# (give the job a cache holding .repowise), which it updates first; when that
+# update or the selection fails, the report says run everything and the job
+# still passes, so a broken setup costs a full run, never a red pipeline.
+repowise-impacted-tests:
+  extends: .repowise
+  script:
+    - |
+      status=0
+      run_all=true
+      echo ":all" > impacted-tests.txt
+      if [ -f .repowise/state.json ] && ! repowise update --index-only; then
+        echo "The cached index could not be updated; running every test."
+      else
+        repowise impacted-tests "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD" \
+          --format args --runner "${REPOWISE_IMPACTED_TESTS_RUNNER:-auto}" > selected.txt || status=$?
+        if [ "$status" -ne 0 ]; then
+          echo "Test selection could not run (exit $status); running every test."
+        elif [ "$(wc -l < selected.txt)" -eq 1 ] && [ "$(cat selected.txt)" != ":all" ]; then
+          mv selected.txt impacted-tests.txt
+          run_all=false
+        fi
+      fi
+      printf 'RUN_ALL_TESTS=%s\n' "$run_all" > repowise-impacted-tests.env
+  artifacts:
+    when: always
+    paths: [impacted-tests.txt]
+    reports:
+      dotenv: repowise-impacted-tests.env
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $REPOWISE_IMPACTED_TESTS == "true"

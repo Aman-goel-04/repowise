@@ -28,6 +28,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import chain
 from pathlib import Path
+from typing import Any
 
 import pathspec
 
@@ -82,6 +83,24 @@ _PRUNE_DIRS = PRUNED_DIRS | frozenset({"dist", "build"})
 _MAX_ARTIFACTS = 50
 
 
+@dataclass(frozen=True)
+class PathGate:
+    """One ``coverage.gates`` entry: a patch-coverage gate over the files its globs match.
+
+    *paths* are gitignore-style globs, like ``coverage.ignore``. Without
+    *fail_under* the gate is reported but judges nothing; an *informational*
+    gate is judged but never fails the change.
+    """
+
+    name: str
+    paths: tuple[str, ...]
+    fail_under: float | None = None
+    informational: bool = False
+
+
+_PATH_GATE_KEYS = ("name", "paths", "fail_under", "informational")
+
+
 @dataclass
 class CoverageConfig:
     """The ``coverage:`` block of ``.repowise/config.yaml``.
@@ -115,6 +134,18 @@ class CoverageConfig:
     # Small-change tolerance: a change with fewer changed executable lines
     # than this never fails the gate.
     min_coverable_lines: int | None = None
+    # Path-scoped gates (``coverage.gates``): the valid entries, and one
+    # message per invalid entry. ``coverage check`` refuses to run on any
+    # message; read-only surfaces evaluate the valid entries.
+    gates: tuple[PathGate, ...] = ()
+    gate_errors: tuple[str, ...] = ()
+    # The stricter gate over risky files only (``coverage check --fail-under-risky``).
+    fail_under_risky: float | None = None
+    # Most project coverage may fall from the change's base, in percentage
+    # points (``coverage check --max-drop``).
+    max_drop: float | None = None
+    # Least share of branches taken on changed lines (``--fail-under-branches``).
+    fail_under_branches: float | None = None
 
     @classmethod
     def from_repo_config(cls, repo_config: dict | None) -> CoverageConfig:
@@ -130,6 +161,7 @@ class CoverageConfig:
             return ()
 
         paths, path_prefixes = _report_entries(block.get("paths"))
+        gates, gate_errors = _path_gates(block.get("gates"))
         return cls(
             auto_discover=bool(block.get("auto_discover", True)),
             artifacts=_strs(block.get("artifacts")),
@@ -142,6 +174,11 @@ class CoverageConfig:
             reingest_on_update=bool(block.get("reingest_on_update", False)),
             fail_under=_percent(block.get("fail_under")),
             min_coverable_lines=_line_count(block.get("min_coverable_lines")),
+            gates=gates,
+            gate_errors=gate_errors,
+            fail_under_risky=_percent(block.get("fail_under_risky")),
+            max_drop=_percent(block.get("max_drop")),
+            fail_under_branches=_percent(block.get("fail_under_branches")),
         )
 
     def reports(self, repo_root: Path) -> dict[Path, str | None]:
@@ -162,18 +199,104 @@ class CoverageConfig:
         return {}
 
 
-def configured_ignore(repo_root: Path | str) -> tuple[str, ...]:
-    """``coverage.ignore`` from *repo_root*'s config, empty when it cannot be read.
+def configured_coverage(repo_root: Path | str) -> CoverageConfig:
+    """*repo_root*'s ``coverage:`` config, the defaults when it cannot be read.
 
     For the surfaces that read stored coverage (REST, agent tools), so their
-    patch coverage leaves out the same files the CLI gate does.
+    patch coverage leaves out the same files and evaluates the same
+    path-scoped gates the CLI gate does.
     """
     from repowise.core.repo_config import RepoConfigError, load_repo_config
 
     try:
-        return CoverageConfig.from_repo_config(load_repo_config(repo_root)).ignore
+        return CoverageConfig.from_repo_config(load_repo_config(repo_root))
     except (RepoConfigError, OSError):
-        return ()
+        return CoverageConfig()
+
+
+def _path_gates(value: object) -> tuple[tuple[PathGate, ...], tuple[str, ...]]:
+    """``coverage.gates``: the valid entries, and why each invalid one is not."""
+    if value is None:
+        return (), ()
+    if not isinstance(value, list):
+        return (), ("coverage.gates must be a list of {name, paths} entries.",)
+    gates: list[PathGate] = []
+    errors: list[str] = []
+    for i, entry in enumerate(value):
+        gate = _parse_path_gate(entry, {g.name for g in gates})
+        if isinstance(gate, PathGate):
+            gates.append(gate)
+            continue
+        name = entry.get("name") if isinstance(entry, dict) else None
+        where = f"coverage.gates[{i}]" + (f" ({name!r})" if isinstance(name, str) else "")
+        errors.append(f"{where}: {gate}")
+    return tuple(gates), tuple(errors)
+
+
+class _InvalidGateError(Exception):
+    """Why one ``coverage.gates`` entry cannot be used; the message says so."""
+
+
+def _parse_path_gate(entry: object, taken: set[str]) -> PathGate | str:
+    """One ``coverage.gates`` entry, or what is wrong with it (the first problem found)."""
+    try:
+        fields = _gate_fields(entry)
+        return PathGate(
+            _gate_name(fields.get("name"), taken),
+            _gate_paths(fields.get("paths")),
+            _gate_threshold(fields.get("fail_under")),
+            _gate_informational(fields.get("informational", False)),
+        )
+    except _InvalidGateError as exc:
+        return str(exc)
+
+
+def _gate_fields(entry: object) -> dict:
+    if not isinstance(entry, dict):
+        raise _InvalidGateError("must be a mapping with name and paths.")
+    unknown = sorted(str(k) for k in entry if k not in _PATH_GATE_KEYS)
+    if unknown:
+        raise _InvalidGateError(
+            f"unknown key {', '.join(unknown)}; expected {', '.join(_PATH_GATE_KEYS)}."
+        )
+    return entry
+
+
+def _gate_name(name: object, taken: set[str]) -> str:
+    if not isinstance(name, str) or not name.strip():
+        raise _InvalidGateError("name must be a non-empty string.")
+    if name in taken:
+        raise _InvalidGateError("duplicate name; each gate needs its own.")
+    return name
+
+
+def _gate_paths(raw: object) -> tuple[str, ...]:
+    paths = (raw,) if isinstance(raw, str) else raw
+    if not isinstance(paths, (list, tuple)) or not paths:
+        raise _InvalidGateError("paths must be a non-empty list of globs.")
+    if not all(isinstance(p, str) and p.strip() for p in paths):
+        raise _InvalidGateError("paths must be a non-empty list of globs.")
+    try:
+        spec = pathspec.PathSpec.from_lines("gitwildmatch", paths)
+    except ValueError as exc:
+        raise _InvalidGateError(f"invalid glob in paths: {exc}") from exc
+    if not any(p.include for p in spec.patterns):
+        # Only comments or ``!`` exclusions: the gate could never match a file.
+        raise _InvalidGateError("paths must include a glob that is not a comment or a ! exclusion.")
+    return tuple(paths)
+
+
+def _gate_threshold(raw: object) -> float | None:
+    threshold = _percent(raw)
+    if raw is not None and threshold is None:
+        raise _InvalidGateError(f"fail_under must be a number from 0 to 100, got {raw!r}.")
+    return threshold
+
+
+def _gate_informational(raw: object) -> bool:
+    if not isinstance(raw, bool):
+        raise _InvalidGateError(f"informational must be true or false, got {raw!r}.")
+    return raw
 
 
 def _report_entries(value: object) -> tuple[tuple[str, ...], dict[str, str]]:
@@ -240,6 +363,31 @@ def expand_report_patterns(patterns: Iterable[str], base: Path) -> list[Path]:
     return out
 
 
+def expand_report_args(args: Iterable[str], base: Path) -> dict[Path, str | None]:
+    """Report arguments given on a command line, each mapped to its prefix (or ``None``).
+
+    Each is a path or glob relative to *base*, optionally ``PATH=PREFIX``. The
+    whole argument is expanded first, so a path or glob holding ``=``
+    (``artifacts/shard=1/*.info``) stays one; only when it matches nothing is
+    it split on the last ``=``, and the prefix applies to every file the left
+    side matches. Raises :class:`FileNotFoundError` naming the argument when one
+    matches no file: a report the caller named and did not get is a broken setup.
+    """
+    out: dict[Path, str | None] = {}
+    for arg in args:
+        pattern, prefix = arg, None
+        matches = expand_report_patterns([arg], base)
+        if not matches and "=" in arg:
+            pattern, _, prefix = arg.rpartition("=")
+            matches = expand_report_patterns([pattern], base)
+        if not matches:
+            where = f"{arg}: " if pattern != arg else ""
+            raise FileNotFoundError(f"{where}no coverage report matches {pattern}.")
+        for path in matches:
+            out.setdefault(path, prefix or None)
+    return out
+
+
 @dataclass
 class ResolvedCoverage:
     """Outcome of resolving a parsed report against the indexed tree."""
@@ -267,6 +415,10 @@ class ResolvedCoverage:
     # Set by :func:`resolve_reports`; consumers must flag the aggregate as
     # partial rather than reporting the mapped subset's numbers as repo-wide.
     mapping_partial: bool = False
+    # One format per report read, repeats kept, and the ``coverage.ignore``
+    # applied: with ``mapping_partial``, what makes two measurements comparable.
+    report_formats: list[str] = field(default_factory=list)
+    ignore: tuple[str, ...] = ()
 
     @property
     def matched(self) -> int:
@@ -285,6 +437,15 @@ class ResolvedCoverage:
             unmatched_path_count=len(self.unmatched),
             ambiguous_path_count=len(self.ambiguous),
             unmatched_sample=tuple((self.unmatched + self.ambiguous)[:UNMATCHED_SAMPLE_CAP]),
+            mapping_partial=self.mapping_partial,
+            scope=self.scope,
+        )
+
+    @property
+    def scope(self) -> CoverageScope:
+        return CoverageScope(
+            report_formats=tuple(sorted(self.report_formats)),
+            ignore=tuple(sorted(self.ignore)),
             mapping_partial=self.mapping_partial,
         )
 
@@ -308,6 +469,45 @@ class CoverageProvenance:
     ambiguous_path_count: int | None = None
     unmatched_sample: tuple[str, ...] = ()
     mapping_partial: bool = False
+    # ``None`` when the writer did not resolve the reports itself.
+    scope: CoverageScope | None = None
+
+
+@dataclass(frozen=True)
+class CoverageScope:
+    """What makes two coverage measurements comparable.
+
+    *report_formats* has one entry per report read (``("lcov", "lcov")`` for
+    two lcov reports), sorted; *ignore* is the ``coverage.ignore`` applied,
+    sorted. A base and head that differ in either measured different things,
+    and a partial mapping measured a fragment, so neither delta means anything
+    (``patch_coverage.delta.incomparable_reasons``).
+    """
+
+    report_formats: tuple[str, ...] = ()
+    ignore: tuple[str, ...] = ()
+    mapping_partial: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "report_formats": list(self.report_formats),
+            "ignore": list(self.ignore),
+            "mapping_partial": self.mapping_partial,
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> CoverageScope | None:
+        """The scope :meth:`to_dict` wrote, ``None`` for anything else."""
+        if not isinstance(data, dict):
+            return None
+        formats, ignore = data.get("report_formats"), data.get("ignore")
+        if not isinstance(formats, list) or not isinstance(ignore, list):
+            return None
+        return cls(
+            report_formats=tuple(sorted(str(f) for f in formats)),
+            ignore=tuple(sorted(str(g) for g in ignore)),
+            mapping_partial=bool(data.get("mapping_partial", False)),
+        )
 
 
 def discover_artifacts(
@@ -697,6 +897,11 @@ def _merge_into(dst: FileCoverage, src: FileCoverage) -> None:
             if dst.branch_coverage_pct is None
             else max(dst.branch_coverage_pct, src.branch_coverage_pct)
         )
+    # Branches are not identified across reports, so the per-line max is a lower bound.
+    for line, (taken, total) in src.branch_lines.items():
+        prev_taken, prev_total = dst.branch_lines.get(line, (0, 0))
+        dst.branch_lines[line] = (max(prev_taken, taken), max(prev_total, total))
+    dst.branch_lines = dict(sorted(dst.branch_lines.items()))
 
 
 def _note_format(result: ResolvedCoverage, source_format: str | None) -> None:
@@ -719,6 +924,7 @@ def _merge_keyed(by_key: dict[str, FileCoverage], key: str, fc: FileCoverage) ->
         total_coverable_lines=fc.total_coverable_lines,
         coverable_lines=list(fc.coverable_lines),
         covered_line_count=fc.covered_line_count,
+        branch_lines=dict(fc.branch_lines),
     )
     if key in by_key:
         _merge_into(by_key[key], resolved_fc)
@@ -749,7 +955,7 @@ def resolve_reports(
     """
     suffix_index = _build_suffix_index(repo_keys)
     ignore_spec = pathspec.PathSpec.from_lines("gitwildmatch", ignore)
-    result = ResolvedCoverage()
+    result = ResolvedCoverage(ignore=tuple(ignore))
     by_key: dict[str, FileCoverage] = {}
     report_file_count = 0
     for report in reports:
@@ -758,6 +964,7 @@ def resolve_reports(
         # not rewrite an lcov report's ``web/src/x.ts``.
         modules = go_modules if report.source_format == "go-coverprofile" else ()
         _note_format(result, report.source_format)
+        result.report_formats.append(report.source_format)
         for fc in report.files:
             report_file_count += 1
             key, ambiguous, exact = _resolve_path(
