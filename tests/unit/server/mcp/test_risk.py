@@ -6,6 +6,7 @@ test data, mirroring the conftest pattern from the REST API tests.
 
 from __future__ import annotations
 
+import importlib
 import json
 
 import pytest
@@ -822,35 +823,65 @@ async def test_get_risk_names_an_unknown_include_rather_than_applying_it(setup_m
 
 
 @pytest.mark.asyncio
-async def test_get_risk_directive_does_not_copy_the_analyzer_score(setup_mcp):
-    """The structural heuristic lives in blast detail, not the directive."""
+async def test_get_risk_reports_reach_not_the_uncalibrated_score(setup_mcp):
+    """PR mode carries the structural band as ``reach``; the raw score is opt-in."""
+    from repowise.core.analysis.risk_semantics import structural_impact_band
     from repowise.server.mcp_server import get_risk
 
     result = await get_risk(
         ["src/auth/service.py"], changed_files=["src/auth/service.py"], include=["blast"]
     )
 
-    assert "overall_risk_score" not in result["directive"]
     blast = result["pr_blast_radius"]
-    assert blast["overall_risk_score"] == blast["structural_impact_score"]
-    assert blast["overall_risk_score_compatibility"] == {
-        "deprecated": True,
-        "replacement": "structural_impact_score",
-        "equivalent_value": True,
-        "historical_meaning": "uncalibrated 0-10 structural blast-radius heuristic",
-    }
-    scale = blast["structural_impact_scale"]
-    assert scale["calibration"]["status"] == "uncalibrated"
-    assert scale["runtime_breakage_probability"] is False
-    # Guard tier by default; the reference tier follows the caller's include.
-    assert "component_fields" not in scale
+    for key in (
+        "structural_impact_score",
+        "structural_impact_band",
+        "structural_impact_scale",
+        "overall_risk_score",
+        "overall_risk_score_compatibility",
+    ):
+        assert key not in blast
+        assert key not in result["directive"]
+    assert result["directive"]["reach"] in {"localized", "moderate", "broad"}
     assert "risk_scales" not in result
 
     expanded = await get_risk(
         ["src/auth/service.py"], changed_files=["src/auth/service.py"], include=["scales", "blast"]
     )
+    blast = expanded["pr_blast_radius"]
     assert expanded["risk_scales"][0]["field"] == "targets.*.hotspot_score"
-    assert expanded["pr_blast_radius"]["structural_impact_scale"]["component_fields"]
+    assert structural_impact_band(blast["structural_impact_score"]) == (
+        expanded["directive"]["reach"]
+    )
+    scale = blast["structural_impact_scale"]
+    assert scale["calibration"]["status"] == "uncalibrated"
+    assert scale["runtime_breakage_probability"] is False
+    assert scale["component_fields"]
+    assert "overall_risk_score" not in blast
+    assert "overall_risk_score_compatibility" not in blast
+
+
+@pytest.mark.asyncio
+async def test_get_risk_reach_is_null_when_the_analyzer_gave_no_score(setup_mcp, monkeypatch):
+    from repowise.server.mcp_server import get_risk
+    get_risk_module = importlib.import_module("repowise.server.mcp_server.tool_risk.get_risk")
+
+    real = get_risk_module._pr_blast_radius
+
+    async def _unscored(*args, **kwargs):
+        blast = await real(*args, **kwargs)
+        blast.pop("structural_impact_score", None)
+        return blast
+
+    monkeypatch.setattr(get_risk_module, "_pr_blast_radius", _unscored)
+    result = await get_risk(
+        ["src/auth/service.py"],
+        changed_files=["src/auth/service.py"],
+        include=["blast", "scales"],
+    )
+
+    assert result["directive"]["reach"] is None
+    assert "structural_impact_score" not in result["pr_blast_radius"]
 
 
 @pytest.mark.asyncio
@@ -1082,7 +1113,10 @@ async def test_get_risk_serves_the_blast_radius_on_request(setup_mcp):
     assert isinstance(plain["directive"]["recommended_reviewers"], list)
 
     blast = await get_risk(files, changed_files=files, include=["blast"])
-    assert "structural_impact_score" in blast["pr_blast_radius"]
+    # The raw structural score also needs "scales"; the directive carries its band.
+    assert "structural_impact_score" not in blast["pr_blast_radius"]
+    scaled = await get_risk(files, changed_files=files, include=["blast", "scales"])
+    assert "structural_impact_score" in scaled["pr_blast_radius"]
     # Named once, in the directive.
     reviewers = plain["directive"]["recommended_reviewers"]
     assert blast["directive"]["recommended_reviewers"] == reviewers
