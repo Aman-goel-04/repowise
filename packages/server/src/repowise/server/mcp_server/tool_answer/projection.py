@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import copy
+import re
 from collections.abc import Callable
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
 from repowise.server.mcp_server.tool_answer.config import (
     _CANDIDATE_FILES_HIGH,
     _CANDIDATE_FILES_MAX,
+    _LARGE_FILE_BYTES,
 )
 
 _COLLECTIONS = (
@@ -307,6 +310,57 @@ def _shape_candidate_files(payload: dict[str, Any], *, expanded: bool) -> None:
         payload["candidate_files"] = paths
 
 
+# Only the legacy abstain reply points at excerpts; once slimmed there are none.
+_EXCERPT_NOTE = re.compile(r", and its excerpt carries that page's actual content(?=\.)")
+
+
+def _first_guess(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The first ``best_guesses`` row naming a file: what both hints point at."""
+    return next(
+        (
+            row for row in payload.get("best_guesses") or []
+            if isinstance(row, dict) and _nav_path(row)
+        ),
+        None,
+    )
+
+
+def _slim_best_guesses(payload: dict[str, Any], facts: dict[str, Any]) -> bool:
+    """Swap each low-confidence guess's page excerpt for compact facts about its file.
+
+    Rows, keys and order stay; ``excerpt`` returns with ``include=["evidence"]``.
+    The row's own ``why_relevant`` and ``score`` win: they come from the same hit.
+    Returns whether there were rows to slim, so sizes are stamped on those only.
+    """
+    guesses = payload.get("best_guesses")
+    if not isinstance(guesses, list) or not guesses:
+        return False
+    dropped = False
+    for row in guesses:
+        if not isinstance(row, dict):
+            continue
+        dropped |= row.pop("excerpt", None) is not None
+        known = facts.get(_nav_path(row))
+        if not isinstance(known, dict):
+            continue
+        if not row.get("why_relevant") and known.get("why"):
+            row["why"] = known["why"]
+        if known.get("functions"):
+            row["functions"] = known["functions"]
+    first = _first_guess(payload)
+    if dropped:
+        note = payload.get("note")
+        if isinstance(note, str):
+            payload["note"] = _EXCERPT_NOTE.sub("", note)
+        hint = payload.get("next_action_hint")
+        if first and isinstance(hint, str) and hint.startswith("Start from the excerpt of "):
+            payload["next_action_hint"] = (
+                f"Read {_nav_path(first)} first: it scored highest, and best_guesses "
+                "says why each file is in the running."
+            )
+    return True
+
+
 def _default_shape(payload: dict[str, Any], question: str) -> None:
     confidence = _shape_confidence(payload)
     why = question.lstrip().lower().startswith("why")
@@ -401,6 +455,14 @@ def project_answer_payload(
     repo: str | None = None, include: list[str] | None = None
 ) -> dict[str, Any]:
     """Return the cache-independent, confidence-specific external response."""
+    return _project(raw, question=question, scope=scope, repo=repo, include=include)[0]
+
+
+def _project(
+    raw: dict[str, Any], *, question: str, scope: str | None,
+    repo: str | None, include: list[str] | None
+) -> tuple[dict[str, Any], bool]:
+    """The projection, and whether it slimmed ``best_guesses`` (decided once, here)."""
     payload = copy.deepcopy(raw)
     totals = {
         key: len(payload.get(key) or []) if isinstance(payload.get(key), list) else 0
@@ -408,8 +470,12 @@ def project_answer_payload(
     }
     _deduplicate(payload)
     expanded = "evidence" in set(include or [])
+    facts = payload.pop("_candidate_file_facts", None)
+    slimmed = False
     if not expanded:
         _default_shape(payload, question)
+        if _shape_confidence(payload) == "low":
+            slimmed = _slim_best_guesses(payload, facts if isinstance(facts, dict) else {})
     _shape_candidate_files(payload, expanded=expanded)
     _rewrite_degraded_answer(payload)
     for key in _COLLECTIONS:
@@ -419,7 +485,7 @@ def project_answer_payload(
     unknown = sorted(set(include or []) - {"evidence"})
     if unknown:
         payload.setdefault("_meta", {})["ignored_arguments"] = {"include": unknown}
-    return payload
+    return payload, slimmed
 
 
 def _served_paths(payload: dict[str, Any]) -> list[str]:
@@ -499,6 +565,75 @@ async def _refresh_freshness(payload: dict[str, Any], repo: str | None) -> None:
         meta["hint"] = hint
 
 
+_LINE_COUNT_MAX_BYTES = 2_000_000
+
+
+def _file_size(root: Path, path: str) -> tuple[int | None, int] | None:
+    """``(lines, size_bytes)`` of a repo file on disk, or None when it is not one.
+
+    Size from ``stat``; lines by streaming, and None above
+    :data:`_LINE_COUNT_MAX_BYTES` so a huge file is never read to count them.
+    """
+    try:
+        abs_path = (root / path).resolve()
+        # An index row is not a trust boundary; refuse anything outside the repo.
+        abs_path.relative_to(root.resolve())
+        if not abs_path.is_file():
+            return None
+        size = abs_path.stat().st_size
+        if size > _LINE_COUNT_MAX_BYTES:
+            return None, size
+        lines, last = 0, b""
+        with abs_path.open("rb") as handle:
+            while chunk := handle.read(65536):
+                lines += chunk.count(b"\n")
+                last = chunk[-1:]
+    except (OSError, ValueError):
+        return None
+    return lines + (1 if last and last != b"\n" else 0), size
+
+
+def _add_file_sizes(payload: dict[str, Any], root: Path | None) -> None:
+    """Stamp live ``lines`` / ``size_bytes`` on slimmed guesses and cue a ranged read.
+
+    Serve-time, not cached, so a dirty tree reports the bytes an agent would Read.
+    """
+    if root is None:
+        return
+    for row in payload.get("best_guesses") or []:
+        path = _nav_path(row) if isinstance(row, dict) else None
+        size = _file_size(root, path) if path else None
+        if size is None:
+            continue
+        lines, row["size_bytes"] = size
+        if lines is not None:
+            row["lines"] = lines
+    top = _first_guess(payload)
+    if top and top.get("size_bytes", 0) > _LARGE_FILE_BYTES:
+        path = _nav_path(top)
+        cue = (
+            f"{path} is {top['size_bytes'] // 1024} KB: Read a line range, or call "
+            f"get_context(targets=[\"{path}\"], include=[\"skeleton\"]), "
+            "rather than the whole file."
+        )
+        hint = payload.get("next_action_hint")
+        payload["next_action_hint"] = f"{hint.rstrip()} {cue}" if isinstance(hint, str) else cue
+
+
+async def _refresh_file_sizes(payload: dict[str, Any], repo: str | None) -> None:
+    """Size the slimmed guesses. Best-effort: a sync stat and bounded read of <= 3 files."""
+    if repo == "all":
+        return
+    try:
+        from repowise.server.mcp_server._helpers import _resolve_repo_context
+        from repowise.server.mcp_server.tool_answer.evidence import _repo_root
+
+        root = _repo_root(await _resolve_repo_context(repo))
+    except Exception:
+        return
+    _add_file_sizes(payload, root)
+
+
 def _whole_bodies(payload: dict[str, Any]) -> int:
     """Count symbol bodies that survived the projection intact.
 
@@ -542,10 +677,12 @@ def projected_answer(fn: Callable[..., Any]) -> Callable[..., Any]:
         include: list[str] | None = None,
     ) -> dict[str, Any]:
         raw = await fn(question=question, scope=scope, repo=repo, include=include)
-        payload = project_answer_payload(
+        payload, slimmed = _project(
             raw, question=question, scope=scope, repo=repo, include=include
         )
         await _refresh_freshness(payload, repo)
+        if slimmed:
+            await _refresh_file_sizes(payload, repo)
         _stamp_completeness(payload)
         return payload
 
