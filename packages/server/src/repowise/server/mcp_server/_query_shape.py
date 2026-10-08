@@ -12,6 +12,8 @@ import re
 from collections.abc import Container
 from functools import cache
 
+from repowise.server.mcp_server._stack_trace import parse_trace
+
 
 @cache
 def _code_exts() -> frozenset[str]:
@@ -188,6 +190,35 @@ def _embedded_identifiers(query: str, names: Container[str] | None = None) -> li
             and (not _one_hump(m.group()) or _in_code_context(query, m))
         )
     ]
+
+
+def _unmistakably_code(token: str) -> bool:
+    """Dotted, snake_case, a digit, or a capital past the first letter beside
+    a lowercase one. ``Config`` and ``Result`` are English words too."""
+    if "." in token:
+        return True
+    body = token.strip("_")
+    if "_" in body or any(ch.isdigit() for ch in body):
+        return True
+    return any(ch.islower() for ch in body) and any(ch.isupper() for ch in body[1:])
+
+
+def defined_identifiers(query: str, names: Container[str]) -> list[str]:
+    """Code-shaped tokens of ``query`` (``_unmistakably_code``) that name an
+    indexed symbol. ``names`` as for ``_embedded_identifiers``."""
+    return [
+        t
+        for t in _embedded_identifiers(query, names)
+        if _unmistakably_code(t) and _names_symbol(t, names)
+    ]
+
+
+def is_issue_shaped(query: str, names: Container[str], frames: list | None = None) -> bool:
+    """Whether ``query`` pastes a stack trace or names an identifier the index
+    defines. ``frames`` is ``parse_trace(query)`` when the caller already has it."""
+    if frames is None:
+        frames = parse_trace(query)
+    return bool(frames) or bool(defined_identifiers(query, names))
 
 
 def _name_token_matches(query: str) -> list[re.Match[str]]:
