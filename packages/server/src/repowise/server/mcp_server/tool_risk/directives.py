@@ -8,6 +8,8 @@ from sqlalchemy import select
 
 from repowise.core.analysis.next_call import ActionCommand
 from repowise.core.analysis.risk_semantics import structural_impact_contract
+from repowise.core.analysis.test_reachability import tests_matching_by_name
+from repowise.core.co_change import MIN_CO_CHANGE_SUPPORT
 from repowise.core.persistence.crud.authority import decision_currencies
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.decision_graph import list_conflict_edges
@@ -59,6 +61,8 @@ _MAY_BREAK_TESTS_LIMIT = 3
 #: the overflow and full typed rows live in pr_blast_radius.test_impact.
 _TESTS_TO_RUN_LIMIT = 10
 _TESTS_TO_RUN_KIND = {"measured": "test_id", "inferred": "test_file"}
+#: Cap on the edit-list: the test files this change will probably need edited.
+_TESTS_TO_UPDATE_LIMIT = 3
 
 
 def _breaking_change_directive(
@@ -479,6 +483,47 @@ def _project_recommendation(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _tests_to_update(
+    changed_files: list[str],
+    test_paths: set[str],
+    pr_blast_radius: dict,
+    exclude_spec: Any,
+) -> list[dict[str, str]]:
+    """Test files the change will probably need edited, strongest reason first.
+
+    A test named for a changed file (``name_pair``), then one that imports it
+    (``imports``), then one that changes with it in git history (``co_change``).
+    A path keeps its first reason; tests already in the change are left out.
+    """
+    changed = set(changed_files)
+    candidates = filter_path_list(sorted(test_paths - changed), exclude_spec)
+    eligible = set(candidates)
+    named = tests_matching_by_name(changed_files, candidates)
+    ordered: list[tuple[str | None, str]] = [
+        (path, "name_pair")
+        for source in changed_files
+        if source in named
+        for path in (named[source].all_tests or named[source].tests)
+    ]
+    ordered += [
+        (_as_path(e), "imports")
+        for e in pr_blast_radius.get("transitive_affected") or []
+        if isinstance(e, dict) and e.get("direct")
+    ]
+    # Indexing already drops pairs below the support floor; a row that still
+    # records less is weak history, not a reason to edit a test.
+    ordered += [
+        (_as_path(e), "co_change")
+        for e in pr_blast_radius.get("cochange_warnings") or []
+        if isinstance(e, dict) and e.get("support", MIN_CO_CHANGE_SUPPORT) >= MIN_CO_CHANGE_SUPPORT
+    ]
+    rows: dict[str, str] = {}
+    for path, reason in ordered:
+        if path in eligible and path not in rows:
+            rows[path] = reason
+    return [{"path": path, "reason": reason} for path, reason in rows.items()]
+
+
 def _build_pr_directive(
     response: dict,
     pr_blast_radius: dict,
@@ -543,6 +588,7 @@ def _build_pr_directive(
         exclude_spec,
     )
     missing_cochanges = all_missing_cochanges[:3]
+    all_tests_to_update = _tests_to_update(changed_files, test_paths, pr_blast_radius, exclude_spec)
     # Run-list: consume the analyzer's canonical typed population instead of
     # independently deriving test ids. Every row retains its basis through
     # de-duplication, sorting, exclusions, and the directive cap.
@@ -697,6 +743,8 @@ def _build_pr_directive(
         "tests_to_run_emitted": len(tests_to_run),
         "tests_to_run_truncated": tests_capped,
         "tests_to_run_omitted": tests_to_run_total - len(tests_to_run),
+        # Tests to edit, not to run; a file can sit in both lists.
+        "tests_to_update": all_tests_to_update,
         "test_recommendations": test_recommendations,
         "test_recommendations_total": test_recommendations_total,
         "test_recommendations_emitted": len(test_recommendations),
@@ -742,6 +790,7 @@ def _build_pr_directive(
         ("missing_cochanges", all_missing_cochanges, 3),
         ("missing_tests", all_missing_tests if coverage_usable else [], 3),
         ("tests_to_run", all_tests_to_run, _TESTS_TO_RUN_LIMIT),
+        ("tests_to_update", all_tests_to_update, _TESTS_TO_UPDATE_LIMIT),
         ("test_recommendations", all_recommendations, _TESTS_TO_RUN_LIMIT),
         (
             "files_without_measured_tests",
