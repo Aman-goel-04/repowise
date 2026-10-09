@@ -29,6 +29,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+from repowise.core.providers.embedding.registry import (
+    DEFAULT_EMBEDDER,
+    KEYLESS_EMBEDDERS,
+    list_embedders,
+)
 from repowise.core.providers.llm.specs import PROVIDER_SPECS
 
 logger = logging.getLogger(__name__)
@@ -56,6 +61,25 @@ PROVIDER_CATALOG: list[dict[str, Any]] = [
 ]
 
 _CATALOG_BY_ID = {p["id"]: p for p in PROVIDER_CATALOG}
+
+FLAG_ONLY_PROVIDERS = [spec.name for spec in PROVIDER_SPECS.values() if spec.picker_rank is None]
+
+
+def _embedder_catalog() -> list[dict[str, Any]]:
+    """Every registered embedder, read at call time so custom ones appear.
+
+    A built-in embedder reads the same credentials as the LLM provider of the
+    same name, so its env vars come from that spec; a custom one has none.
+    The default comes first so the picker opens on it; the rest stay sorted.
+    """
+    return [
+        {
+            "id": name,
+            "env_vars": list(spec.required_envs) if (spec := PROVIDER_SPECS.get(name)) else [],
+            "semantic": name not in KEYLESS_EMBEDDERS,
+        }
+        for name in sorted(list_embedders(), key=lambda n: n != DEFAULT_EMBEDDER)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -303,13 +327,30 @@ def list_provider_status(
             }
         )
 
+    # Deferred: the estimator package pulls in the generation pipeline.
+    from repowise.core.cost_estimator import lookup_cost
+
+    model = active_model or (
+        _CATALOG_BY_ID.get(active_id, {}).get("default_model") if active_id else None
+    )
+    rates = lookup_cost(model) if model else None
+    # An unpriced model on a local provider costs nothing; anywhere else it
+    # is unknown, and null rates make the dashboard show no estimate.
+    spec = PROVIDER_SPECS.get(active_id or "")
+    if rates is None and model and spec is not None and spec.local:
+        rates = (0.0, 0.0)
+    input_rate, output_rate = rates or (None, None)
     return {
         "active": {
             "provider": active_id,
-            "model": active_model
-            or (_CATALOG_BY_ID.get(active_id, {}).get("default_model") if active_id else None),
+            "model": model,
+            "input_cost_per_1k": input_rate,
+            "output_cost_per_1k": output_rate,
+            "embedder": os.environ.get("REPOWISE_EMBEDDER", DEFAULT_EMBEDDER).lower(),
         },
         "providers": providers,
+        "flag_only_providers": FLAG_ONLY_PROVIDERS,
+        "embedders": _embedder_catalog(),
     }
 
 
