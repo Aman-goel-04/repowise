@@ -1035,14 +1035,6 @@ def config_fingerprint(repo_path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _is_codex_cli_available() -> bool:
-    """Check if the Codex CLI binary is available."""
-
-    import shutil
-
-    return shutil.which("codex") is not None
-
-
 def resolve_provider(
     provider_name: str | None,
     model: str | None,
@@ -1300,48 +1292,26 @@ def validate_provider_config(provider_name: str | None = None) -> list[str]:
 
     # Required environment variables per provider, read from the registry that
     # also drives resolution, so a provider added there is validated here without
-    # a second edit. The agent-CLI providers are absent by design: they need no
-    # env var, so they are handled by the binary checks below instead.
-    from repowise.core.providers.llm.registry import (
-        PROVIDER_API_KEY_ENVS,
-        provider_required_envs,
-    )
+    # a second edit. The agent-CLI providers need no env var; the check for them
+    # is whether their CLI is installed.
+    from repowise.core.agents.identity import identity_for_provider
+    from repowise.core.providers.llm.registry import provider_required_envs
+    from repowise.core.providers.llm.specs import PROVIDER_SPECS
 
     provider_env_vars = {
-        name: list(provider_required_envs(name)) for name in (*PROVIDER_API_KEY_ENVS, "ollama")
+        name: list(provider_required_envs(name))
+        for name in PROVIDER_SPECS
+        if provider_required_envs(name)
     }
 
     if provider_name:
-        if provider_name == "codex_cli":
-            if not _is_codex_cli_available():
+        agent = identity_for_provider(provider_name)
+        if agent is not None:
+            if not agent.is_installed():
                 warnings.append(
-                    "Provider 'codex_cli' requires the Codex CLI. "
-                    "Install it with: npm install -g @openai/codex"
-                )
-            return warnings
-
-        if provider_name == "claude_cli":
-            import shutil
-
-            if not shutil.which("claude"):
-                warnings.append(
-                    "Provider 'claude_cli' requires the Claude Code CLI.\n"
-                    "  Install:  https://claude.com/claude-code\n"
-                    "  Setup:    run 'claude login' once to authenticate"
-                )
-            return warnings
-
-        if provider_name == "opencode":
-            import shutil
-
-            if not shutil.which("opencode"):
-                warnings.append(
-                    "Provider 'opencode' requires the opencode CLI.\n"
-                    "  Install:  curl -fsSL https://opencode.ai/install | bash\n"
-                    "  Setup:    run 'opencode' once to configure your provider\n"
-                    "  Models:   opencode models (list available models)\n"
-                    "  More:     https://opencode.ai\n"
-                    "  Usage:    repowise init --provider opencode --model opencode/openai/gpt-5"
+                    f"Provider '{provider_name}' requires the {agent.display_name} CLI.\n"
+                    f"  Install:  {agent.install_hint}\n"
+                    f"  Setup:    {agent.login_hint}"
                 )
             return warnings
 
@@ -1350,46 +1320,22 @@ def validate_provider_config(provider_name: str | None = None) -> list[str]:
             warnings.append(f"Unknown provider '{provider_name}' - cannot validate configuration")
             return warnings
 
+        # Any one of a provider's env vars satisfies it (GEMINI_API_KEY or
+        # GOOGLE_API_KEY), the same rule resolution applies.
         env_vars = provider_env_vars[provider_name]
-        missing_vars = []
-
-        if provider_name == "gemini":
-            # Special case: either GEMINI_API_KEY or GOOGLE_API_KEY
-            if not (_is_env_var_set("GEMINI_API_KEY") or _is_env_var_set("GOOGLE_API_KEY")):
-                missing_vars = env_vars
-        else:
-            for var in env_vars:
-                if not _is_env_var_set(var):
-                    missing_vars.append(var)
-
-        if missing_vars:
-            warnings.append(
-                f"Provider '{provider_name}' requires environment variables: {', '.join(missing_vars)}"
-            )
+        if not any(_is_env_var_set(var) for var in env_vars):
+            warnings.append(f"Provider '{provider_name}' requires {' or '.join(env_vars)}")
     else:
         # Check all providers - warn about any that could be configured but are missing keys
         for name, env_vars in provider_env_vars.items():
-            if name == "gemini":
-                if os.environ.get("REPOWISE_PROVIDER") == "gemini" and not (
-                    _is_env_var_set("GEMINI_API_KEY") or _is_env_var_set("GOOGLE_API_KEY")
-                ):
-                    # Only warn if it looks like they might be trying to use gemini
-                    warnings.append(
-                        "Provider 'gemini' requires GEMINI_API_KEY or GOOGLE_API_KEY environment variable"
-                    )
+            if any(_is_env_var_set(var) for var in env_vars):
                 continue
-
-            missing = [var for var in env_vars if not _is_env_var_set(var)]
-            if missing:
-                # Only warn if this provider is explicitly requested OR
-                # if the env var exists but is invalid (empty)
-                env_var_exists = any(_is_env_var_exists(var) for var in env_vars)
-                explicitly_requested = os.environ.get("REPOWISE_PROVIDER") == name
-
-                if explicitly_requested or env_var_exists:
-                    warnings.append(
-                        f"Provider '{name}' requires environment variables: {', '.join(missing)}"
-                    )
+            # Only warn if this provider is explicitly requested OR
+            # if the env var exists but is invalid (empty)
+            env_var_exists = any(_is_env_var_exists(var) for var in env_vars)
+            explicitly_requested = os.environ.get("REPOWISE_PROVIDER") == name
+            if explicitly_requested or env_var_exists:
+                warnings.append(f"Provider '{name}' requires {' or '.join(env_vars)}")
 
     return warnings
 
