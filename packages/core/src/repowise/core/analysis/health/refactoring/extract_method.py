@@ -10,20 +10,24 @@ OUT return). This detector turns the best such span into one structured
 ``impact_delta`` is the share of the finding the extraction itself removes,
 not the whole finding: the share of what the finding measures that moves into
 the helper, applied to the finding's ``health_impact``. That is
-``ccn_removed / ccn`` for ``complex_method``, ``slice_nloc / nloc`` for
-``large_method`` and the larger of the two for ``brain_method``, capped at 1
+``ccn_removed / ccn`` for ``complex_method`` and ``brain_method``, and the
+smaller of ``slice_nloc / nloc`` and that for ``large_method``
 (:func:`recovered_share`). Both line counts follow the walker's NLOC rule, so
 comments credit nothing. Crediting the whole finding whenever the residual and
 the helper both fell under the biomarker's bar let a two-line span in a
 function barely over the bar claim all of it, and rank first on the repo.
 
 A span is only offered when it is worth doing (:func:`_worth_extracting`): it
-removes at least two decision points, or, for a ``large_method`` finding, lifts
-at least 12 code lines, and the helper it creates would not carry the finding
-at the function's own severity or worse (lifting nearly the whole body moves
-the smell, it does not split it).
-When the best span misses that floor the next-best one that clears it is
-offered instead.
+removes at least two decision points and the helper it creates would not carry
+the finding at the function's own severity or worse (lifting nearly the whole
+body moves the smell, it does not split it). When the best span misses that
+floor the next-best one that clears it is offered instead.
+
+That span is then offered only when it is a split a reviewer would make
+(:func:`_offerable`): at most 60% of the function's lines, at least 8 code
+lines, and not opening on the docstring. A miss falls through only to a span
+that does not overlap it: an overlapping one is the same block minus a
+statement, just under the cut.
 
 A JSX function component whose decision points sit mostly in its markup
 (conditional spreads, ``&&`` and ternaries in attributes or children, template
@@ -66,6 +70,7 @@ from ..biomarkers.complex_method import ComplexMethodDetector
 from ..biomarkers.large_method import LargeMethodDetector
 from ..complexity.cyclomatic import _is_boolean_operator
 from ..complexity.languages import get_language_map
+from ..complexity.nloc import is_string_stmt
 from ..dataflow import find_extractions
 from ..scoring import severity_deduction
 from .models import RefactoringContext, RefactoringSuggestion
@@ -113,14 +118,18 @@ _SEVERITY_RULE: dict[str, Callable[[int, int], Severity | None]] = {
     "complex_method": ComplexMethodDetector.severity_for,
 }
 
-# Minimum worth. Census of the 1,162 stored plans on this repo's index: the best
-# span of 408 missed this floor (2 code lines lifting 2 decision points out of
-# ``walk_file`` was the #1 plan), 187 of those had a next-best span that clears
-# it and 221 were dropped. A size-only bar for ``large_method`` keeps big
-# low-branching spans that do shrink the finding. Table in the commit that set
-# it.
-_MIN_CCN_REMOVED = 2
-_MIN_LARGE_SPAN_NLOC = 12
+# Minimum worth: a helper lifting one decision point is a renamed ``if``, not
+# a split, however many straight lines come with it.
+_MIN_OFFER_CCN_REMOVED = 2
+
+# A span over three fifths of the function leaves a shell (a guard, a wrapper,
+# the final ``return``) behind; the smell moved instead of splitting. Inclusive,
+# since a span at exactly 0.60 still leaves real work. This is a stricter
+# offer-time gate on the function's physical lines, distinct from slice.py's
+# candidate-time ``_MAX_BODY_SHARE`` on the body's code lines.
+_MAX_SPAN_SHARE = 0.60
+# Below 8 code lines the helper's call and signature cost about what it saves.
+_MIN_OFFER_NLOC = 8
 
 # ``high`` confidence also needs the helper to take a real share of the
 # function: below a tenth (a 2-point span out of a CCN 249 function) the step
@@ -149,15 +158,7 @@ class ExtractMethodDetector(RefactoringDetector):
             if jsx_plumbing_dominates(analysis.fn_node, lmap):
                 continue
             markers = {getattr(f, "biomarker_type", "") for f in matched}
-            # Best-first, so the first span worth doing is the strongest one.
-            best = next(
-                (
-                    c
-                    for c in find_extractions(analysis, lmap)
-                    if _worth_extracting(analysis, c, markers)
-                ),
-                None,
-            )
+            best = _choose(analysis, find_extractions(analysis, lmap), markers)
             if best is None:
                 continue
             impact, share, source = self._impact_for(analysis, best, matched)
@@ -271,15 +272,11 @@ class ExtractMethodDetector(RefactoringDetector):
 
     @staticmethod
     def _confidence(extraction: Extraction, share: float) -> str:
-        """High when the extraction is unambiguous and worth handing off: it
-        removes several decision points with a clean signature and takes a real
-        share of the function. Medium otherwise. (Every emitted span is
-        single-exit with at most one return by construction.)"""
-        if (
-            extraction.ccn_removed >= _MIN_CCN_REMOVED
-            and len(extraction.params) <= 4
-            and share >= _HIGH_MIN_SHARE
-        ):
+        """High when the extraction is unambiguous and worth handing off: a
+        clean signature and a real share of the function. Medium otherwise.
+        (Every emitted span is single-exit with at most one return and removes
+        at least two decision points by construction.)"""
+        if len(extraction.params) <= 4 and share >= _HIGH_MIN_SHARE:
             return "high"
         return "medium"
 
@@ -289,25 +286,25 @@ def recovered_share(
 ) -> float:
     """Share of what *biomarker* measures that *extraction* moves into the helper.
 
-    Decision points for ``complex_method``, code lines for ``large_method``
-    (the walker's NLOC rule on both sides), the larger of the two for
-    ``brain_method``, capped at 1. Per biomarker because the plain maximum let
-    2 decision points out of a CCN 3, 292-line method claim two thirds of a
-    size finding.
+    Decision points for every biomarker except ``large_method``, the only one
+    *biomarker* changes: code lines there (the walker's NLOC rule on both
+    sides), capped at 1. Per biomarker because
+    the plain maximum let 2 decision points out of a CCN 3, 292-line method
+    claim two thirds of a size finding. Never more than the decision-point
+    share, ``brain_method`` included: a long flat span claimed most of a size
+    finding for moving straight-line code.
     """
     ccn_share = extraction.ccn_removed / analysis.ccn if analysis.ccn > 0 else 0.0
-    nloc_share = extraction.slice_nloc / analysis.nloc if analysis.nloc > 0 else 0.0
-    if biomarker == "complex_method":
-        return min(1.0, ccn_share)
     if biomarker == "large_method":
-        return min(1.0, nloc_share)
-    return min(1.0, max(ccn_share, nloc_share))
+        nloc_share = extraction.slice_nloc / analysis.nloc if analysis.nloc > 0 else 0.0
+        return min(1.0, nloc_share, ccn_share)
+    return min(1.0, ccn_share)
 
 
 def _worth_extracting(
     analysis: FunctionAnalysis, extraction: Extraction, markers: set[str]
 ) -> bool:
-    """The minimum-worth floor (the slicer already demands 5 code lines)."""
+    """The minimum-worth floor, applied while choosing among candidates."""
     for marker in markers:
         rule = _SEVERITY_RULE[marker]
         helper = rule(extraction.ccn_removed + 1, extraction.slice_nloc)
@@ -317,9 +314,54 @@ def _worth_extracting(
             before is None or severity_deduction(helper) >= severity_deduction(before)
         ):
             return False
-    if extraction.ccn_removed >= _MIN_CCN_REMOVED:
-        return True
-    return "large_method" in markers and extraction.slice_nloc >= _MIN_LARGE_SPAN_NLOC
+    return extraction.ccn_removed >= _MIN_OFFER_CCN_REMOVED
+
+
+def _choose(
+    analysis: FunctionAnalysis, candidates: list[Extraction], markers: set[str]
+) -> Extraction | None:
+    """The strongest span worth doing and offerable, best-first.
+
+    Once the strongest worth-doing span is refused, only spans disjoint from it
+    stay eligible: one overlapping it is a shrunken copy of the refused plan.
+    """
+    refused: Extraction | None = None
+    for c in candidates:
+        if not _worth_extracting(analysis, c, markers):
+            continue
+        if refused is not None and not (
+            c.end_line < refused.start_line or c.start_line > refused.end_line
+        ):
+            continue
+        if _offerable(analysis, c):
+            return c
+        refused = refused or c
+    return None
+
+
+def _offerable(analysis: FunctionAnalysis, extraction: Extraction) -> bool:
+    """Whether a span is a split worth offering (share of physical lines)."""
+    fn_lines = max(analysis.end_line - analysis.start_line + 1, 1)
+    span_lines = extraction.end_line - extraction.start_line + 1
+    if span_lines / fn_lines > _MAX_SPAN_SHARE or extraction.slice_nloc < _MIN_OFFER_NLOC:
+        return False
+    return not _starts_on_docstring(analysis.fn_node, extraction.start_line)
+
+
+def _starts_on_docstring(fn_node: Any, start_line: int) -> bool:
+    """True when the span opens on the body's docstring (or a JS/TS directive
+    such as ``"use strict"``): lifting it strips the function of it. Comments
+    before it are skipped, as they are not statements."""
+    body = fn_node.child_by_field_name("body") if fn_node is not None else None
+    if body is None:
+        return False
+    first = next((c for c in body.named_children if "comment" not in c.type), None)
+    # Only bodies holding bare string statements (Python, JS/TS) can match.
+    return (
+        first is not None
+        and is_string_stmt(first)
+        and start_line <= first.start_point[0] + 1
+    )
 
 
 def jsx_plumbing_dominates(fn_node: Any, lmap: LanguageNodeMap) -> bool:
