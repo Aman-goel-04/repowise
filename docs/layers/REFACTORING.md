@@ -103,7 +103,10 @@ Names are never invented. A suggested helper or file name is `null` when nothing
 in the code anchors one. A Split File or Extract Class plan with an unnamed group
 is held as `needs_design`, like a cycle: it is not a step and never reaches Fix
 first. Code only moves within a language family, so Java, Kotlin and Scala are
-separate. A callback is named after the call it is passed to.
+separate. A callback is named after the call it is passed to. An Extract Method
+helper is named from a stage label, a banner comment, or `compute_<value>` when the
+span has no outside effects. A name already taken where the helper lands is
+dropped, so a `null` name means you name the helper.
 
 An empty list means no detector found work that clears its gates. It does not mean
 the code needs no attention: check the findings in
@@ -180,8 +183,8 @@ Most plans answer a health finding, so per-path marker rules in
   generated code comes back as a diff.
 - Extract Method offers a span only when it can show the extraction keeps behavior
   (every returned value written on every path, no state carried across loop
-  iterations, no local a closure shares crossing the span's edge). Spans it
-  cannot prove are dropped, so it under-reports by design.
+  iterations, no local a closure shares across the span's edge). Spans it cannot
+  prove are dropped, so it under-reports by design.
 - Extract Method skips spans too small to matter and spans that would carry the
   original finding into the helper. A component whose branching is mostly in its
   markup gets no extraction.

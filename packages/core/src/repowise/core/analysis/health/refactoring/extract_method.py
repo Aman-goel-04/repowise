@@ -46,9 +46,10 @@ Plan shape (open dict, no migration):
 - ``plan`` = ``{"span": {"start": int, "end": int}, "params": [str, ...],
   "returns": [str, ...], "suggested_name": str | None}`` -- the lines to lift,
   the inferred signature, and a deterministic starting name (see
-  ``_suggested_name``). ``None`` when the span has no single informative OUT
-  value: a name derived from the enclosing function described the context
-  rather than the span, and collided with every sibling plan in the file.
+  ``helper_naming``): a ``timed()`` stage label, a banner comment, or
+  ``compute_<out>`` for an effect-free span with one informative OUT value.
+  ``None`` when nothing anchors a name, or when the name is already taken in
+  the scope the helper lands in.
 - ``plan.needs_async`` -- the span awaits, so the helper is async and its call
   is awaited. An awaiting plan also carries ``async_host``: False when the
   enclosing function is not declared async, which makes the step a judgment
@@ -79,38 +80,14 @@ from ..dataflow import find_extractions
 from ..effort import effort_bucket
 from ..perf.dialects import PERF_DIALECTS
 from ..scoring import severity_deduction
+from .helper_naming import ScopeNames, helper_name, out_value_name
 from .models import RefactoringContext, RefactoringSuggestion
-from .naming import join_identifier, split_words
 from .registry import RefactoringDetector, register
 
 if TYPE_CHECKING:
     from ..complexity.languages import LanguageNodeMap
     from ..dataflow import Extraction, FunctionAnalysis
     from ..models import Severity
-
-# OUT values whose name describes the variable's role, not the block's
-# product: ``compute_result`` names nothing the reader did not know.
-_UNINFORMATIVE_OUT = frozenset(
-    {"out", "result", "results", "value", "values", "ret", "tmp", "temp", "data", "item"}
-)
-
-# How each language that reaches this detector joins the words of a helper
-# name. Only the languages the Extract Method slicer has a dialect for
-# (``dataflow/dialects/__init__.py``) can appear here. C++ is deliberately
-# absent: it has no single convention (the standard library is snake_case,
-# Google style is PascalCase, Qt is camelCase), so it keeps the snake_case
-# default rather than getting one answer that is wrong for most C++ repos.
-_NAME_CONVENTION: dict[str, str] = {
-    "go": "camelCase",
-    "java": "camelCase",
-    "typescript": "camelCase",
-    "tsx": "camelCase",
-    "javascript": "camelCase",
-    "jsx": "camelCase",
-    "svelte": "camelCase",
-    "vue": "camelCase",
-}
-_SNAKE_CASE = "snake_case"
 
 # The function-level structural biomarkers this detector answers. A function is
 # only offered an extraction when one of these flagged it, so the suggestion
@@ -156,7 +133,9 @@ class ExtractMethodDetector(RefactoringDetector):
             return []
 
         out: list[RefactoringSuggestion] = []
-        for analysis in analyses:
+        names = ScopeNames(lmap)
+        # Source order, so the first of two colliding plans keeps the name.
+        for analysis in sorted(analyses, key=lambda a: (a.start_line, a.end_line)):
             matched = self._findings_for(analysis, ctx.findings)
             if not matched:
                 # Only suggest where a method biomarker actually fired.
@@ -179,7 +158,12 @@ class ExtractMethodDetector(RefactoringDetector):
                         "span": {"start": best.start_line, "end": best.end_line},
                         "params": list(best.params),
                         "returns": list(best.returns),
-                        "suggested_name": self._suggested_name(analysis, best, ctx.language),
+                        "suggested_name": names.claim(
+                            analysis,
+                            helper_name(
+                                analysis, best, lmap, ctx.language, names.imports(analysis.fn_node)
+                            ),
+                        ),
                         **_async_fields(analysis, best, lmap, ctx.language),
                     },
                     evidence={
@@ -234,48 +218,8 @@ class ExtractMethodDetector(RefactoringDetector):
     def _suggested_name(
         analysis: FunctionAnalysis, extraction: Extraction, language: str | None = None
     ) -> str | None:
-        """A deterministic starting name for the lifted helper, in *language*'s
-        identifier convention.
-
-        Same posture as Extract Helper (see ``naming``): anchor the name to
-        something the plan already knows rather than guess what the block does.
-        The slice's OUT value is that anchor when there is exactly one -- a span
-        whose single product is ``average`` is, by construction, the code that
-        computes it, so ``compute_average`` describes it without inferring
-        intent. With no single OUT (a void slice, or several) the only certain
-        anchor left is the function the span came out of, which at least names
-        the helper for its context. Measured over the 854 stored plans on this
-        repo's index, 545 (64%) come from the OUT value and 309 from the
-        enclosing function.
-
-        Convention is per language: Python, Rust and C++ keep ``compute_average``;
-        Go, Java and the TypeScript/JavaScript family take ``computeAverage``.
-        C++ gets no convention because it has no single one -- the standard
-        library is snake_case and Google style is PascalCase, so a fixed answer
-        would be wrong for as many repos as it fixed. The out value's own casing
-        is kept as word boundaries rather than thrown away, so ``meanValue`` is
-        ``computeMeanValue`` in Java, not ``compute_meanvalue``.
-
-        **Not unique within a file, by design.** Two functions in one file can
-        each produce a value with the same name, and both spans then get the
-        same ``compute_*``: 28 of those 854 plans, across 14 files, collide with
-        a sibling that way (the fallback branch does not collide, since there is
-        one plan per function). Uniqueness would need a per-file suffix, which
-        would renumber existing names whenever a new plan appeared and churn
-        every persisted row. The name is a starting point every surface frames
-        as editable, so the surfaces say to rename on a clash instead.
-        """
-        if len(extraction.returns) != 1:
-            return None
-        out_words = split_words(extraction.returns[0])
-        if not out_words:
-            return None
-        # ``_UNINFORMATIVE_OUT`` is keyed on the single-word slug, matching the
-        # names it holds (``meanValue`` is a product, ``result`` is a role).
-        if "_".join(out_words) in _UNINFORMATIVE_OUT:
-            return None
-        convention = _NAME_CONVENTION.get(language or "", _SNAKE_CASE)
-        return join_identifier(["compute", *out_words], convention)
+        """The OUT-value name alone (:func:`helper_naming.out_value_name`)."""
+        return out_value_name(analysis, extraction, language)
 
     @staticmethod
     def _confidence(extraction: Extraction, share: float) -> str:
