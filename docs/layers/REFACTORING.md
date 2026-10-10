@@ -55,6 +55,11 @@ filters for type, confidence and effort. A plan's drawer explains its rank, show
 the tests that reach the code and the command to run them, and can export the
 structured plan for an agent. The page never edits code or runs tests on its own.
 
+A plan lists the tests closest to the change first: measured coverage, then
+tests named for the file, then the call graph. Tests that reach the file only
+through a widely imported hub module are left out. When no test reaches the
+change, the plan has no command and asks for a characterization test first.
+
 ## Reading the results
 
 A **plan** is one detector's output for one target. An **opportunity** is one

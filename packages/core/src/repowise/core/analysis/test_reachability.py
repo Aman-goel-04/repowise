@@ -663,6 +663,7 @@ async def tests_reaching_by_tier(
     import_depth: int = DEFAULT_MAX_DEPTH,
     symbol_seeds: Mapping[str, Collection[str]] | None = None,
     test_files: set[str] | None = None,
+    avoid: Collection[str] = frozenset(),
 ) -> dict[str, ReachedBy]:
     """:func:`tests_reaching`, also saying which tier answered each target.
 
@@ -675,6 +676,10 @@ async def tests_reaching_by_tier(
     declares. A target it does not name, or names with no ids, keeps the
     ``defines`` lookup, and the
     import tier stays file-level either way.
+
+    *avoid* names files the call walk does not pass reach through, except
+    into a target's own symbols. The import tier is
+    one hop, so it never passes through anything.
 
     The call walk runs first; the import walk is then seeded with only the
     targets it left unanswered, so the weaker tier never speaks over the
@@ -700,7 +705,7 @@ async def tests_reaching_by_tier(
     out: dict[str, ReachedBy] = {}
     if call_depth >= 1:
         found = await _call_reaching(
-            session, repo_id, seeds, test_files, call_depth, symbol_seeds=symbol_seeds
+            session, repo_id, seeds, test_files, call_depth, symbol_seeds=symbol_seeds, avoid=avoid
         )
         for seed, reach in found.items():
             ordered = tuple(rank_tests(seed.split("::", 1)[0], reach))
@@ -734,6 +739,7 @@ async def _call_reaching(
     *,
     symbol_seeds: Mapping[str, Collection[str]] | None = None,
     strict: bool = False,
+    avoid: Collection[str] = frozenset(),
 ) -> dict[str, dict[str, ReachDistance]]:
     """Tests that can execute into each seed file, walking call edges backwards.
 
@@ -805,6 +811,11 @@ async def _call_reaching(
                 # A test is a leaf. Walking through one would let "test A calls
                 # shared helper B" drag B's unrelated targets in.
                 continue
+            if owner in avoid:
+                # A hub carries on only the seeds it declares itself.
+                carried = {s: d for s, d in carried.items() if s.split("::", 1)[0] == owner}
+                if not carried:
+                    continue
             known = origins.setdefault(caller, {})
             closer = {
                 seed: distance + 1
@@ -830,6 +841,7 @@ async def reach_into_symbols(
     test_files: set[str],
     *,
     max_depth: int = DEFAULT_CALL_DEPTH,
+    avoid: Collection[str] = frozenset(),
 ) -> dict[str, dict[str, ReachDistance]]:
     """Tests that call into each symbol id, keyed by the symbol, with their hops.
 
@@ -848,6 +860,7 @@ async def reach_into_symbols(
         max_depth,
         symbol_seeds={symbol: (symbol,) for symbol in seeds},
         strict=True,
+        avoid=avoid,
     )
 
 
@@ -856,12 +869,44 @@ async def imported_names_by_test(
 ) -> dict[str, dict[str, frozenset[str]]]:
     """The names each test file imports from each of *files*, keyed by file then test.
 
-    An empty set is an import of the module itself. One query, one hop: what a
-    test names, not what it reaches.
+    An empty set is an import of the module itself. One hop, plus one through a
+    re-export barrel (``index.ts``, ``__init__.py``) that imports the file: a
+    test importing ``foo`` from the barrel imports it from the file. What a test
+    names, not what it reaches.
     """
     targets = sorted({path for path in files if path})
     if not targets or not test_files:
         return {}
+    out: dict[str, dict[str, frozenset[str]]] = {}
+    barrels: dict[str, dict[str, frozenset[str]]] = {}
+    for source, target, names in await _imported_names(session, repo_id, targets):
+        if source in test_files:
+            _add_names(out, target, source, names)
+        elif PurePosixPath(source).name in BARREL_FILENAMES:
+            barrels.setdefault(source, {})[target] = names
+    if barrels:
+        for source, barrel, names in await _imported_names(session, repo_id, sorted(barrels)):
+            if source not in test_files:
+                continue
+            for target, exported in barrels[barrel].items():
+                # ``export *`` passes every name on; otherwise only the ones it re-exports.
+                passed = names if not exported or "*" in exported else names & exported
+                if passed or not names:
+                    _add_names(out, target, source, passed)
+    return out
+
+
+def _add_names(
+    out: dict[str, dict[str, frozenset[str]]], target: str, test: str, names: frozenset[str]
+) -> None:
+    by_test = out.setdefault(target, {})
+    by_test[test] = by_test.get(test, frozenset()) | names
+
+
+async def _imported_names(
+    session: AsyncSession, repo_id: str, targets: list[str]
+) -> list[tuple[str, str, frozenset[str]]]:
+    """``(importer, imported file, names)`` for every import edge into *targets*."""
     params: dict[str, Any] = {"repo_id": repo_id}
     tgt = _in_clause("p", targets, params)
     ets = _in_clause("e", sorted(FILE_DEPENDENCY_EDGE_TYPES), params)
@@ -873,18 +918,13 @@ async def imported_names_by_test(
         ),
         params,
     )
-    out: dict[str, dict[str, frozenset[str]]] = {}
+    out = []
     for source, target, names_json in rows:
-        if source not in test_files:
-            continue
         try:
             names = json.loads(names_json or "[]")
         except (TypeError, ValueError):
             names = []
-        by_test = out.setdefault(target, {})
-        by_test[source] = by_test.get(source, frozenset()) | frozenset(
-            name for name in names if isinstance(name, str)
-        )
+        out.append((source, target, frozenset(n for n in names if isinstance(n, str))))
     return out
 
 
