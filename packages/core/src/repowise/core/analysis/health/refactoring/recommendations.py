@@ -18,8 +18,11 @@ from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from repowise.core.analysis.health.effort import EFFORT_ORDER
 from repowise.core.analysis.health.grading import TARGET_SCORE
 from repowise.core.analysis.health.perf.ranking import _percentile_threshold
+from repowise.core.analysis.health.queue_rules import FilterRule, SortKeys
+from repowise.core.analysis.health.refactoring_summary import STRUCTURAL_TYPES
 from repowise.core.analysis.pr_blast import rank_tests_by_reach
 from repowise.core.analysis.test_collection import narrow_scopes
 from repowise.core.analysis.test_reachability import (
@@ -924,6 +927,103 @@ class Recommendation:
             "validation": self.validation.as_dict(),
         }
 
+    def rank_facts(self) -> dict[str, Any]:
+        """What ranking added to the stored plan, persisted once at finalize."""
+        return {
+            "benefit": self.benefit,
+            "leverage": self.leverage,
+            "cost": self.cost,
+            "risk": self.risk,
+            "rank_score": self.rank_score,
+            "dependents": self.dependents,
+            "file_nloc": self.file_nloc,
+            "file_weighted_deficit": self.file_weighted_deficit,
+            # Enriched with the caller rollup, which the stored column lacks.
+            "blast_radius": self.suggestion.blast_radius or {},
+            "validation": self.validation.as_dict(),
+        }
+
+
+_RANK_FACTS = (
+    "benefit",
+    "leverage",
+    "cost",
+    "risk",
+    "rank_score",
+    "dependents",
+    "file_nloc",
+    "file_weighted_deficit",
+)
+
+
+def stored_recommendation(row: Any) -> Recommendation | None:
+    """The recommendation finalize persisted on *row*, or ``None`` when it has
+    none or an incomplete one, so the caller rebuilds it instead."""
+    from .serving import validation_from_profile
+
+    facts = _loads_dict(_attr(row, "rank_json", None))
+    if not isinstance(facts.get("validation"), dict) or any(k not in facts for k in _RANK_FACTS):
+        return None
+    try:
+        validation = validation_from_profile(facts["validation"])
+    except TypeError:
+        return None
+    suggestion = rehydrate_suggestion(row)
+    suggestion.blast_radius = dict(facts.get("blast_radius") or {})
+    suggestion.validation = validation.as_dict()
+    return Recommendation(
+        suggestion=suggestion,
+        validation=validation,
+        **{name: facts[name] for name in _RANK_FACTS},
+    )
+
+
+#: Each bucket's place in the shared effort scale, for the ``effort`` sort.
+EFFORT_RANK = {bucket: rank for rank, bucket in enumerate(EFFORT_ORDER)}
+#: Where a bucket outside the scale sorts: with ``L``.
+UNKNOWN_EFFORT = EFFORT_RANK["L"]
+
+#: The plan list's filters, read in SQL on a ranked store
+#: (``persistence.sql.rule_predicate``) and in memory on the live path
+#: (``queue_rules.keep``), so the two cannot disagree.
+PLAN_FILTERS = (
+    FilterRule("refactoring_types", "refactoring_type", "in", "set"),
+    FilterRule("file_path", "file_path", "eq", "set"),
+    FilterRule("confidences", "confidence", "in", "truthy"),
+    FilterRule("efforts", "effort_bucket", "in", "truthy"),
+)
+
+#: The plan list's field sorts; every one but ``file`` breaks ties by the view
+#: order. ``effort`` reads :data:`EFFORT_RANK` and ``canonical`` is the view.
+PLAN_SORTS: dict[str, SortKeys] = {
+    "health": (("impact_delta", True),),
+    "blast": (("blast_size", True),),
+    "file": (("file_path", False), ("target_symbol", False), ("id", False)),
+}
+
+
+def plan_types(refactoring_type: str | None) -> tuple[str, ...] | None:
+    """The plan types a list's ``refactoring_type`` names; ``structural`` is a lens."""
+    if refactoring_type == "structural":
+        return tuple(sorted(STRUCTURAL_TYPES))
+    return (refactoring_type,) if refactoring_type else None
+
+
+def matches_search(suggestion: RefactoringSuggestion, query: str) -> bool:
+    """Whether lower-cased *query* occurs in the plan's searchable text."""
+    plan = suggestion.plan or {}
+    haystack = " ".join(
+        (
+            suggestion.file_path,
+            suggestion.target_symbol,
+            suggestion.refactoring_type,
+            suggestion.source_biomarker,
+            str(plan.get("strategy") or ""),
+            str(plan.get("intervention_symbol") or ""),
+        )
+    ).lower()
+    return query in haystack
+
 
 def _priority_components(
     suggestion: RefactoringSuggestion,
@@ -1322,6 +1422,10 @@ __all__ = [
     "CONFIDENCE_RISK",
     "DEFAULT_TEST_LIMIT",
     "EFFORT_COST",
+    "EFFORT_RANK",
+    "PLAN_FILTERS",
+    "PLAN_SORTS",
+    "UNKNOWN_EFFORT",
     "Recommendation",
     "RecommendationView",
     "ValidationEvidence",
@@ -1339,9 +1443,12 @@ __all__ = [
     "enrich_blast_radius",
     "hub_files",
     "hydrate_recommendations",
+    "matches_search",
+    "plan_types",
     "priority_score",
     "rehydrate_suggestion",
     "serialize_recommendations",
+    "stored_recommendation",
     "surface_confidence_risk",
     "target_symbol_ids",
 ]

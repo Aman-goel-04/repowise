@@ -12,13 +12,26 @@ what makes them agree.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import (
+    Select,
+    String,
+    Text,
+    bindparam,
+    case,
+    collate,
+    func,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ....analysis.finding_registry import excluded_types
 from ...models import RefactoringSuggestion, _new_uuid, _now_utc
+from ...sql import LIKE_ESCAPE, escape_like, rule_predicate
 from .._shared import _BATCH_SIZE, _finding_file_path
 
 # The finding-triage vocabulary, shared with health findings so Code Health has
@@ -248,6 +261,9 @@ async def finalize_refactoring_suggestions(
         for name in _REFRESHED_COLUMNS:
             if name in values:
                 setattr(row, name, values[name])
+        # Unranked until the finalizer ranks the refreshed content; a finalize
+        # that fails then leaves no stale rank beside fresh fields.
+        row.rank_position = row.blast_size = row.rank_json = None
         if row.status == "resolved" and row.status_reason == "no_longer_detected":
             row.status = "open"
             row.status_reason = None
@@ -475,3 +491,231 @@ async def count_refactoring_suggestions(
         )
     )
     return int((await session.execute(q)).scalar_one())
+
+
+# ---------------------------------------------------------------------------
+# Persisted rank: written once per finalize, read by every plan list
+# ---------------------------------------------------------------------------
+
+
+async def store_plan_ranks(
+    session: AsyncSession, repository_id: str, recommendations: list[Any]
+) -> None:
+    """Persist rank position, rank facts and change surface for *recommendations*.
+
+    Every other row is cleared first, so a plan the finalizer did not rank
+    (resolved, or reopened by hand since) reads as unranked and its list falls
+    back to ranking live until the next index. Neither write moves
+    ``updated_at``: a rank is derived, not a change to the plan.
+    """
+    from ....analysis.health.refactoring.recommendations import blast_size, canonical_order
+
+    table = RefactoringSuggestion.__table__
+    await session.execute(
+        update(table)
+        .where(table.c.repository_id == repository_id, table.c.rank_position.is_not(None))
+        .values(
+            rank_position=None, blast_size=None, rank_json=None, updated_at=table.c.updated_at
+        )
+    )
+    values = [
+        {
+            "plan_id": item.id,
+            "position": position,
+            "surface": blast_size(item.suggestion),
+            "facts": json.dumps(item.rank_facts(), separators=(",", ":")),
+        }
+        for position, item in enumerate(canonical_order(recommendations))
+    ]
+    statement = (
+        update(table)
+        .where(table.c.id == bindparam("plan_id"))
+        .values(
+            rank_position=bindparam("position"),
+            blast_size=bindparam("surface"),
+            rank_json=bindparam("facts"),
+            updated_at=table.c.updated_at,
+        )
+    )
+    for index in range(0, len(values), _BATCH_SIZE):
+        await session.execute(statement, values[index : index + _BATCH_SIZE])
+
+
+def _base_order(view: str, predicates: list[Any]) -> tuple[Select[Any], tuple[Any, ...]]:
+    """The plan query and its view order, before any narrowing filter.
+
+    ``file_spread`` deals one plan per file per round over the whole base set,
+    files in order of their best plan, as :func:`apply_view` does in memory.
+    """
+    if view != "file_spread":
+        query = select(RefactoringSuggestion).where(*predicates)
+        return query, (RefactoringSuggestion.rank_position,)
+    position = RefactoringSuggestion.rank_position
+    spread = (
+        select(
+            RefactoringSuggestion.id.label("plan_id"),
+            func.row_number()
+            .over(partition_by=RefactoringSuggestion.file_path, order_by=position)
+            .label("spread_round"),
+            func.min(position).over(partition_by=RefactoringSuggestion.file_path).label("first"),
+        )
+        .where(*predicates)
+        .subquery()
+    )
+    query = select(RefactoringSuggestion).join(spread, spread.c.plan_id == RefactoringSuggestion.id)
+    return query, (spread.c.spread_round, spread.c.first)
+
+
+def _sort_keys(sort: str, base: tuple[Any, ...], *, byte_order: bool) -> tuple[Any, ...]:
+    """A named sort from the shared table, ties broken by the view order.
+
+    *byte_order* collates text as Python compares it; SQLite's default already
+    does, and it has no ``"C"`` collation to name.
+    """
+    from ....analysis.health.refactoring.recommendations import (
+        EFFORT_RANK,
+        PLAN_SORTS,
+        UNKNOWN_EFFORT,
+    )
+
+    if sort == "effort":
+        bucket = case(EFFORT_RANK, value=RefactoringSuggestion.effort_bucket, else_=UNKNOWN_EFFORT)
+        return (bucket, *base)
+    keys = PLAN_SORTS.get(sort)
+    if keys is None:
+        return base
+    ordered = []
+    for name, descending in keys:
+        column = getattr(RefactoringSuggestion, name)
+        if byte_order and isinstance(column.type, String | Text):
+            column = collate(column, "C")
+        ordered.append(column.desc() if descending else column.asc())
+    return (*ordered, *base)
+
+
+def _search_prefilter(search: str) -> list[Any]:
+    """Every word of *search* in some searchable column: a superset of the
+    exact match, which :func:`matches_search` then decides.
+
+    A word ``plan_json`` may store escaped (non-ASCII, a quote, a backslash),
+    or SQLite cannot case-fold (non-ASCII), is left to the exact match alone.
+    """
+    columns = (
+        RefactoringSuggestion.file_path,
+        RefactoringSuggestion.target_symbol,
+        RefactoringSuggestion.refactoring_type,
+        RefactoringSuggestion.source_biomarker,
+        RefactoringSuggestion.plan_json,
+    )
+    return [
+        or_(
+            *(
+                func.lower(column).like(f"%{escape_like(word)}%", escape=LIKE_ESCAPE)
+                for column in columns
+            )
+        )
+        for word in search.split()
+        if word.isascii() and '"' not in word and "\\" not in word
+    ]
+
+
+async def ranked_refactoring_suggestions(
+    session: AsyncSession,
+    repository_id: str,
+    *,
+    min_confidence: str | None = None,
+    filters: Mapping[str, Any] | None = None,
+    search: str = "",
+    sort: str = "canonical",
+    view: str = "canonical",
+    limit: int | None = None,
+    offset: int = 0,
+) -> tuple[list[RefactoringSuggestion], int] | None:
+    """One page of open plans in persisted rank order, and its total.
+
+    *filters* are the params of the shared ``PLAN_FILTERS``. They narrow after
+    the view is dealt, as the in-memory path does, so a filtered
+    ``file_spread`` keeps the order the unfiltered one had. A search reads
+    every row its SQL prefilter keeps, so its cost is bounded only by that
+    prefilter. ``None`` when an open plan was not ranked by the last
+    finalize: the caller ranks live.
+    """
+    from ....analysis.health.queue_rules import active_filters
+    from ....analysis.health.refactoring.recommendations import (
+        PLAN_FILTERS,
+        matches_search,
+        rehydrate_suggestion,
+    )
+
+    base = _suggestion_filters(
+        repository_id,
+        refactoring_type=None,
+        file_paths=None,
+        min_confidence=min_confidence,
+        status="open",
+    )
+    unranked = await session.execute(
+        select(RefactoringSuggestion.id)
+        .where(*base, RefactoringSuggestion.rank_position.is_(None))
+        .limit(1)
+    )
+    if unranked.first() is not None:
+        return None
+    query, order = _base_order(view, base)
+    narrowing = [
+        rule_predicate(RefactoringSuggestion, rule, value)
+        for rule, value in active_filters(PLAN_FILTERS, filters or {})
+    ]
+    byte_order = session.get_bind().dialect.name == "postgresql"
+    query = query.where(*narrowing, *_search_prefilter(search)).order_by(
+        *_sort_keys(sort, order, byte_order=byte_order)
+    )
+    if search:
+        # The prefilter bounds the read; the exact match is the shared one.
+        rows = [
+            row
+            for row in (await session.execute(query)).scalars().all()
+            if matches_search(rehydrate_suggestion(row), search)
+        ]
+        end = None if limit is None else offset + limit
+        return rows[offset:end], len(rows)
+    total = int(
+        (await session.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
+    )
+    query = query.offset(offset)
+    if limit is not None:
+        query = query.limit(limit)
+    return list((await session.execute(query)).scalars().all()), total
+
+
+async def summarize_open_plans(
+    session: AsyncSession, repository_id: str, *, min_confidence: str | None = None
+) -> dict[str, Any]:
+    """The plan board's chip counts over the open plans, from narrow columns.
+
+    The plan payload is read only for the grouping types whose design count
+    needs it.
+    """
+    from ....analysis.health.refactoring_summary import GROUPING_TYPES, summarize_plans
+
+    kind = RefactoringSuggestion.refactoring_type
+    rows = await session.execute(
+        select(
+            kind,
+            RefactoringSuggestion.file_path,
+            RefactoringSuggestion.effort_bucket,
+            RefactoringSuggestion.impact_delta,
+            case(
+                (kind.in_(sorted(GROUPING_TYPES)), RefactoringSuggestion.plan_json), else_=None
+            ).label("plan_json"),
+        ).where(
+            *_suggestion_filters(
+                repository_id,
+                refactoring_type=None,
+                file_paths=None,
+                min_confidence=min_confidence,
+                status="open",
+            )
+        )
+    )
+    return summarize_plans(rows.all())
