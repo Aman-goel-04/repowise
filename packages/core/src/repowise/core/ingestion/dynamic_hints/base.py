@@ -38,8 +38,24 @@ class DynamicHintExtractor(ABC):
     # None -> extractors that need it build their own, as before.
     _dotnet_index = None
 
+    # Ingestion's ``{repo-relative path: raw bytes}`` for the parsed files,
+    # attached by HintRegistry.extract_all when the caller holds one, so an
+    # extractor reading every file of a language reuses the parse pass's
+    # bytes. None (or a missing path) -> read from disk.
+    _source_map = None
+
     @abstractmethod
     def extract(self, repo_root: Path) -> list[DynamicEdge]: ...
+
+    def _source_bytes(self, abs_path: Path, rel: str) -> bytes:
+        """*rel*'s bytes from the attached source map, else from disk; ``b""`` if neither."""
+        # Same contract as ``ingestion.source_text.source_bytes``; collapse into it once both exist.
+        if self._source_map is not None and (data := self._source_map.get(rel)) is not None:
+            return data
+        try:
+            return abs_path.read_bytes()
+        except OSError:
+            return b""
 
     def _rglob(self, root: Path, pattern: str) -> Iterator[Path]:
         """Pruned replacement for :py:meth:`pathlib.Path.rglob`.
