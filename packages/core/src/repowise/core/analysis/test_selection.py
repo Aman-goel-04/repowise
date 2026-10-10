@@ -28,13 +28,16 @@ is chosen when any of these hold:
 
 Otherwise the subset is the covering tests, the tests the graph shows reaching
 the changed files (a changed test, the call graph, the import graph) and
-``tests.always_run``, plus every test the graph cannot see into (not indexed,
-or with no resolved edge), plus the tests reaching files whose imports moved
-between the indexed commit and the base (:func:`plan_gap`). A test package's
-``__init__.py`` or a ``conftest.py`` (changed, deleted, or on a route to a
-changed file) stands for every test under its directory. A helper module tests
-import stands for the tests that import it, directly or through other helpers
-(basis ``helper-importers``), which are the files that run it: Python runs the
+``tests.always_run``, plus every test the graph cannot see into: one not
+indexed or with no resolved edge, and one the indexer found listing and reading
+files under a source directory or running the project's own command or module
+in a child process (it imports one module, but exercises far more). The tests
+reaching files whose imports moved between the indexed commit and the base
+(:func:`plan_gap`) run too. A test package's ``__init__.py`` or a
+``conftest.py`` (changed, deleted, or on a route to a changed file) stands for
+every test under its directory. A helper module tests import stands for the
+tests that import it, directly or through other helpers (basis
+``helper-importers``), which are the files that run it: Python runs the
 package file for each module in it, and pytest loads a conftest for each test
 at or below it. Only documentation (``docs/`` and the root README, CHANGELOG,
 LICENSE and the like, never code) that no code names is skipped without a test.
@@ -234,7 +237,9 @@ class Selection:
     ``no-tests-needed``, ``deleted-test``, ``test-tree``, ``test-package``,
     ``conftest``, ``helper-importers``, ``coverage``,
     ``changed-test``, ``call-graph``, ``import-graph``, ``filename-pattern``,
-    ``unknown``, or ``none`` when nothing was asked (no index).
+    ``unknown``, or ``none`` when nothing was asked (no index). ``why`` says,
+    per selected test file, what put it in: the changed file and evidence that
+    reached it, or the reason it runs with every subset.
     """
 
     run_all: bool
@@ -245,6 +250,7 @@ class Selection:
     always_run: tuple[str, ...] = ()
     skipped_files: tuple[str, ...] = ()
     basis: Mapping[str, str] = field(default_factory=dict)
+    why: Mapping[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -256,6 +262,7 @@ class Selection:
             "always_run": list(self.always_run),
             "skipped_files": list(self.skipped_files),
             "basis": dict(self.basis),
+            "why": dict(self.why),
         }
 
 
@@ -410,7 +417,9 @@ class SelectionInput:
     expands to. *doc_readers* maps a changed doc to a file naming it
     (:func:`doc_readers`); *plugin_loader* is a file loading pytest plugins by
     name (:func:`plugin_loader`); *unplaced_tests* are tests the graph cannot
-    see into (not indexed, or with no resolved edge), which every subset runs.
+    see into (not indexed, or with no resolved edge), and *always_run_tests*
+    maps each test the indexer found walking the source tree or running the
+    project in a child process to why; every subset runs both.
     """
 
     changed: Collection[str]
@@ -433,6 +442,7 @@ class SelectionInput:
     # :func:`plan_gap` for *index_gap*, with the targets whose rows *tiers* also
     # holds; None when the caller did not trace it, so any code there runs all.
     gap: GapPlan | None = None
+    always_run_tests: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -456,28 +466,91 @@ def select_tests(inp: SelectionInput) -> Selection:
     evidence = _Evidence.of(inp, deleted)
     per_file, file_reasons = _tests_per_file(triage.code, evidence)
     traced = bool(triage.code and inp.gap and inp.gap.targets)
-    gap_tests, route_reasons = (
-        _gap_route_tests(inp.gap.targets, paths, evidence) if traced else ([], [])
+    gap_tests, route_reasons, gap_why = (
+        _gap_route_tests(inp.gap.targets, paths, evidence) if traced else ([], [], {})
     )
     if inp.index_available:
         run_all += file_reasons + route_reasons
     basis = {**triage.basis, **{path: per_file[path][1] for path in triage.code}}
 
-    # The graph cannot say what an unplaced test reaches, so it always runs.
-    unplaced = [(t, t) for t in inp.unplaced_tests] if triage.code else []
+    # The graph cannot say what these tests reach, so they always run.
+    always = _always_running(inp) if triage.code else {}
     tests, test_files = _runnable(
-        [*(t for path in triage.code for t in per_file[path][0]), *gap_tests, *unplaced]
+        [
+            *(t for path in triage.code for t in per_file[path][0]),
+            *gap_tests,
+            *((t, t) for t in always),
+        ]
     )
     return Selection(
         run_all=bool(run_all),
-        reasons=tuple(run_all + _notes(inp, triage.skipped, bool(unplaced), traced)),
+        reasons=tuple(run_all + _notes(inp, triage.skipped, always, traced)),
         tests=tests,
         test_files=test_files,
         packages=_go_packages(triage.code, deleted, inp.go_test_dirs),
         always_run=inp.config.always_run,
         skipped_files=tuple(triage.skipped),
         basis=basis,
+        why={**gap_why, **_why(triage.code, per_file, evidence), **always},
     )
+
+
+_UNPLACED_REASON = "the graph has no edge from it into the repository's code"
+_EVERY_SUBSET = "runs with every subset: "
+
+
+def _always_running(inp: SelectionInput) -> dict[str, str]:
+    """``{test file: why it runs with every subset}``; a detected reason wins.
+
+    A detected test the checkout no longer has is left out, like any test.
+    """
+    known = set(inp.known_tests)
+    out = {t: f"{_EVERY_SUBSET}{_UNPLACED_REASON}" for t in inp.unplaced_tests}
+    for test, reason in sorted(inp.always_run_tests.items()):
+        if not known or test in known:
+            out[test] = f"{_EVERY_SUBSET}{reason}"
+    return out
+
+
+def _why(
+    code: list[str], per_file: Mapping[str, tuple[list[_TestRef], str]], ev: _Evidence
+) -> dict[str, str]:
+    """``{test file: the first changed file that selected it, and the evidence}``.
+
+    Only the first: a test several changed files reach names the first of them
+    in sorted order.
+    """
+    out: dict[str, str] = {}
+    for path in code:
+        tests, basis = per_file[path]
+        vias = {f: via for f, via in ev.inferred.get(path, ())}
+        covered = {f for _, f in ev.covered.get(path, ())}
+        for _, test_file in tests:
+            if test_file and test_file not in out:
+                via = "coverage" if test_file in covered else vias.get(test_file, basis)
+                out[test_file] = f"{path} changed ({via})"
+    return out
+
+
+def selected_by_change(selection: Selection, test: str) -> bool:
+    """Whether a changed file (not a rule) put *test* in the selection."""
+    why = selection.why.get(test.split("::", 1)[0])
+    return bool(why) and not why.startswith(_EVERY_SUBSET)
+
+
+def explain_test(selection: Selection, test: str) -> tuple[bool, list[str]]:
+    """Whether *test* (a file or node id) runs for this selection, and why, in plain lines."""
+    test_file = test.split("::", 1)[0]
+    if selection.run_all:
+        return True, ["Every test runs:", *selection.reasons]
+    if why := selection.why.get(test_file):
+        return True, [f"Selected: {why}."]
+    if test in selection.always_run or test_file in selection.always_run:
+        return True, ["Selected: it is listed in tests.always_run."]
+    return False, [
+        "Not selected: no changed file reaches it through coverage, the call graph or "
+        "the import graph, and it is not a test that runs with every subset."
+    ]
 
 
 def _triage(
@@ -536,7 +609,9 @@ def _index_reasons(inp: SelectionInput, *, has_code: bool) -> list[str]:
     return out
 
 
-def _notes(inp: SelectionInput, skipped: list[str], unplaced: bool, traced: bool) -> list[str]:
+def _notes(
+    inp: SelectionInput, skipped: list[str], always: Mapping[str, str], traced: bool
+) -> list[str]:
     """Reasons that explain the selection without forcing a full run."""
     out = []
     if traced:
@@ -545,11 +620,21 @@ def _notes(inp: SelectionInput, skipped: list[str], unplaced: bool, traced: bool
             f"The index predates {rewired} changed file(s) outside this change; "
             "the tests reaching them run too."
         )
-    if unplaced:
-        out.append(
-            f"{len(inp.unplaced_tests)} test file(s) the graph cannot see into run with "
-            f"every selection (e.g. {sorted(inp.unplaced_tests)[0]})."
-        )
+    if always:
+        detected = sorted(t for t in always if t in inp.always_run_tests)
+        unseen = len(always) - len(detected)
+        if unseen:
+            example = sorted(t for t in always if t not in inp.always_run_tests)[0]
+            out.append(
+                f"{unseen} test file(s) the graph cannot see into run with every selection "
+                f"(e.g. {example})."
+            )
+        if detected:
+            out.append(
+                f"{len(detected)} test file(s) that list source files or run the project in "
+                f"a child process run with every selection (e.g. {detected[0]}: "
+                f"{inp.always_run_tests[detected[0]]})."
+            )
     if not inp.map_current and inp.tiers.get("covered"):
         out.append(
             "The per-test map was measured at another commit, so covering tests "
@@ -700,15 +785,19 @@ def _files_under(init: str, files: Collection[str]) -> list[str]:
 
 def _gap_route_tests(
     targets: Collection[str], paths: list[str], ev: _Evidence
-) -> tuple[list[_TestRef], list[str]]:
-    """The tests reaching each gap target, and run-all reasons found on those routes."""
+) -> tuple[list[_TestRef], list[str], dict[str, str]]:
+    """The tests reaching each gap target, run-all reasons found on those routes, and why each runs."""
     tests: list[_TestRef] = []
     reasons: list[str] = []
+    why: dict[str, str] = {}
     for path in sorted(set(targets) - set(paths)):
-        found, _, why = _file_tests(path, ev, route_only=True)
+        found, _, route_reasons = _file_tests(path, ev, route_only=True)
         tests += found
-        reasons += [f"Changed after the index was built: {r}" for r in why]
-    return tests, reasons
+        reasons += [f"Changed after the index was built: {r}" for r in route_reasons]
+        for _, test_file in found:
+            if test_file:
+                why.setdefault(test_file, f"{path} changed after the index was built")
+    return tests, reasons, why
 
 
 _TestRef = tuple[str, str | None]  # (test id or file, the file it lives in)
