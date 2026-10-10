@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ActionsResponse, NextAction } from "@repowise-dev/types/actions";
 
-import { NextActions, actionsStatus } from "../../src/overview/next-actions.js";
+import { NextActions } from "../../src/overview/next-actions.js";
 import { actionHref } from "../../src/overview/action-href.js";
 
 function action(overrides: Partial<NextAction> = {}): NextAction {
@@ -112,6 +112,31 @@ describe("NextActions", () => {
     expect(onSetState.mock.calls[0]?.[0].fingerprint).toBe("fp1");
   });
 
+  it("still says everything is answered once the re-read view drops the row", async () => {
+    const onSetState = vi.fn().mockResolvedValue(undefined);
+    const before = response([], [action()]);
+    const { rerender } = render(
+      <NextActions data={before} hrefFor={() => null} onSetState={onSetState} />,
+    );
+    const chip = () => screen.getByRole("radio", { name: /This quarter/ });
+    expect(chip()).toHaveTextContent("1");
+    fireEvent.click(screen.getByRole("button", { name: /More for Raise test coverage/ }));
+    fireEvent.click(await screen.findByText("Dismiss"));
+    // Until the re-read lands, the count stays with the view, as the sentence does.
+    expect(chip()).toHaveTextContent("1");
+    await waitFor(() => expect(onSetState).toHaveBeenCalledTimes(1));
+
+    const after = response([], []);
+    after.horizons.quarter.hidden = 1;
+    rerender(<NextActions data={after} hrefFor={() => null} onSetState={onSetState} />);
+    expect(screen.getByText(/You have answered everything listed here/)).toBeInTheDocument();
+    expect(screen.queryByText(/none of them produced work/)).toBeNull();
+    expect(chip()).toHaveTextContent("0");
+    // The other time frame held nothing to answer, so it reads as empty.
+    fireEvent.click(screen.getByRole("radio", { name: /This week/ }));
+    expect(screen.getByText(/none of them produced work/)).toBeInTheDocument();
+  });
+
   it("brings a row back when the write fails", async () => {
     const onSetState = vi.fn().mockRejectedValue(new Error("nope"));
     render(
@@ -160,21 +185,21 @@ describe("the action drawer", () => {
   });
 });
 
-describe("actionsStatus", () => {
-  it("names the window by its last indexed commit and counts work only", () => {
-    const now = action({ tier: "act_now", horizons: ["week"] });
-    const signal = action({ id: "s", tier: "improve_signal", horizons: ["week"] });
-    const text = actionsStatus(response([now, signal], []), "week");
-    expect(text).toMatch(/^1 thing worth doing in the week to /);
-    expect(text).toMatch(/1 of them now\.$/);
+describe("the status sentence", () => {
+  it("renders the sentence core wrote for the open time frame", () => {
+    const data = {
+      ...response([], [action()]),
+      summary: { week: "Core wording, week.", quarter: "Core wording, quarter." },
+    };
+    render(<NextActions data={data} hrefFor={() => null} />);
+    expect(screen.getByText("Core wording, quarter.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: /This week/ }));
+    expect(screen.getByText("Core wording, week.")).toBeInTheDocument();
   });
 
-  it("points to the other time frame when this one is clear", () => {
-    expect(actionsStatus(response([], [action()]), "week")).toBe(
-      "Nothing needs you in the week to " +
-        new Date("2026-09-28T09:45:08").toLocaleDateString(undefined, { month: "short", day: "numeric" }) +
-        ", the last indexed commit. 1 thing is worth planning this quarter.",
-    );
+  it("shows no sentence from a server that predates it", () => {
+    render(<NextActions data={response([], [action()])} hrefFor={() => null} />);
+    expect(screen.queryByText(/worth doing|Nothing/)).toBeNull();
   });
 });
 
