@@ -31,7 +31,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.analysis.finding_registry import excluded_types
 from repowise.core.analysis.health.fix_first import DEFAULT_LIMIT, FixFirstQueue, build_fix_first
-from repowise.core.analysis.health.fix_first.build import MIN_WORTH, hot_cut, hot_cut_offset
+from repowise.core.analysis.health.fix_first.build import (
+    DEAD_CONFIDENCE,
+    MIN_WORTH,
+    hot_cut,
+    hot_cut_offset,
+)
 from repowise.core.analysis.health.perf.opportunity_rank import DEFAULT_QUEUE_STATES
 from repowise.core.analysis.health.refactoring.identity import REFACTORING_MODEL_VERSION
 from repowise.core.analysis.health.refactoring.models import (
@@ -46,6 +51,7 @@ from repowise.core.analysis.health.rows import detail_map
 from repowise.core.analysis.health.scoring import history_biomarkers
 
 from ...models import (
+    DeadCodeFinding,
     GitMetadata,
     GraphMetric,
     GraphNode,
@@ -55,6 +61,7 @@ from ...models import (
     RefactoringOpportunity,
     RefactoringSuggestion,
 )
+from ...sql import json_text
 
 #: Files read for plan-less finding items, by open code-shape deduction.
 #: Ceiling: a file past this rank never becomes a finding item. The queue
@@ -275,6 +282,9 @@ async def _performance(session: AsyncSession, repo_id: str) -> list[Any]:
         p.plan_state == "available",
         p.fix_strategy.is_not(None),
     )
+    # The reason is no column: read for ``expected`` rows only, in SQL, so
+    # the default queue counts each expected reason with no decode.
+    reason = json_text(p.details_json, "actionability_reason")
     return _plain(
         await session.execute(
             select(
@@ -294,10 +304,41 @@ async def _performance(session: AsyncSession, repo_id: str) -> list[Any]:
                 p.affected_call_sites_total,
                 p.affected_files_total,
                 p.status,
+                case((p.actionability_state == "expected", reason)).label(
+                    "actionability_reason"
+                ),
                 case((ready, p.details_json)).label("details_json"),
             )
             .where(p.repository_id == repo_id, p.status == "open")
             .order_by(p.rank_position)
+        )
+    )
+
+
+def _sure_dead_code(repo_id: str) -> Any:
+    d = DeadCodeFinding
+    return and_(
+        d.repository_id == repo_id,
+        d.status == "open",
+        or_(d.confidence >= DEAD_CONFIDENCE, d.safe_to_delete.is_(True)),
+    )
+
+
+async def _dead_code(session: AsyncSession, repo_id: str) -> list[Any]:
+    """Open dead-code findings sure enough to make what they cover ``unreachable``."""
+    d = DeadCodeFinding
+    return _plain(
+        await session.execute(
+            select(
+                d.kind,
+                d.file_path,
+                d.symbol_name,
+                d.start_line,
+                d.end_line,
+                d.confidence,
+                d.safe_to_delete,
+                d.status,
+            ).where(_sure_dead_code(repo_id))
         )
     )
 
@@ -365,6 +406,12 @@ async def _symbol_lines(session: AsyncSession, repo_id: str, performance: list[A
         if row.details
         for step in (row.details.get("plan") or {}).get("steps") or ()
         if not step.get("line") and "::" in (step.get("symbol") or "")
+    }
+    # And each cause's own function, which the dead-code join places by line.
+    wanted |= {
+        row.intervention_symbol
+        for row in performance
+        if row.details and "::" in (row.intervention_symbol or "")
     }
     if not wanted:
         return {}
@@ -456,6 +503,16 @@ async def _stamp(session: AsyncSession, repo_id: str) -> tuple[Any, ...]:
                 )
             ).one()
         )
+    # Dead-code rows carry no ``updated_at``; a triage change moves the count.
+    stamps.extend(
+        (
+            await session.execute(
+                select(func.max(DeadCodeFinding.analyzed_at), func.count()).where(
+                    _sure_dead_code(repo_id)
+                )
+            )
+        ).one()
+    )
     return tuple(stamps)
 
 
@@ -548,6 +605,7 @@ async def _build(
         refactoring=refactoring,
         performance=performance,
         plans=await _plans(session, repository_id, steps, full),
+        dead_code=await _dead_code(session, repository_id),
         limit=limit,
         scope=scope,
         item_id=item_id,

@@ -27,6 +27,7 @@ from .actionability import (
     PerformanceFix,
     actionability,
     assess_fix,
+    expected_reason,
     provenance_confidence,
 )
 from .causal import (
@@ -175,7 +176,11 @@ def _assemble(key: Any, members: list[Any], cap: int) -> PerformanceOpportunity:
         [facts.details for facts in members],
         cross_function=any(facts.cross_function for facts in members),
     )
-    acted = actionability(assessment, evidence_confidence)
+    acted = actionability(
+        assessment,
+        evidence_confidence,
+        expected_reason=expected_reason(members),
+    )
     magnitude = loop_magnitude(marker, [facts.details for facts in members])
     factors = rank_factors(
         marker=marker,
