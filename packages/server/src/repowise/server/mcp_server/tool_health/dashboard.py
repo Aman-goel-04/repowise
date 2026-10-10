@@ -41,7 +41,7 @@ def build_dashboard(
     )
     result: dict[str, Any] = {
         # The one lead; every block below ranks and describes.
-        **({"fix_first": _fix_first_block(data)} if data.fix_first is not None else {}),
+        **({"fix_first": _fix_first_block(data, req, pager)} if data.fix_first is not None else {}),
         "mode": "dashboard",
         "scope": pop.reported_scope,
         "counts": pop.reported_counts,
@@ -104,12 +104,33 @@ def build_dashboard(
     return result, ModeTotals(metrics=None, trends=None, modules=len(all_modules))
 
 
-def _fix_first_block(data: HealthData) -> dict[str, Any]:
-    """Core's queue in the compact projection, with the call for one full item."""
-    queue = data.fix_first
-    block = queue.as_dict(compact=True)
-    if queue.lead is not None:
-        block["detail_call"] = f"get_health(fix_id={queue.lead.id!r})"
+def _fix_first_block(data: HealthData, req: HealthRequest, pager: Pager) -> dict[str, Any]:
+    """Core's queue in the compact projection, its counts, and the call for one full item.
+
+    ``lead`` is the queue's first item, whatever page ``items`` is;
+    ``items_total`` is the eligible queue the items were cut from, starting at
+    ``cursor``. Only the lead carries ``next_call``: it is the bulk of a compact
+    item, every item's is one ``fix_id`` call away, and without it a named page
+    of 25 fits the default budget.
+    """
+    page, full = data.fix_first, data.fix_first_full
+    block = page.as_dict(compact=True)
+    for item in block["items"]:
+        item.pop("next_call", None)
+    block["lead"] = full.lead.compact() if full.lead is not None else None
+    block["counts"] = full.counts(shown=len(page.items))
+    block["items_total"] = full.totals.eligible
+    block["cursor"] = req.fix_first_cursor
+    if full.lead is not None:
+        block["detail_call"] = f"get_health(fix_id={full.lead.id!r})"
+    if req.pages_fix_first:
+        pager.note_page(
+            "fix_first",
+            start=req.fix_first_cursor,
+            shown=len(page.items),
+            total=full.totals.eligible,
+            limit=req.fix_first_cap,
+        )
     return block
 
 

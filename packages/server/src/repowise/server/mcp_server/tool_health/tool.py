@@ -125,7 +125,7 @@ async def get_health(
     targets: list[str] | None = None,
     include: list[str] | None = None,
     repo: str | None = None,
-    limit: int = 20,
+    limit: int | None = None,
     only: list[str] | None = None,
     refactoring_view: str = _REFACTORING_VIEW_DEFAULT,
     refactoring_type: str | None = None,
@@ -164,7 +164,7 @@ async def get_health(
             ``performance``/``defect``/``maintainability``/``advisory``
             do not: they filter rows into ``unknown_only_keys``.
         repo: usually omitted.
-        limit: max rows per ranked list, ``0`` for none.
+        limit: max rows per ranked list (default 20), ``0`` for none.
         cursor: zero-based offset into a ranked list.
         fix_id/finding_id/plan_id: stable ``id`` of an item, finding or plan.
         opportunity_id: ``perf...``/``refop...``: the unit, its steps or
@@ -250,7 +250,7 @@ async def get_health(
             await _attach_repository_analysis_meta(session, repository, result["_meta"])
         else:
             _attach_health_analysis_meta(result["_meta"], data.pop.all_metrics)
-        pager.report_omissions(result, omission_collector, reference_repository)
+        pager.report_omissions(result, omission_collector)
         omission_collector.attach(result)
         _attach_semantics(result, req)
         # Server-side wall clock, as ``get_context`` reports.
@@ -287,7 +287,9 @@ def _finish(
             "top_findings": findings.findings_total,
             "test_findings": findings.test_findings_total,
             "churn_complexity": len(data.churn_points),
-            "refactoring_plans": len(data.refactoring_recommendations),
+            "refactoring_plans": (
+                data.refactoring_plans.total if data.refactoring_plans is not None else 0
+            ),
             "performance_opportunities": (
                 data.performance.page.total if data.performance.page is not None else 0
             ),
