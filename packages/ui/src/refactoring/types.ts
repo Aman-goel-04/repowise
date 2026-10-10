@@ -180,6 +180,28 @@ export function extractMethodPlan(plan: RefactoringPlan): ExtractMethodPlan {
   };
 }
 
+/** The helper an extraction proposes, as one line: `async name(a, b) -> c`. */
+export function extractMethodSignature(em: ExtractMethodPlan): string {
+  const name = em.suggested_name ?? "helper";
+  const returns = em.returns.length ? ` -> ${em.returns.join(", ")}` : "";
+  return `${em.needs_async ? "async " : ""}${name}(${em.params.join(", ")})${returns}`;
+}
+
+/**
+ * The lines "Show the code" reads for a step: an extraction's stored slice,
+ * otherwise the step's own span. A step's span is the whole function it
+ * changes, which for an extraction is far more than the lines that move.
+ */
+export function stepExcerptRange(
+  step: { line_start: number | null; line_end: number | null },
+  plan: RefactoringPlan | undefined,
+): { start: number; end: number; extraction: ExtractMethodPlan | null } | null {
+  const extraction = plan?.refactoring_type === "extract_method" ? extractMethodPlan(plan) : null;
+  if (extraction?.span) return { ...extraction.span, extraction };
+  if (!step.line_start) return null;
+  return { start: step.line_start, end: step.line_end ?? step.line_start, extraction };
+}
+
 export interface SplitGroup {
   name: string | null;
   symbols: string[];

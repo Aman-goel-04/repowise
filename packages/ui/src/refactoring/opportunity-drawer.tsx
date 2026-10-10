@@ -29,6 +29,7 @@ import { Layers, Sparkles, Terminal } from "lucide-react";
 
 import { Sheet, SheetContent, SheetTitle } from "../ui/sheet";
 import { Skeleton, SkeletonRegion } from "../ui/skeleton";
+import { CollapsibleSection } from "../shared/collapsible-section";
 import { formatNumber } from "../lib/format";
 import { ValidationSummary } from "./validation-summary";
 import { CONFIDENCE_LABEL, EFFORT_LABEL, typeMeta } from "./meta";
@@ -36,7 +37,7 @@ import { CodeBlock } from "./plan-detail";
 import { SourceExcerpt } from "./source-excerpt";
 import { RelatedWork, type RelatedWorkSlotProps } from "../health/related-work";
 import { GenerateCodePanel } from "./generate-code-panel";
-import { extractHelperDetail } from "./types";
+import { extractHelperDetail, extractMethodSignature, stepExcerptRange } from "./types";
 import {
   ORDERING_NOTE,
   STATUS_LABEL,
@@ -204,6 +205,8 @@ function DrawerBody({
   // drawer, triage included, still describes a real opportunity.
   const stepsUnavailable = detail.details_status === "unavailable";
   const anyRelocated = detail.steps.some(isRelocated);
+  const guarding = guardingTestCount(detail.validation_profiles);
+  const guardingTests = guarding.count;
 
   const [pending, setPending] = React.useState<OpportunityStatus | null>(null);
   const [failed, setFailed] = React.useState(false);
@@ -266,7 +269,10 @@ function DrawerBody({
       </div>
 
       <p className="border-b border-[var(--color-border-default)] px-5 py-2 text-[12px] text-[var(--color-text-secondary)]">
-        {blastRadiusLine(detail)}
+        {blastRadiusLine(detail)}{" "}
+        {guardingTests > 0
+          ? `${guarding.atLeast ? "At least " : ""}${formatNumber(guardingTests)} guarding test${guardingTests === 1 ? "" : "s"} reach it.`
+          : "No guarding tests found."}
       </p>
 
       <div className="flex-1 space-y-6 overflow-y-auto px-5 py-5">
@@ -360,12 +366,13 @@ function DrawerBody({
           ) : null}
         </section>
 
-        {/* Always present: "nothing guards this" is the answer a person most
-            needs before changing the file, so its absence is said, not hidden. */}
-        <section>
-          <h4 className="mb-3 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-            Verify
-          </h4>
+        {/* Detail below the steps is collapsed: the line under the facts already
+            says whether tests guard the file, which is what a person decides on. */}
+        <CollapsibleSection
+          title="Verify"
+          hint={guardingTests > 0 ? `${formatNumber(guardingTests)} tests` : "none guarding"}
+          defaultOpen={guardingTests === 0}
+        >
           {detail.validation_profiles.length > 0 ? (
             <div className="space-y-4">
               {detail.validation_profiles.map((profile) => (
@@ -382,7 +389,7 @@ function DrawerBody({
               these steps.
             </p>
           )}
-        </section>
+        </CollapsibleSection>
 
         <RelatedWork
           related={related?.file_path === detail.file_path ? related : null}
@@ -393,10 +400,7 @@ function DrawerBody({
         />
 
         {detail.evidence.length > 0 ? (
-          <section>
-            <h4 className="mb-1 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-              Evidence
-            </h4>
+          <CollapsibleSection title="Evidence" hint={formatNumber(detail.evidence_total)}>
             {/* Named as observation, not instruction. These are mostly demoted
                 clone groups: real duplication, not a change worth making on its
                 own account. */}
@@ -426,15 +430,19 @@ function DrawerBody({
                 Showing {detail.evidence_emitted} of {detail.evidence_total} observations.
               </p>
             ) : null}
-          </section>
+          </CollapsibleSection>
         ) : null}
 
         {others.length > 0 ? (
-          <section>
-            <h4 className="mb-2 flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-              <Layers className="h-3.5 w-3.5" />
-              Also affected
-            </h4>
+          <CollapsibleSection
+            title={
+              <span className="flex items-center gap-1.5">
+                <Layers className="h-3.5 w-3.5" aria-hidden="true" />
+                Also affected
+              </span>
+            }
+            hint={formatNumber(others.length)}
+          >
             <ul className="space-y-1">
               {others.map((f) => {
                 const href = fileHref?.(f, null);
@@ -456,14 +464,17 @@ function DrawerBody({
                 );
               })}
             </ul>
-          </section>
+          </CollapsibleSection>
         ) : null}
 
-        <section>
-          <h4 className="mb-2 flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-            <Terminal className="h-3.5 w-3.5" />
-            Ask for this by id
-          </h4>
+        <CollapsibleSection
+          title={
+            <span className="flex items-center gap-1.5">
+              <Terminal className="h-3.5 w-3.5" aria-hidden="true" />
+              Ask for this by id
+            </span>
+          }
+        >
           <p className="text-[12.5px] text-[var(--color-text-secondary)]">
             Copy the prompt with the Claude + MCP flavor and it carries this call, so the agent
             can pull the same record itself rather than working from the pasted copy. The other
@@ -472,7 +483,7 @@ function DrawerBody({
           <p className="mt-1.5 break-all rounded bg-[var(--color-bg-inset)] px-2 py-1.5 font-mono text-xs text-[var(--color-text-primary)]">
             {opportunityHandoffCall(detail.opportunity_id)}
           </p>
-        </section>
+        </CollapsibleSection>
       </div>
 
       {/* The prompt carries the ordered steps; without them it would hand an
@@ -601,7 +612,9 @@ function StepCard({
  * Closed by default: a drawer of seven open excerpts would bury the order of
  * the steps, which is the drawer's subject. The excerpt prefers the text the
  * stored plan carries (an extract-helper block); otherwise it reads the file
- * the way the file view does and cuts the step's span out of it.
+ * the way the file view does and cuts out the lines the step changes. For an
+ * extraction that is the slice, under the helper's proposed signature, not the
+ * whole function the step's span covers.
  */
 function StepCode({
   step,
@@ -616,7 +629,10 @@ function StepCode({
 }) {
   const [open, setOpen] = React.useState(false);
   const stored = plan ? extractHelperDetail(plan) : null;
-  const canRead = Boolean(readSource && step.line_start);
+  const range = stepExcerptRange(step, plan);
+  const extraction = range?.extraction ?? null;
+  const slice = extraction?.span ?? null;
+  const canRead = Boolean(readSource && range);
   if (!stored?.snippet && !canRead && !plan) return null;
   return (
     <div className="mt-2">
@@ -630,13 +646,21 @@ function StepCode({
       </button>
       {open ? (
         <div className="mt-2 space-y-3">
+          {extraction && slice ? (
+            <p className="text-[11.5px] text-[var(--color-text-tertiary)]">
+              Lines {slice.start} to {slice.end} become{" "}
+              <code className="break-all font-mono text-[var(--color-text-primary)]">
+                {extractMethodSignature(extraction)}
+              </code>
+            </p>
+          ) : null}
           {stored?.snippet ? (
             <CodeBlock code={stored.snippet} startLine={stored.snippetStartLine} />
           ) : canRead ? (
             <SourceExcerpt
               path={step.file_path}
-              start={step.line_start!}
-              end={step.line_end ?? step.line_start!}
+              start={range!.start}
+              end={range!.end}
               readSource={readSource!}
             />
           ) : null}
@@ -651,6 +675,24 @@ function StepCode({
       ) : null}
     </div>
   );
+}
+
+/**
+ * Distinct guarding tests across an opportunity's validation profiles.
+ *
+ * Profiles are deduplicated by their whole content, so two steps with
+ * different validations get two profiles that can name the same tests:
+ * summing `total` would count those twice. A truncated profile lists only
+ * some of its tests, so the count is then a floor, never less than any one
+ * profile's total.
+ */
+export function guardingTestCount(
+  profiles: ReadonlyArray<{ total: number; tests: string[]; truncated?: boolean | undefined }>,
+): { count: number; atLeast: boolean } {
+  const distinct = new Set(profiles.flatMap((profile) => profile.tests)).size;
+  const largest = profiles.reduce((n, profile) => Math.max(n, profile.total), 0);
+  const atLeast = profiles.length > 1 && profiles.some((p) => p.truncated || p.tests.length < p.total);
+  return { count: Math.max(distinct, largest), atLeast };
 }
 
 /**

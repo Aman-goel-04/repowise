@@ -43,7 +43,7 @@ import { Segmented } from "../shared/segmented";
 import { exclusionPhrase } from "../health/fix-first/scope";
 import { formatNumber } from "../lib/format";
 import { OpportunityRows } from "./opportunity-rows";
-import { RefactoringLede } from "./refactoring-lede";
+import { RefactoringLede, type RefactoringFacets } from "./refactoring-lede";
 import { StartHere } from "./start-here";
 import { CONFIDENCE_LABEL, EFFORT_LABEL } from "./meta";
 import { STATUS_LABEL, TRIAGE_STATUSES } from "./opportunity";
@@ -99,11 +99,12 @@ export interface RefactoringBoardProps {
   opportunities: RefactoringOpportunity[];
   /** The repository rollup the endpoint returns. Feeds the lede. */
   summary?: RefactoringOpportunityRollup | null | undefined;
+  /** The page's facet counts, which the lede's filter chips count. */
+  facets?: RefactoringFacets | null | undefined;
   /** Bounded structural head for Start here, already filtered to lead types. */
   structuralOpportunities?: RefactoringOpportunity[] | undefined;
   serverState: RefactoringBoardServerState;
   onServerStateChange: (change: Partial<RefactoringBoardServerState>) => void;
-  indexedFileCount?: number | undefined;
   onOpen?: ((opportunity: RefactoringOpportunity) => void) | undefined;
   onAiPrompt?: ((opportunity: RefactoringOpportunity) => void) | undefined;
   onStatusChange?:
@@ -125,10 +126,10 @@ export interface RefactoringBoardProps {
 export function RefactoringBoard({
   opportunities,
   summary,
+  facets,
   structuralOpportunities,
   serverState,
   onServerStateChange,
-  indexedFileCount,
   onOpen,
   onAiPrompt,
   onStatusChange,
@@ -175,10 +176,20 @@ export function RefactoringBoard({
   const hiddenTotal = serverState.hidden?.total ?? 0;
   const hiddenWhy = serverState.hidden ? exclusionPhrase(serverState.hidden.by_reason) : "";
 
+  const quickWinsActive = serverState.effort === "S";
+  const toggleQuickWins = () =>
+    onServerStateChange({ effort: quickWinsActive ? null : "S", offset: 0 });
+
   return (
     <div className="space-y-10">
       {showLede ? (
-        <RefactoringLede summary={summary} indexedFileCount={indexedFileCount} />
+        <RefactoringLede
+          summary={summary}
+          facets={facets}
+          quickWinsActive={quickWinsActive}
+          onToggleQuickWins={toggleQuickWins}
+          onSeeStructural={onSeeStructural}
+        />
       ) : null}
 
       {showLede && (structuralOpportunities?.length ?? 0) > 0 ? (
