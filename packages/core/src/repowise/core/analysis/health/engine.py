@@ -110,18 +110,7 @@ log = structlog.get_logger(__name__)
 # Not a licence to move a calibrated scoring weight — those are frozen
 # independently of this stamp.
 #
-# Current stamp (v39): a Rust ``use`` statement's I/O boundary classification
-# is per leaf instead of per statement, so a grouped import
-# (``use std::{fs::File, collections::HashMap};``) no longer binds every name
-# in the group to whichever module resolves first. ``use std::{fs::File,
-# collections::HashMap};`` now binds only ``fs``/``File`` to ``filesystem``;
-# ``collections``/``HashMap`` bind nothing. ``io_boundary_names`` changes for
-# any Rust file with a grouped ``use``, and so does any ``io_in_loop`` /
-# ``hot_path_sync_io`` finding that depended on the wrong member winning the
-# group (a db import listed after a filesystem one in the same group, for
-# example, was previously invisible to the sink gate).
-#
-# v38: Split File's co-change edge reads per-function commit
+# Current stamp (v38): Split File's co-change edge reads per-function commit
 # sets (the 50 newest distinct commits of each function, stored on
 # ``git_function_blame``), and a class takes the union of its methods' sets
 # instead of blame over its whole span. Group membership is a kernel input to
@@ -391,7 +380,7 @@ log = structlog.get_logger(__name__)
 # forms. Files that were counted untested and are not become tested, which
 # moves untested-hotspot findings and the scores that carry them, on every
 # language with a prefix or spec convention rather than Ruby alone.
-HEALTH_ANALYZER_VERSION = 39
+HEALTH_ANALYZER_VERSION = 38
 
 
 def _mark_deprecated(
