@@ -313,3 +313,217 @@ async def test_data_files_are_not_routes_and_helper_importers_are_reported(
         "tests/test_a.py": "import-graph",
     }
     assert out["helper_importers"]["tests/helpers.py"] == ["tests/test_a.py"]
+
+
+_CONFTEST = '''
+import pytest
+from app import store
+
+
+@pytest.fixture(autouse=True)
+def _isolate(monkeypatch):
+    monkeypatch.setattr(store, "_cache", None)
+
+
+@pytest.fixture
+def db():
+    return store.open()
+'''
+
+
+async def _conftest_graph(session, repo_id, *, stamped: bool) -> None:
+    """A conftest importing ``store``, one test asking for its ``db`` fixture, two not."""
+    from repowise.core.persistence.models import GraphEdge, GraphNode
+
+    tests = ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+    await _graph(
+        session,
+        repo_id,
+        tests={*tests, "tests/conftest.py"},
+        files={"src/app/store.py", "src/app/util.py"},
+        imports=[("src/app/store.py", "src/app/util.py"), ("tests/conftest.py", "src/app/store.py")],
+    )
+    for sym in ("tests/conftest.py::db", "tests/conftest.py::_isolate", "tests/test_a.py::test_x"):
+        session.add(GraphNode(repository_id=repo_id, node_id=sym, node_type="symbol"))
+    for test in tests:
+        session.add(
+            GraphEdge(
+                repository_id=repo_id,
+                source_node_id=test,
+                target_node_id="tests/conftest.py",
+                edge_type="framework",
+                hint_source="pytest_conftest",
+            )
+        )
+    session.add(
+        GraphEdge(
+            repository_id=repo_id,
+            source_node_id="tests/test_a.py::test_x",
+            target_node_id="tests/conftest.py::db",
+            edge_type="framework_binds",
+            hint_source="pytest_fixture" if stamped else None,
+        )
+    )
+    await session.commit()
+
+
+async def test_a_conftest_reached_through_its_imports_runs_only_the_tests_it_can_break(
+    async_session,
+) -> None:
+    """Only ``db`` runs the changed code; the autouse fixture just patches it."""
+    repo = await insert_repo(async_session)
+    await _conftest_graph(async_session, repo.id, stamped=True)
+
+    out = _empty_result(1)
+    await _resolve_impacted(
+        async_session,
+        repo.id,
+        {"src/app/util.py": None},
+        set(),
+        out,
+        pytest_texts={"tests/conftest.py": _CONFTEST},
+    )
+
+    assert _pairs(out, "src/app/util.py") == {"tests/test_a.py": "conftest-fixture"}
+    assert any("only through its imports" in n for n in out["conftest_notes"])
+
+
+async def test_an_index_without_stamped_fixture_requests_keeps_every_test(async_session) -> None:
+    repo = await insert_repo(async_session)
+    await _conftest_graph(async_session, repo.id, stamped=False)
+
+    out = _empty_result(1)
+    await _resolve_impacted(
+        async_session,
+        repo.id,
+        {"src/app/util.py": None},
+        set(),
+        out,
+        pytest_texts={"tests/conftest.py": _CONFTEST},
+    )
+
+    assert "tests/conftest.py" in _pairs(out, "src/app/util.py")
+    assert any("before fixture requests were recorded" in n for n in out["conftest_notes"])
+
+
+async def test_a_conftest_only_patching_the_route_runs_one_import_check(async_session) -> None:
+    repo = await insert_repo(async_session)
+    await _conftest_graph(async_session, repo.id, stamped=True)
+    source = _CONFTEST.split("@pytest.fixture\ndef db")[0]
+
+    out = _empty_result(1)
+    await _resolve_impacted(
+        async_session,
+        repo.id,
+        {"src/app/util.py": None},
+        set(),
+        out,
+        pytest_texts={"tests/conftest.py": source},
+    )
+
+    assert _pairs(out, "src/app/util.py") == {"tests/test_a.py": "conftest-import-check"}
+
+
+async def _add_edge(session, repo_id, source, target, edge_type, hint=None) -> None:
+    from repowise.core.persistence.models import GraphEdge
+
+    session.add(
+        GraphEdge(
+            repository_id=repo_id,
+            source_node_id=source,
+            target_node_id=target,
+            edge_type=edge_type,
+            hint_source=hint,
+        )
+    )
+    await session.commit()
+
+
+async def _narrowed(session, repo_id) -> dict[str, str]:
+    out = _empty_result(1)
+    await _resolve_impacted(
+        session,
+        repo_id,
+        {"src/app/util.py": None},
+        set(),
+        out,
+        pytest_texts={"tests/conftest.py": _CONFTEST},
+    )
+    return out
+
+
+async def test_a_request_the_index_cannot_record_keeps_every_test(async_session) -> None:
+    from sqlalchemy import update
+
+    from repowise.core.persistence.models import GraphEdge
+
+    repo = await insert_repo(async_session)
+    await _conftest_graph(async_session, repo.id, stamped=True)
+    await async_session.execute(
+        update(GraphEdge)
+        .where(GraphEdge.source_node_id == "tests/test_b.py")
+        .values(hint_source="pytest_conftest_unrecorded")
+    )
+    await async_session.commit()
+
+    out = await _narrowed(async_session, repo.id)
+
+    assert "tests/conftest.py" in _pairs(out, "src/app/util.py")
+    assert any("tests/test_b.py asks for fixtures" in n for n in out["conftest_notes"])
+
+
+async def test_an_unresolved_conftest_import_keeps_every_test(async_session) -> None:
+    repo = await insert_repo(async_session)
+    await _conftest_graph(async_session, repo.id, stamped=True)
+    await _add_edge(async_session, repo.id, "tests/test_c.py", "external:conftest", "imports")
+
+    out = await _narrowed(async_session, repo.id)
+
+    assert "tests/conftest.py" in _pairs(out, "src/app/util.py")
+    assert any("could not resolve" in n for n in out["conftest_notes"])
+
+
+async def test_a_resolved_conftest_import_keeps_its_importer(async_session) -> None:
+    """``from conftest import helper`` is an import: that test runs whatever it reaches."""
+    from sqlalchemy import update
+
+    from repowise.core.persistence.models import GraphEdge
+
+    repo = await insert_repo(async_session)
+    await _conftest_graph(async_session, repo.id, stamped=True)
+    await async_session.execute(
+        update(GraphEdge)
+        .where(GraphEdge.source_node_id == "tests/test_c.py", GraphEdge.edge_type == "framework")
+        .values(edge_type="imports", hint_source=None)
+    )
+    await async_session.commit()
+
+    out = await _narrowed(async_session, repo.id)
+
+    assert _pairs(out, "src/app/util.py") == {
+        "tests/test_a.py": "conftest-fixture",
+        "tests/test_c.py": "conftest-fixture",
+    }
+
+
+async def test_a_reaching_fixture_nobody_requests_selects_only_the_import_check(
+    async_session,
+) -> None:
+    from sqlalchemy import delete
+
+    from repowise.core.persistence.models import GraphEdge
+
+    repo = await insert_repo(async_session)
+    await _conftest_graph(async_session, repo.id, stamped=True)
+    await async_session.execute(
+        delete(GraphEdge).where(GraphEdge.target_node_id == "tests/conftest.py::db")
+    )
+    # Another fixture request elsewhere shows the index records them.
+    await _add_edge(
+        async_session, repo.id, "tests/test_b.py::test_x", "tests/other.py::f",
+        "framework_binds", "pytest_fixture",
+    )
+
+    out = await _narrowed(async_session, repo.id)
+
+    assert _pairs(out, "src/app/util.py") == {"tests/test_a.py": "conftest-import-check"}

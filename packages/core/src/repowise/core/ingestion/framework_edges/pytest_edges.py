@@ -1,18 +1,40 @@
 """pytest conftest convention edges.
 
 Two conventions, both invisible to a static import graph: a ``conftest.py`` is
-imported by collection rather than by any statement, and a test's parameter
+imported by collection, not by any statement, and a test's parameter
 names are fixture requests resolved at run time.
+
+Every way a test or fixture asks for a fixture by name becomes a
+``framework_binds`` edge stamped :data:`FIXTURE_HINT`: a test's parameters, a
+fixture's own parameters, ``@pytest.mark.usefixtures(...)`` on a test or its
+class, a module's ``pytestmark`` usefixtures, and ``request.getfixturevalue``
+with a literal name. Test selection reads these edges to find every test that
+uses a fixture, and trusts them only when the stamp shows all of these forms
+were recorded. A request no edge can record (a computed name, a test inherited
+from a base class declared elsewhere, a class-level ``pytestmark``, marks inside
+``pytest.param``, a parametrize call in a hook, any other code use of a
+request name such as an aliased mark, ``add_marker`` or ``fixturenames``, a
+config ``usefixtures`` or ``python_functions``, a helper asking for a fixture,
+a file whose text is not available) is stamped
+:data:`UNRECORDED_HINT` on the conftest edges it could reach, and selection
+keeps every test under those conftests.
 """
 
 from __future__ import annotations
 
+import io
 import re
+import tokenize
+from collections import Counter
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...pytest_roots import DEFAULT_PYTHON_FUNCTIONS
 from ..resolvers import ResolverContext
+from ..source_text import decode_source, source_text
 from ..type_names import strip_type_arguments
 from .base import (
     DetectionContext,
@@ -36,6 +58,40 @@ _QUOTED_RE = re.compile(r"""["']([^"']*)["']""")
 # top-level keyword only: a `name=` nested in a params list is not the
 # fixture's name.
 _NAME_KWARG_ARG_RE = re.compile(r"""^name\s*=\s*["']([^"']+)["']$""")
+_USEFIXTURES_RE = re.compile(r"^@(?:[\w.]+\.)?usefixtures\b")
+# A module-level `pytestmark = pytest.mark.usefixtures("a")` (or a list of
+# marks): the statement up to the next top-level line.
+_PYTESTMARK_RE = re.compile(r"^pytestmark\b[^\n]*(?:\n[ \t)\]][^\n]*)*", re.MULTILINE)
+_USEFIXTURES_CALL_RE = re.compile(r"usefixtures\(([^)]*)\)")
+# The name is captured only when it is a literal alone in the call.
+_GETFIXTUREVALUE_RE = re.compile(r"""getfixturevalue\(\s*(?:["'](\w+)["']\s*(?=\)))?""")
+# Names through which code can ask for a fixture. A use of one that is not a
+# form this module records (a literal decorator, a module ``pytestmark``, a
+# literal ``getfixturevalue`` call in a test or fixture) hides a request.
+_REQUEST_NAMES = frozenset(
+    {"usefixtures", "getfixturevalue", "add_marker", "applymarker", "fixturenames",
+     "lazy_fixture", "fixture_ref"}
+)
+_AUTOUSE_KWARG_RE = re.compile(r"^autouse\s*=\s*(.+)$")
+_INDIRECT_KWARG_RE = re.compile(r"^indirect\s*=")
+_LITERAL_RE = re.compile(r"""(["'])\w+\1""")
+_LITERAL_LIST_RE = re.compile(r"""[\[(]\s*(?:(["'])\w+\1\s*,?\s*)*[\])]""")
+# A `pytestmark` inside a class body, and a parametrize called instead of
+# applied as a decorator (`metafunc.parametrize(..., indirect=True)`).
+_CLASS_PYTESTMARK_RE = re.compile(r"^[ \t]+pytestmark\b", re.MULTILINE)
+_CALL_PARAMETRIZE_RE = re.compile(r"^[ \t]*[^@\s#][^\n]*\bparametrize\(", re.MULTILINE)
+# Bases a test class may name without carrying fixture requests of its own.
+_PLAIN_BASES = frozenset(
+    {"object", "ABC", "abc.ABC", "TestCase", "unittest.TestCase", "IsolatedAsyncioTestCase",
+     "unittest.IsolatedAsyncioTestCase"}
+)
+
+# Stamped on every fixture-request edge, so a reader can tell an index that
+# records all request forms from one built before they were recorded.
+FIXTURE_HINT = "pytest_fixture"
+# Stamped instead of the conftest hint on a test -> conftest edge when the test
+# (or the conftest) may request that conftest's fixtures in a way no edge records.
+UNRECORDED_HINT = "pytest_conftest_unrecorded"
 
 # pytest's own `python_files` default, and deliberately not the shared
 # `is_test_path`. A fixture is injected only into a file pytest actually
@@ -44,10 +100,8 @@ _NAME_KWARG_ARG_RE = re.compile(r"""^name\s*=\s*["']([^"']+)["']$""")
 # `tests/helpers.py` and every non-Python spec layout. Widening it would inject
 # fixture parameters into files that are never collected.
 #
-# Ceiling: `python_files` is configurable and this assumes the default, unlike
-# `_DEFAULT_TEST_CLASS_GLOBS` below, which reads the setting because assuming it
-# cost 346 of celery's 359 bindings. No corpus repo overrides `python_files`, so
-# the same mistake is not yet demonstrable here.
+# Used only when the traverser's pytest roots are not known; with them, the
+# configured `python_files` decide.
 _TEST_FILE_RE = re.compile(r"(?:^|/)(?:test_[^/]*|[^/]*_test)\.py$")
 
 # pytest collects methods only from classes matching `python_classes`, so a
@@ -243,61 +297,102 @@ def _add_conftest_edges(
     return count
 
 
-def _registered_name(sym: Any, decorator: str) -> str:
-    """The name pytest registers the fixture under.
+def fixture_declaration(name: str, decorators: Iterable[str]) -> tuple[str, bool] | None:
+    """``(registered name, autouse)`` when *decorators* declare a pytest fixture.
 
-    ``name=`` must be read as a top-level keyword, not found anywhere in the
-    text: ``@pytest.fixture(params=[dict(name="alice")])`` otherwise registers
-    the fixture as ``alice``, which both loses the real request and mints a
-    fabricated one.
+    ``name=`` and ``autouse=`` are read as top-level keywords only:
+    ``@pytest.fixture(params=[dict(name="alice")])`` registers the fixture
+    under its own name. An ``autouse`` that is not the literal ``False`` may be
+    true, so it counts as autouse.
     """
-    for arg in _call_arguments(decorator):
-        match = _NAME_KWARG_ARG_RE.match(arg)
-        if match:
-            return match.group(1)
-    return sym.name
+    for dec in decorators:
+        if not _FIXTURE_DECORATOR_RE.match(dec.strip()):
+            continue
+        registered, autouse = name, False
+        for arg in _call_arguments(dec):
+            if match := _NAME_KWARG_ARG_RE.match(arg):
+                registered = match.group(1)
+            elif match := _AUTOUSE_KWARG_RE.match(arg):
+                autouse = match.group(1).strip() not in ("False", "0", "None")
+        return registered, autouse
+    return None
 
 
 def _declared_fixtures(parsed: Any) -> dict[tuple[str | None, str], str]:
     """``{(owning class or None, fixture name): symbol id}``.
 
-    Keyed by scope rather than by name alone. A fixture declared inside a test
-    class serves that class only, and flattening the two makes every sibling
-    class share it — which is a wrong edge whichever way the collision is
-    resolved.
+    Keyed by scope as well as by name. A fixture declared inside a test class
+    serves that class only, and flattening the two makes every sibling class
+    share it, which is a wrong edge whichever way the collision is resolved.
     """
     out: dict[tuple[str | None, str], str] = {}
     for sym in parsed.symbols:
         if sym.kind not in ("function", "method"):
             continue
-        for dec in sym.decorators:
-            if not _FIXTURE_DECORATOR_RE.match(dec.strip()):
-                continue
-            out.setdefault((sym.parent_name, _registered_name(sym, dec)), sym.id)
-            break
+        if declared := fixture_declaration(sym.name, sym.decorators):
+            out.setdefault((sym.parent_name, declared[0]), sym.id)
     return out
 
 
-def _requested_fixtures(sym: Any) -> list[str]:
-    """The parameter names *sym* asks pytest to inject.
+@dataclass
+class _Requests:
+    """What a list of decorators asks for: names it supplies, names it requests."""
 
-    Reads the recorded signature rather than re-parsing: a second pass over
-    every test file is the cost of running inside the build rather than beside
-    it.
-    """
-    supplied: set[str] = set()
-    for dec in sym.decorators:
-        if not _PARAMETRIZE_RE.match(dec.strip()):
+    supplied: set[str] = field(default_factory=set)
+    requested: list[str] = field(default_factory=list)
+    # A request the text does not name (a computed ``indirect`` or usefixtures argument).
+    unknown: bool = False
+
+
+def _argnames(spec: str) -> list[str]:
+    return [p.strip() for token in _QUOTED_RE.findall(spec) for p in token.split(",") if p.strip()]
+
+
+def _decorator_requests(decorators: Iterable[str]) -> _Requests:
+    """Supplied argnames, and fixtures requested by ``usefixtures`` or ``indirect`` parametrize."""
+    out = _Requests()
+    for dec in decorators:
+        dec = dec.strip()
+        if _USEFIXTURES_RE.match(dec):
+            for arg in _call_arguments(dec):
+                if _LITERAL_RE.fullmatch(arg):
+                    out.requested.append(arg[1:-1])
+                else:
+                    out.unknown = True
             continue
-        # Only the first argument is the argnames spec. Reading the whole
-        # decorator instead makes every parametrize *value* look like a name
-        # the test supplies, so a real fixture request whose name is also a
-        # common literal is silently refused.
+        if not _PARAMETRIZE_RE.match(dec):
+            continue
+        # Only the first argument is the argnames spec: reading the whole
+        # decorator makes every parametrize value look like a supplied name.
         args = _call_arguments(dec)
-        if args:
-            for token in _QUOTED_RE.findall(args[0]):
-                supplied.update(p.strip() for p in token.split(","))
+        if not args:
+            continue
+        names = _argnames(args[0])
+        indirect = next(
+            (a.split("=", 1)[1].strip() for a in args[1:] if _INDIRECT_KWARG_RE.match(a)),
+            args[2] if len(args) > 2 and "=" not in args[2] else None,
+        )
+        # `indirect` hands the value to the fixture of that name: a request.
+        if indirect in (None, "False"):
+            out.supplied.update(names)
+        elif indirect == "True":
+            out.requested.extend(names)
+        elif _LITERAL_LIST_RE.fullmatch(indirect):
+            via = set(_QUOTED_RE.findall(indirect))
+            out.requested.extend(n for n in names if n in via)
+            out.supplied.update(n for n in names if n not in via)
+        else:
+            out.requested.extend(names)
+            out.unknown = True
+    return out
 
+
+def _requested_fixtures(sym: Any, supplied: set[str] = frozenset()) -> list[str]:
+    """The parameter names *sym* asks pytest to inject, minus *supplied* argnames.
+
+    Reads the recorded signature: a second parse of every test file is the cost
+    of running inside the build, not beside it.
+    """
     names = []
     for raw in _call_arguments(sym.signature or ""):
         # A defaulted parameter is never injected -- pytest skips any argument
@@ -306,23 +401,95 @@ def _requested_fixtures(sym: Any) -> list[str]:
         if raw.startswith("*") or _has_default(raw):
             continue
         name = raw.split(":")[0].strip()
-        if not name or name in ("self", "cls", "/"):
-            continue
-        if name in supplied:
+        if not name or name in ("self", "cls", "/") or name in supplied:
             continue
         names.append(name)
     return names
 
 
-def _add_fixture_injection_edges(
-    graph: nx.DiGraph, parsed_files: dict[str, Any], repo_path: Path | None = None
-) -> int:
-    """Link each test function to the fixture it asks for by name.
+def _module_usefixtures(text: str) -> tuple[list[str], bool]:
+    """Fixture names a module-level ``pytestmark`` applies, and whether any is computed."""
+    names: list[str] = []
+    unknown = False
+    for mark in _PYTESTMARK_RE.findall(text):
+        for call in _USEFIXTURES_CALL_RE.findall(mark):
+            args = _call_arguments(f"({call})")
+            # `usefixtures(*names())` stops the capture early and parses to nothing.
+            unknown = unknown or (bool(call.strip()) and not args)
+            for arg in args:
+                if _LITERAL_RE.fullmatch(arg):
+                    names.append(arg[1:-1])
+                else:
+                    unknown = True
+    return names, unknown
 
-    Scope follows pytest's own rule, innermost first: the test's own class, then
-    its module, then the nearest ``conftest.py`` at or above it. Nothing else is
-    searched, so a plugin-provided fixture stays unclaimed rather than being
-    bound to a same-named local one.
+
+def _request_name_uses(text: str) -> Counter[str] | None:
+    """How often code (not strings or comments) uses each of :data:`_REQUEST_NAMES`.
+
+    ``None`` when the text does not tokenize, which hides whatever it holds.
+    A substring check first, so the lexer runs only on the few files that
+    mention one.
+    """
+    if not any(name in text for name in _REQUEST_NAMES):
+        return Counter()
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+        return Counter(
+            t.string for t in tokens if t.type == tokenize.NAME and t.string in _REQUEST_NAMES
+        )
+    except (tokenize.TokenError, SyntaxError):
+        return None
+
+
+def _hidden_request(text: str) -> str | None:
+    """A request form the edges below cannot record, found in a test file's or conftest's text."""
+    if _CLASS_PYTESTMARK_RE.search(text):
+        return "a class-level pytestmark"
+    if "marks=" in text and "usefixtures" in text:
+        return "usefixtures inside pytest.param marks"
+    if "indirect" in text and _CALL_PARAMETRIZE_RE.search(text):
+        return "a parametrize call outside a decorator"
+    return None
+
+
+def _runtime_requests(text: str, symbols: list[Any]) -> tuple[list[tuple[Any, str]], bool]:
+    """``(enclosing function, name)`` per literal ``getfixturevalue``, and whether any is computed."""
+    out: list[tuple[Any, str]] = []
+    unknown = False
+    functions = [s for s in symbols if s.kind in ("function", "method")]
+    for match in _GETFIXTUREVALUE_RE.finditer(text):
+        name = match.group(1)
+        line = text.count("\n", 0, match.start()) + 1
+        enclosing = [s for s in functions if s.start_line <= line <= s.end_line]
+        if name is None or not enclosing:
+            unknown = True
+            continue
+        out.append((max(enclosing, key=lambda s: s.start_line), name))
+    return out, unknown
+
+
+def _add_fixture_injection_edges(
+    graph: nx.DiGraph,
+    parsed_files: dict[str, Any],
+    repo_path: Path | None = None,
+    read: Callable[[str], str | None] | None = None,
+    roots: PytestRoots | None = None,
+    helper_text: Callable[[str], str | None] | None = None,
+) -> int:
+    """Link each test and fixture to every fixture it asks for by name.
+
+    Scope follows pytest's own rule, innermost first: the requester's own class,
+    then its module, then the nearest ``conftest.py`` at or above it. Nothing
+    else is searched, so a plugin-provided fixture stays unclaimed instead of
+    being bound to a same-named local one. A fixture asking for its own name
+    (an override) gets the next one out. *read* returns a file's text, for the
+    forms only the text shows; *roots* say which files pytest collects;
+    *helper_text* returns the text of any other Python file from the bytes
+    ingestion already holds (``None`` when it does not hold it).
+
+    A request no edge can record is stamped on the requester's conftest edges
+    instead (:data:`UNRECORDED_HINT`, see :func:`_stamp_unrecorded`).
     """
     # Only a conftest's module-level fixtures are visible to other files; one
     # declared inside a class there serves that class alone.
@@ -338,38 +505,176 @@ def _add_fixture_injection_edges(
             conftests[Path(path).parent.as_posix()] = declared
 
     class_globs = _test_class_globs(repo_path)
-
+    unrecorded: set[str] = set()
+    everywhere = False
     count = 0
     for path, parsed in parsed_files.items():
-        if parsed.file_info.language != "python" or not _TEST_FILE_RE.search(path):
+        if parsed.file_info.language != "python":
             continue
-
-        own = _declared_fixtures(parsed)
-        # Nearest-first: the deepest conftest directory that is a prefix of this
-        # file's directory shadows the ones above it, as pytest does.
-        chain = sorted(
-            (d for d in conftests if path.startswith(f"{d}/") or d == "."),
-            key=len,
-            reverse=True,
-        )
-
-        for sym in parsed.symbols:
-            if sym.kind not in ("function", "method") or not sym.name.startswith("test_"):
-                continue
-            if sym.parent_name and not any(
-                fnmatch(sym.parent_name, g) for g in class_globs
-            ):
-                continue
-            scopes = _fixture_scopes(parsed, sym.parent_name)
-            for name in _requested_fixtures(sym):
-                target = next(
-                    (own[(s, name)] for s in scopes if (s, name) in own), None
-                ) or next(
-                    (conftests[d][name] for d in chain if name in conftests[d]), None
-                )
-                if target and add_symbol_edge(graph, sym.id, target):
-                    count += 1
+        is_conftest = Path(path).name == "conftest.py"
+        collected = roots.may_collect_name(path) if roots else bool(_TEST_FILE_RE.search(path))
+        if not (is_conftest or collected):
+            # Code a test calls may ask for a fixture by name, for whichever test
+            # calls it. Read from the bytes ingestion holds, never from disk: a
+            # file missing there is not known to be free of requests.
+            text = helper_text(path) if helper_text is not None else None
+            uses = None if text is None else _request_name_uses(text)
+            everywhere = everywhere or uses is None or bool(uses)
+            continue
+        added, hidden, anywhere = _link_file(graph, path, parsed, conftests, class_globs, read)
+        count += added
+        everywhere = everywhere or anywhere
+        if hidden:
+            unrecorded.add(path)
+    hidden_dirs = roots.hidden_request_dirs() if roots else []
+    _stamp_unrecorded(graph, unrecorded, hidden_dirs, everywhere=everywhere)
     return count
+
+
+def _stamp_unrecorded(
+    graph: nx.DiGraph, files: set[str], dirs: list[str], *, everywhere: bool
+) -> None:
+    """Mark the conftest edges whose fixtures may be requested in a way no edge records.
+
+    A file's requests resolve among the conftests above it, so its edges to them
+    are marked; a conftest's own unrecorded requests mark the edges into it too.
+    *dirs* hold a pytest config that requests fixtures for every test under it.
+    """
+    for conf in [n for n in graph.nodes if str(n).endswith("conftest.py")]:
+        for source in list(graph.predecessors(conf)):
+            data = graph[source][conf]
+            if data.get("hint_source") != CONFTEST_HINT:
+                continue
+            under_dir = any(d == "" or str(source).startswith(f"{d}/") for d in dirs)
+            if everywhere or under_dir or source in files or conf in files:
+                data["hint_source"] = UNRECORDED_HINT
+
+
+def _link_file(
+    graph: nx.DiGraph,
+    path: str,
+    parsed: Any,
+    conftests: dict[str, dict[str, str]],
+    class_globs: tuple[str, ...],
+    read: Callable[[str], str | None] | None,
+) -> tuple[int, bool, bool]:
+    """The fixture-request edges leaving one test module or conftest, and whether some cannot be.
+
+    The second value is true when the file asks for a fixture in a way no edge
+    records: a computed name, a test inherited from a base class this file does
+    not declare, or a request form only the text shows (:func:`_hidden_request`).
+    The third is true when a helper asks for one, for whichever test calls it.
+    """
+    is_conftest = Path(path).name == "conftest.py"
+    own = _declared_fixtures(parsed)
+    fixture_ids = set(own.values())
+    # Nearest-first: the deepest conftest directory that is a prefix of this
+    # file's directory shadows the ones above it, as pytest does.
+    chain = sorted(
+        (d for d in conftests if path.startswith(f"{d}/") or d == "."),
+        key=len,
+        reverse=True,
+    )
+
+    def link(sym: Any, names: Iterable[str]) -> int:
+        scopes = _fixture_scopes(parsed, sym.parent_name)
+        added = 0
+        for name in names:
+            hits = [own[(s, name)] for s in scopes if (s, name) in own]
+            hits += [conftests[d][name] for d in chain if name in conftests[d]]
+            target = next((h for h in hits if h != sym.id), None)
+            if target and add_symbol_edge(graph, sym.id, target):
+                graph[sym.id][target]["hint_source"] = FIXTURE_HINT
+                added += 1
+        return added
+
+    classes = {sym.name: sym for sym in parsed.symbols if sym.kind == "class"}
+    collected = {c for c in classes if any(fnmatch(c, g) for g in class_globs)}
+    # A collected class runs the tests of every base it names, with their marks.
+    inherited = {s for c in collected for s in _fixture_scopes(parsed, c) if s}
+    hidden = any(b not in classes and b not in _PLAIN_BASES for b in inherited)
+    marks = {c: _decorator_requests(classes[c].decorators) for c in inherited if c in classes}
+    hidden = hidden or any(r.unknown for r in marks.values())
+
+    # Decorator uses of `usefixtures` this file records (the computed ones are
+    # flagged by `_decorator_requests` itself).
+    recorded = Counter(
+        "usefixtures"
+        for sym in parsed.symbols
+        for dec in sym.decorators
+        if _USEFIXTURES_RE.match(dec.strip())
+    )
+    count = 0
+    tests = []
+    for sym in parsed.symbols:
+        if sym.kind not in ("function", "method"):
+            continue
+        own_requests = _decorator_requests(sym.decorators)
+        hidden = hidden or own_requests.unknown
+        if sym.id in fixture_ids:
+            names = _requested_fixtures(sym, own_requests.supplied) + own_requests.requested
+            count += link(sym, names)
+            continue
+        if is_conftest or not sym.name.startswith(DEFAULT_PYTHON_FUNCTIONS):
+            continue
+        if sym.parent_name and sym.parent_name not in collected | inherited:
+            continue
+        tests.append(sym)
+        scoped = [marks[s] for s in _fixture_scopes(parsed, sym.parent_name) if s in marks]
+        supplied = own_requests.supplied.union(*(r.supplied for r in scoped))
+        names = _requested_fixtures(sym, supplied) + own_requests.requested
+        count += link(sym, names + [n for r in scoped for n in r.requested])
+
+    text = read(path) if read is not None else None
+    everywhere = False
+    if text is None:
+        # Unread, the file may hold any request form.
+        return count, True, everywhere
+    hidden = hidden or _hidden_request(text) is not None
+    if "pytestmark" in text:
+        module_marks, unknown = _module_usefixtures(text)
+        hidden = hidden or unknown
+        recorded["usefixtures"] += sum(
+            len(_USEFIXTURES_CALL_RE.findall(m)) for m in _PYTESTMARK_RE.findall(text)
+        )
+        for sym in tests:
+            count += link(sym, module_marks)
+    if "getfixturevalue" in text:
+        runtime, unknown = _runtime_requests(text, parsed.symbols)
+        hidden = hidden or unknown
+        for sym, name in runtime:
+            if sym in tests or sym.id in fixture_ids:
+                count += link(sym, [name])
+                recorded["getfixturevalue"] += 1
+            else:
+                # A helper asking for a fixture serves whichever test calls it.
+                everywhere = True
+    # Any other use (an alias, a mark stored in a variable, `add_marker`,
+    # `request.fixturenames`, a lazy-fixture plugin) is a request no edge records.
+    uses = _request_name_uses(text)
+    hidden = hidden or uses is None or any(n > recorded[name] for name, n in uses.items())
+    return count, hidden, everywhere
+
+
+def _source_reader(ctx: ResolverContext) -> Callable[[str], str | None]:
+    """Text of an indexed file, from the bytes ingestion already read, else from disk."""
+
+    def read(path: str) -> str | None:
+        if ctx.repo_path is None and path not in (ctx.source_map or {}):
+            return None
+        return source_text(path, (ctx.repo_path or Path()) / path, ctx.source_map)
+
+    return read
+
+
+def _held_text(ctx: ResolverContext) -> Callable[[str], str | None]:
+    """Text of an indexed file from the bytes ingestion already read only; ``None`` if not held."""
+
+    def read(path: str) -> str | None:
+        data = (ctx.source_map or {}).get(path)
+        return None if data is None else decode_source(data)
+
+    return read
 
 
 class _FixtureInjectionHandler:
@@ -385,7 +690,14 @@ class _FixtureInjectionHandler:
         ctx: ResolverContext,
         path_set: set[str],
     ) -> int:
-        return _add_fixture_injection_edges(graph, parsed_files, ctx.repo_path)
+        return _add_fixture_injection_edges(
+            graph,
+            parsed_files,
+            ctx.repo_path,
+            _source_reader(ctx),
+            ctx.pytest_roots,
+            _held_text(ctx),
+        )
 
 
 class _ConftestHandler:
