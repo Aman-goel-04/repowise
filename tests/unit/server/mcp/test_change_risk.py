@@ -406,6 +406,63 @@ async def test_impacted_tests_promotes_an_edited_test_file_inferred(tmp_path, mo
 
 
 @pytest.mark.asyncio
+async def test_impacted_tests_lists_an_edited_test_file_the_graph_never_reached(
+    tmp_path, monkeypatch
+) -> None:
+    """An edited test file with no import edge into the change still leads.
+
+    ``tests/test_edited.py`` is a known test file the change edits, but it has
+    no resolved import into any changed source file, so ``tests_reaching``
+    never returns it and it is absent from the reach map. It must still be
+    listed, and first, ahead of ``tests/test_generic.py`` which does reach the
+    changed source (#2901).
+    """
+    from repowise.core.persistence.models import GraphEdge, GraphNode
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(["init", "-q"], repo)
+    _commit(repo, {"src/core.py": "a\n"}, "chore: seed")
+    _commit(
+        repo,
+        {"src/core.py": "a\nb\n", "tests/test_edited.py": "e\n"},
+        "feat: touch",
+    )
+
+    factory = await _factory_with_repo(None)
+    async with factory() as s:
+        for path, is_test in (
+            ("tests/test_edited.py", True),
+            ("tests/test_generic.py", True),
+            ("src/core.py", False),
+        ):
+            s.add(GraphNode(repository_id="repo1", node_id=path, node_type="file", is_test=is_test))
+        # Only the generic test imports the changed source; the edited test
+        # file has no edge at all, so the graph walk cannot reach it.
+        s.add(
+            GraphEdge(
+                repository_id="repo1",
+                source_node_id="tests/test_generic.py",
+                target_node_id="src/core.py",
+                edge_type="imports",
+            )
+        )
+        await s.commit()
+
+    module = importlib.import_module("repowise.server.mcp_server.tool_change_risk")
+
+    async def _context(_: str | None) -> SimpleNamespace:
+        return SimpleNamespace(path=str(repo), session_factory=factory)
+
+    monkeypatch.setattr(module, "_resolve_repo_context", _context)
+    it = (await module.get_change_risk(baseline=0))["impacted_tests"]
+
+    assert it["basis"] == "inferred"
+    assert it["tests_to_run"] == ["tests/test_edited.py", "tests/test_generic.py"]
+    assert it["total"] == 2
+
+
+@pytest.mark.asyncio
 async def test_impacted_tests_promotion_survives_the_overflow_cap(tmp_path, monkeypatch) -> None:
     """An edited test file stays inside the cap even if 12 others reach more.
 
