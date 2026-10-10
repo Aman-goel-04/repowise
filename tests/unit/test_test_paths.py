@@ -12,6 +12,7 @@ import pytest
 
 from repowise.core.pytest_roots import read_pytest_roots
 from repowise.core.test_paths import (
+    is_skippable_test_path,
     is_test_path,
     is_test_related_path,
     is_test_support_path,
@@ -105,6 +106,14 @@ _CORPUS: tuple[tuple[str, str | None, str], ...] = (
     ("contest/x.py", None, ""),
     # e2e suites
     ("e2e/login.ts", None, "test"),
+    # ...and the `.e2e.` infix beside `.test.`/`.spec.`, suites and their helpers
+    ("src/gateway/gateway.e2e.ts", None, "test"),
+    ("src/gateway/test-helpers.e2e.ts", None, "test"),
+    ("apps/desktop/tsconfig.e2e.json", None, ""),
+    ("src/harness/e2e_utils.py", None, ""),
+    # one-word suite directories (gcc, flask before 0.11)
+    ("flask/testsuite/basic.py", None, "test"),
+    ("gcc/testsuite/gcc.dg/pr123.c", None, "test"),
     # production code that merely contains the word: the unanchored
     # `test[s_/]` substring rule classified the first three as tests
     ("src/latest/api.py", None, ""),  # #1103 finding 1
@@ -338,6 +347,28 @@ def test_unambiguous_test_paths_need_more_than_a_test_shaped_name_under_src(
     path: str, expected: bool
 ) -> None:
     assert is_unambiguous_test_path(path) is expected
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("tests/api/openapi.yaml", True),
+        ("Foo.Tests/Clients/Orders.cs", True),
+        ("src/api/client.test.ts", True),
+        ("src/__mocks__/api.ts", True),
+        ("pkg/server/handler_test.go", True),
+        # non-source files need a named test tree
+        ("Foo.Specs/openapi.yaml", False),
+        ("spec/support/openapi.yaml", False),
+        ("testdata/openapi.yaml", False),
+        # a PascalCase suite folder alone, or a Python test name under src
+        ("LoadTests/Runner.cs", False),
+        ("src/api/test_routes.py", False),
+        ("src/app/main.ts", False),
+    ],
+)
+def test_skippable_test_paths_never_drop_a_possible_contract(path: str, expected: bool) -> None:
+    assert is_skippable_test_path(path) is expected
 
 
 _ROOTS = read_pytest_roots(
