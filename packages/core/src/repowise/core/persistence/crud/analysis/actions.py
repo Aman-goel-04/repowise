@@ -39,13 +39,16 @@ from repowise.core.analysis.actions.build import (
     build_recent,
     build_secrets,
     lead_paths,
+    reach_paths,
     with_leads,
+    with_test_reach,
 )
 from repowise.core.analysis.actions.facts import FileFacts
 from repowise.core.analysis.actions.rules.code import FIX_FIRST_ACTIONS
 from repowise.core.analysis.actions.rules.hygiene import PUBLIC_ENV_KIND, SECRET_KINDS
 from repowise.core.analysis.dead_code.risk_factors import REVIEW_ONLY_KINDS
 from repowise.core.analysis.finding_registry import excluded_types
+from repowise.core.analysis.test_reachability import any_tests_reaching
 
 from ...models import (
     ActionState,
@@ -224,6 +227,26 @@ async def _recent(
     return build_recent(rows, week=since, open_findings=open_findings, files=files)
 
 
+async def _history(session: AsyncSession, repo_id: str) -> dict[str, Any]:
+    count = select(func.count()).select_from(GitCommit).where(GitCommit.repository_id == repo_id)
+    commits = (await session.execute(count)).scalar_one()
+    if not commits:
+        # No commit rows and no per-file history: git was never indexed, which
+        # is unknown, not a short history.
+        indexed = select(GitMetadata.file_path).where(GitMetadata.repository_id == repo_id)
+        if (await session.execute(indexed.limit(1))).first() is None:
+            return {"history_commits": None}
+    return {"history_commits": commits}
+
+
+async def _test_map(session: AsyncSession, repo_id: str, files: dict[str, FileFacts]) -> dict:
+    """Only a file no test reaches may be told to add tests, so only those few are walked."""
+    paths = reach_paths(files)
+    if not paths:
+        return {}
+    return {"files": with_test_reach(files, await any_tests_reaching(session, repo_id, paths))}
+
+
 async def _fix_first(session: AsyncSession, repo_id: str) -> dict[str, Any]:
     return {"fix_first": (await load_fix_first(session, repo_id, limit=FIX_FIRST_ACTIONS)).items}
 
@@ -389,7 +412,10 @@ async def load_repo_facts(session: AsyncSession, repo_id: str) -> RepoFacts:
             logger.warning("actions: %s unavailable: %s", store, exc)
             unavailable[store] = ABSENT
 
+    await read("history", lambda: _history(session, repo_id))
     await read("files", lambda: _files(session, repo_id, since))
+    if "files" in values:
+        await read("test_map", lambda: _test_map(session, repo_id, values["files"]))
     files: dict[str, FileFacts] = values.get("files") or {}
     await read("authors", lambda: _authors(session, repo_id, since))
     await read("commit_health", lambda: _recent(session, repo_id, week, files))

@@ -226,6 +226,12 @@ Rows are grouped as **Now**, **Worth planning** and **Improve what Repowise can
 see** (steps such as adding a coverage report that make other answers sharper).
 Run `repowise update` to refresh the list after you change code.
 
+A fragile file asks for tests only when it has no measured coverage and no test
+reaches it in the code graph. When tests do reach it, the row asks you to
+simplify its lead function instead. An index with fewer than five commits leaves
+out the rows ranked by history: fragile files, bug-fix concentration and
+knowledge loss.
+
 ## Performance findings
 
 Performance risk flags structure that wastes work. It does not measure runtime.
