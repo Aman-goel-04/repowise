@@ -177,7 +177,8 @@ Most plans answer a health finding, so per-path marker rules in
   generated code comes back as a diff.
 - Extract Method offers a span only when it can show the extraction keeps behavior
   (every returned value written on every path, no state carried across loop
-  iterations). Spans it cannot prove are dropped, so it under-reports by design.
+  iterations, no local a closure shares crossing the span's edge). Spans it
+  cannot prove are dropped, so it under-reports by design.
 - Extract Method skips spans too small to matter and spans that would carry the
   original finding into the helper. A component whose branching is mostly in its
   markup gets no extraction.
