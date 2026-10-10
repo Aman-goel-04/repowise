@@ -49,6 +49,10 @@ Plan shape (open dict, no migration):
   ``_suggested_name``). ``None`` when the span has no single informative OUT
   value: a name derived from the enclosing function described the context
   rather than the span, and collided with every sibling plan in the file.
+- ``plan.needs_async`` -- the span awaits, so the helper is async and its call
+  is awaited. An awaiting plan also carries ``async_host``: False when the
+  enclosing function is not declared async, which makes the step a judgment
+  call (``preconditions``) rather than a mechanical one.
 - ``evidence`` = ``{"slice_nloc": int, "ccn_removed": int}`` -- the size and
   complexity (code lines, decision points) the residual method sheds.
 - ``blast_radius`` = ``{"scope": "local"}`` -- extraction is local (a new
@@ -72,6 +76,7 @@ from ..complexity.cyclomatic import _is_boolean_operator
 from ..complexity.languages import get_language_map
 from ..complexity.nloc import is_string_stmt
 from ..dataflow import find_extractions
+from ..perf.dialects import PERF_DIALECTS
 from ..scoring import severity_deduction
 from .models import RefactoringContext, RefactoringSuggestion
 from .naming import join_identifier, split_words
@@ -174,6 +179,7 @@ class ExtractMethodDetector(RefactoringDetector):
                         "params": list(best.params),
                         "returns": list(best.returns),
                         "suggested_name": self._suggested_name(analysis, best, ctx.language),
+                        **_async_fields(analysis, best, lmap, ctx.language),
                     },
                     evidence={
                         "slice_nloc": best.slice_nloc,
@@ -299,6 +305,29 @@ def recovered_share(
         nloc_share = extraction.slice_nloc / analysis.nloc if analysis.nloc > 0 else 0.0
         return min(1.0, nloc_share, ccn_share)
     return min(1.0, ccn_share)
+
+
+def _async_fields(
+    analysis: FunctionAnalysis,
+    extraction: Extraction,
+    lmap: LanguageNodeMap,
+    language: str | None,
+) -> dict[str, bool]:
+    """``needs_async`` always; ``async_host`` only for an awaiting span, False
+    when the function holding it is not declared async (a C++ coroutine),
+    where no async helper can be written in its place."""
+    if not extraction.needs_async:
+        return {"needs_async": False}
+    return {"needs_async": True, "async_host": host_is_async(analysis.fn_node, lmap, language)}
+
+
+def host_is_async(fn_node: Any, lmap: LanguageNodeMap, language: str | None) -> bool:
+    """Whether *fn_node* is declared async, by the perf pass's own test: a
+    dedicated async node kind, else the language's perf dialect."""
+    if fn_node.type in lmap.async_function_kinds:
+        return True
+    dialect = PERF_DIALECTS.get(language or "")
+    return dialect is not None and dialect.is_async_fn(fn_node)
 
 
 def _worth_extracting(
