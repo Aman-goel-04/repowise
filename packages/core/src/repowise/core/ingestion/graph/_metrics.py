@@ -131,7 +131,7 @@ class MetricsMixin:
             return sub
 
     def cycle_subgraph(self) -> nx.DiGraph:
-        """Return :meth:`file_subgraph` minus cohesion and ``dynamic_uses`` edges,
+        """Return :meth:`file_subgraph` minus cohesion, type-only and ``dynamic_uses`` edges,
         for cycle detection.
 
         A cohesion edge records that two files are one compilation unit — Go
@@ -160,7 +160,11 @@ class MetricsMixin:
         """
         return self._file_edge_view(
             "_cycle_subgraph_cache",
-            lambda base, u, v, d: is_cohesion_edge(d) or d.get("edge_type") == "dynamic_uses",
+            lambda base, u, v, d: (
+                is_cohesion_edge(d)
+                or d.get("type_only") is True
+                or d.get("edge_type") == "dynamic_uses"
+            ),
         )
 
     def centrality_subgraph(self) -> nx.DiGraph:

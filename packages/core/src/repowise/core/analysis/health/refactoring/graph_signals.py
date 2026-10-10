@@ -58,6 +58,7 @@ def _is_cycle_edge(data: Any) -> bool:
         data.get("edge_type") in _CYCLE_EDGE_TYPES
         and data.get("edge_type") != "dynamic_uses"
         and not is_cohesion_edge(data)
+        and not data.get("type_only")
     )
 
 
