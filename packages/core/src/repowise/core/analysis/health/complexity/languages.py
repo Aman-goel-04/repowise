@@ -1182,6 +1182,38 @@ _OBJC = LanguageNodeMap(
 )
 
 
+_PHP = LanguageNodeMap(
+    function_kinds=frozenset({"function_definition", "method_declaration"}),
+    lambda_kinds=frozenset({"anonymous_function", "arrow_function"}),
+    branch_kinds=frozenset({"if_statement", "else_if_clause", "conditional_expression"}),
+    loop_kinds=frozenset({"for_statement", "foreach_statement", "while_statement", "do_statement"}),
+    try_kinds=frozenset({"try_statement"}),
+    catch_kinds=frozenset({"catch_clause"}),
+    switch_kinds=frozenset({"switch_statement", "match_expression"}),
+    case_kinds=frozenset({"case_statement", "match_conditional_expression"}),
+    boolean_operator_kinds=frozenset(),
+    boolean_operator_text_kinds=frozenset({"binary_expression"}),
+    class_kinds=frozenset(
+        {"class_declaration", "trait_declaration", "interface_declaration", "enum_declaration"}
+    ),
+    self_identifiers=frozenset({"$this"}),
+    member_access_kinds=frozenset(
+        {"member_access_expression", "member_call_expression", "nullsafe_member_access_expression"}
+    ),
+    assert_call_kinds=frozenset(
+        {"member_call_expression", "scoped_call_expression", "function_call_expression"}
+    ),
+    call_kinds=frozenset(
+        {
+            "member_call_expression",
+            "scoped_call_expression",
+            "function_call_expression",
+            "nullsafe_member_call_expression",
+        }
+    ),
+)
+
+
 LANGUAGE_MAPS: dict[str, LanguageNodeMap] = {
     "python": _PY,
     "typescript": _TS,
@@ -1211,6 +1243,7 @@ LANGUAGE_MAPS: dict[str, LanguageNodeMap] = {
     # No "elixir" entry on purpose. See the note above ``_FSHARP``.
     "fsharp": _FSHARP,
     "objectivec": _OBJC,
+    "php": _PHP,
 }
 
 
