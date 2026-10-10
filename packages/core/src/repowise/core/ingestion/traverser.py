@@ -210,13 +210,9 @@ _BLOCKED_DIRS: frozenset[str] = frozenset(
         ".mypy_cache",
         ".ruff_cache",
         ".tox",
-        "dist",
-        "build",
         ".next",
-        "target",  # Rust / Maven
         ".gradle",
         "vendor",  # Go / PHP
-        "coverage",
         "htmlcov",
         ".eggs",
         "site-packages",
@@ -320,6 +316,24 @@ _MINIFIED_SAMPLE_BYTES: int = 256 * 1024
 
 # Languages with no AST parsing, so generated-marker sniffing buys nothing.
 _SKIP_GENERATED_CHECK: frozenset[str] = _LANG_REGISTRY.unparseable_data_languages()
+
+#: Names build and report tools write to that are also ordinary package names
+#: (``analysis/coverage/``, coverage.py's own ``coverage/``, a Go ``build``
+#: package, a ``build`` route). Pruned unless the directory itself holds a
+#: hand-written source file: output roots hold bundles, objects and reports
+#: directly and keep any copied source a level deeper (``build/lib/``,
+#: ``target/generated-sources/``). Ceiling: a package holding only JavaScript
+#: or C directly, or whose files all sit in subdirectories, stays pruned, and
+#: no ignore file can re-include a pruned directory yet. A ``package.json`` is
+#: no evidence: bundlers write one beside their output.
+_OUTPUT_DIR_NAMES: frozenset[str] = frozenset({"build", "coverage", "dist", "target"})
+
+#: Languages a build or report writes (bundles, generated C, HTML reports),
+#: so their files are no evidence that an output-named directory is source.
+_EMITTED_LANGUAGES: frozenset[str] = _SKIP_GENERATED_CHECK | {"c", "cpp", "javascript", "objectivec"}
+
+#: Filename endings a compiler emits in otherwise hand-written languages.
+_EMITTED_SUFFIXES: tuple[str, ...] = (".d.ts", ".d.mts", ".d.cts", ".qmltypes", *_GENERATED_SUFFIXES)
 
 
 class FileTraverser:
@@ -592,7 +606,8 @@ class FileTraverser:
         if dir_ignore is not None and dir_ignore.extra.match_file(dirname + "/"):
             return True
         nested = dir_ignore is not None and dir_ignore.gitignore.match_file(dirname + "/")
-        return self._dir_gitignored(rel_str, nested)
+        # Last, so a gitignored output tree is pruned before anything lists it.
+        return self._dir_gitignored(rel_str, nested) or is_output_dir(self.repo_root / rel_path)
 
     def _dir_gitignored(self, rel_str: str, nested_match: bool) -> bool:
         """Whether ``.gitignore`` prunes the directory, which it may not if git tracks a file in it."""
@@ -1345,14 +1360,77 @@ def _parse_gitmodules(repo_root: Path) -> frozenset[str]:
         return frozenset()
 
 
-def is_candidate_source_path(rel_path: str) -> bool:
+def _is_handwritten_source_name(name: str) -> bool:
+    """Whether a file named *name* is source a person writes, never a build writes."""
+    if name.endswith(_EMITTED_SUFFIXES):
+        return False
+    language = EXTENSION_TO_LANGUAGE.get(os.path.splitext(name)[1].lower())
+    return language is not None and language not in _EMITTED_LANGUAGES
+
+
+def is_output_dir(abs_dir: Path) -> bool:
+    """Whether *abs_dir* is a build or report output root (see ``_OUTPUT_DIR_NAMES``).
+
+    One listing of the directory itself, and only for an output-shaped name.
+    An unlistable directory is not output: a deleted source package must still
+    reach the change sources as deletions.
+    """
+    if abs_dir.name not in _OUTPUT_DIR_NAMES:
+        return False
+    try:
+        with os.scandir(abs_dir) as entries:
+            return not any(
+                _is_handwritten_source_name(e.name) and e.is_file() for e in entries
+            )
+    except OSError:
+        return False
+
+
+def in_blocked_dir(
+    rel_path: str, repo_root: Path | None, cache: dict[Path, bool] | None = None
+) -> bool:
+    """Whether a directory on *rel_path* (POSIX, repo-relative) is blocklisted.
+
+    With no *repo_root* there is nothing to list, so every output-shaped name
+    counts as output, the conservative answer. A caller checking many paths
+    passes one *cache* for the batch, so each output-named directory is listed
+    once. A hand-written file directly in a directory cached as output lists
+    it again, since that file may be what makes it source; build output never
+    has such a name, so a burst of it stays cached.
+    """
+    *dirs, name = rel_path.split("/")
+    for depth, part in enumerate(dirs, 1):
+        if part in _BLOCKED_DIRS:
+            return True
+        if part not in _OUTPUT_DIR_NAMES:
+            continue
+        if repo_root is None:
+            return True
+        abs_dir = repo_root.joinpath(*dirs[:depth])
+        cached = None if cache is None else cache.get(abs_dir)
+        if cached is None or (
+            cached and depth == len(dirs) and _is_handwritten_source_name(name)
+        ):
+            cached = is_output_dir(abs_dir)
+            if cache is not None:
+                cache[abs_dir] = cached
+        if cached:
+            return True
+    return False
+
+
+def is_candidate_source_path(
+    rel_path: str, repo_root: Path | None = None, cache: dict[Path, bool] | None = None
+) -> bool:
     """Whether *rel_path* is shaped like a file this repo would index.
 
     Path-shape only: the directory blocklist, the blocked extensions/filename
-    patterns, and the known-language extension map. No disk access, no
-    gitignore, no binary/size/generated checks, so a ``True`` answer means
-    "worth handing to the pipeline", never "will be indexed". :class:`FileTraverser`
-    still applies the full test on the files it walks.
+    patterns, and the known-language extension map. No gitignore, no
+    binary/size/generated checks, so a ``True`` answer means "worth handing to
+    the pipeline", never "will be indexed". :class:`FileTraverser` still
+    applies the full test on the files it walks. The only disk access is the
+    output-directory listing of :func:`in_blocked_dir`, given *repo_root*
+    (and memoized in *cache* when given).
 
     It serves the change sources that only see a path: the working-tree diff
     and the file watcher.
@@ -1360,10 +1438,11 @@ def is_candidate_source_path(rel_path: str) -> bool:
     One known false negative: an extensionless script that :class:`FileTraverser`
     accepts by shebang is rejected here, since deciding that means reading it.
     """
-    parts = Path(rel_path.replace("\\", "/")).parts
+    posix = rel_path.replace("\\", "/")
+    parts = Path(posix).parts
     if not parts:
         return False
-    if any(part in _BLOCKED_DIRS for part in parts[:-1]):
+    if in_blocked_dir(posix, repo_root, cache):
         return False
 
     name = parts[-1]
