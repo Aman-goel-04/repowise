@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ from repowise.core.persistence.models import (
 )
 from repowise.server.mcp_server._basis import call_resolution_basis
 from repowise.server.mcp_server._budget import OmissionCollector, cap_collection
+from repowise.server.mcp_server._edit_sites import reference_edit_set
 from repowise.server.mcp_server._helpers import (
     LIKE_ESCAPE,
     _decision_body,
@@ -53,8 +55,9 @@ from repowise.server.mcp_server._helpers import (
     read_repo_file_text,
 )
 from repowise.server.mcp_server._index_state import index_state_key
+from repowise.server.mcp_server._meta import uncommitted_targets
 from repowise.server.mcp_server._references import path_identity, symbol_identity
-from repowise.server.mcp_server._symbol_lookup import resolve_symbol_rows
+from repowise.server.mcp_server._symbol_lookup import resolve_symbol_rows, symbol_id_variants
 from repowise.server.mcp_server.tool_context.enrichment import (
     _DOC_DRIFT_PATH,
     _resolve_call_graph,
@@ -81,6 +84,60 @@ _MAX_DECISION_HISTORY = 2
 #: Bound parameters per rank lookup. SQLite's ceiling is 999 before 3.32 and
 #: 32,766 after, and which applies depends on the libsqlite3 linked at runtime.
 _RANK_LOOKUP_CHUNK = 500
+
+#: Rows the compact symbol list carries unless ``include=["symbols"]``. The
+#: head of a file is mostly constants and type vars; ranked, 15 rows cover a
+#: file's types and functions in most real files.
+_SYMBOL_CAP = 15
+
+# Card rank by ``SymbolKind``: the types a file defines, then its callables,
+# then values. Wider than the budgeter's ``symbol_priority`` table, which
+# ranks ``type_alias``, ``impl`` and ``module`` with variables.
+_TYPE_KINDS = frozenset(
+    {"class", "interface", "struct", "trait", "enum", "type", "type_alias", "impl", "module"}
+)
+_CALLABLE_KINDS = frozenset({"function", "method", "macro", "decorator"})
+
+
+def _kind_rank(kind: str | None) -> int:
+    kind = (kind or "").lower()
+    return 0 if kind in _TYPE_KINDS else 1 if kind in _CALLABLE_KINDS else 2
+
+
+async def _compact_symbol_rows(
+    session: AsyncSession, repo_id: str, file_path: str, symbols: Any
+) -> list[dict[str, Any]]:
+    """Compact rows ranked by kind, then PageRank, then start line.
+
+    ``symbol_id`` is omitted when it is exactly ``path::name``, which the
+    reader can rebuild; methods and overload variants keep theirs, because a
+    bare ``path::name`` does not resolve them uniquely.
+    """
+    res = await session.execute(
+        select(GraphNode.node_id, GraphNode.pagerank).where(
+            GraphNode.repository_id == repo_id,
+            GraphNode.file_path == file_path,
+        )
+    )
+    rank = {node_id: float(pr or 0.0) for node_id, pr in res.all()}
+    path = path_identity(file_path)
+    scored = []
+    for s in symbols:
+        row: dict[str, Any] = {
+            "name": s.name,
+            "kind": s.kind,
+            "signature": _clean_signature(s.signature),
+            "line": s.start_line,
+        }
+        sid = symbol_identity(s.symbol_id)
+        if sid != f"{path}::{s.name}":
+            row["symbol_id"] = sid
+        scored.append(
+            ((_kind_rank(s.kind), -rank.get(s.symbol_id, 0.0), s.start_line or 0), row)
+        )
+    scored.sort(key=lambda pair: pair[0])
+    return [row for _, row in scored]
+
 
 # The default file card is the symbol list; the skeleton is opt-in via
 # ``include=["skeleton"]``. An auto-upgraded card was mostly source text, which
@@ -120,40 +177,124 @@ def _preview_summary(file_path: str, preview: dict[str, Any]) -> str:
     lines = preview.get("lines", 0)
     if not lines:
         return f"{name}: empty file"
-    headings = preview.get("headings")
-    if headings:
-        return f"{name}: {lines}-line document, {len(headings)} headings, no indexed symbols."
+    heading_count = preview.get("heading_count")
+    if heading_count:
+        return f"{name}: {lines}-line document, {heading_count} headings, no indexed symbols."
     return f"{name}: {lines} lines, no indexed symbols."
 
 
-# Bounds on the preview a symbol-less file (README, YAML, SQL) gets, cheap
-# enough to stay on by default.
-_PREVIEW_MAX_LINES = 15
+# Bounds on the preview a symbol-less file (README, YAML, SQL) gets: counts
+# plus a few verbatim lines, cheap enough to stay on by default.
+_PREVIEW_MAX_LINES = 3
 _PREVIEW_MAX_LINE_CHARS = 120
 # Beyond this the file is big enough that a preview would misrepresent it; the
 # counts and the "go Read it" note are the honest reply.
 _PREVIEW_MAX_BYTES = 2_000_000
 
-_MARKDOWN_EXTS = (".md", ".markdown", ".mdx", ".rst")
+_MARKDOWN_EXTS = (".md", ".markdown", ".mdx")
+_RST_EXTS = (".rst",)
+_MD_HEADING = re.compile(r" {0,3}#{1,6}(\s|$)")
+_MD_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+_RST_ADORNMENT = re.compile(r"([!-/:-@\[-`{-~])\1+")
+# Lines that open with a comment marker: licence banners and the like.
+_COMMENT_PREFIXES = ("#", "//", "--", "/*", "*", "<!--")
+
+
+def _markdown_headings(lines: list[str]) -> list[str]:
+    """ATX headings outside front matter, fenced code and HTML comments."""
+    headings: list[str] = []
+    start = 0
+    if lines and lines[0].strip() == "---":
+        close = next((i for i in range(1, len(lines)) if lines[i].strip() in ("---", "...")), None)
+        if close is not None:
+            start = close + 1
+    fence = ""
+    in_comment = False
+    for ln in lines[start:]:
+        if in_comment:
+            in_comment = "-->" not in ln
+            continue
+        if fence:
+            # Only a bare run of the opening character, at least as long, closes.
+            bare = ln.strip()
+            if bare and set(bare) == {fence[0]} and len(bare) >= len(fence):
+                fence = ""
+            continue
+        m = _MD_FENCE.match(ln)
+        if m:
+            fence = m.group(1)
+            continue
+        opened = ln.find("<!--")
+        if opened != -1 and "-->" not in ln[opened + 4 :]:
+            in_comment = True
+            continue
+        if _MD_HEADING.match(ln):
+            headings.append(ln.strip())
+    return headings
+
+
+def _rst_table_lines(lines: list[str]) -> set[int]:
+    """Line indexes inside simple tables: a blank-free block with 3+ ``=`` borders."""
+    inside: set[int] = set()
+    i = 0
+    while i < len(lines):
+        if not lines[i].strip():
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and lines[j].strip():
+            j += 1
+        borders = sum(1 for k in range(i, j) if set(lines[k].strip()) <= {"=", " "})
+        if borders >= 3 and set(lines[i].strip()) <= {"=", " "}:
+            inside.update(range(i, j))
+        i = j
+    return inside
+
+
+def _rst_headings(lines: list[str]) -> list[str]:
+    """Section titles: an unindented line underlined by punctuation at least as long.
+
+    Indented lines (literal and directive bodies) are never titles, so a
+    ``# comment`` inside a ``code-block`` is not one either, and neither is a
+    row of a simple table framed by ``=`` borders.
+    """
+    tables = _rst_table_lines(lines)
+    headings: list[str] = []
+    for i in range(len(lines) - 1):
+        title, under = lines[i].rstrip(), lines[i + 1].rstrip()
+        if (
+            i not in tables
+            and title
+            and not title[0].isspace()
+            and not _RST_ADORNMENT.fullmatch(title)
+            and _RST_ADORNMENT.fullmatch(under)
+            and len(under) >= len(title)
+        ):
+            headings.append(title)
+    return headings
 
 
 def _outline_lines(text: str, file_path: str) -> tuple[str, list[str]]:
-    """Pick the most informative ~15 lines of a symbol-less file.
+    """Return a document's headings, or the head lines of anything else.
 
-    Markdown-ish files get their heading spine, which is a genuine table of
-    contents. Everything else gets its first non-blank, non-comment lines,
-    which for config and data files is where the keys live. Returns the kind of
-    excerpt chosen so the caller can label it truthfully.
+    Returns the kind of excerpt chosen so the caller can label it truthfully.
+    A heading-less document falls through to head lines rather than reporting
+    an empty outline. Head lines skip comment banners unless that is all
+    the file has.
     """
     lines = text.splitlines()
-    if file_path.lower().endswith(_MARKDOWN_EXTS):
-        headings = [ln.strip() for ln in lines if ln.lstrip().startswith("#")]
-        # An .rst or heading-less .md falls through to the head-lines form
-        # rather than reporting an empty outline.
-        if headings:
-            return "headings", headings[:_PREVIEW_MAX_LINES]
+    lower = file_path.lower()
+    if lower.endswith(_MARKDOWN_EXTS):
+        headings = _markdown_headings(lines)
+    elif lower.endswith(_RST_EXTS):
+        headings = _rst_headings(lines)
+    else:
+        headings = []
+    if headings:
+        return "headings", headings
     head = [ln.rstrip() for ln in lines if ln.strip()]
-    return "head", head[:_PREVIEW_MAX_LINES]
+    content = [ln for ln in head if not ln.lstrip().startswith(_COMMENT_PREFIXES)]
+    return "head", content or head
 
 
 def _file_preview(repo_root: Any, file_path: str) -> dict[str, Any] | None:
@@ -177,12 +318,12 @@ def _file_preview(repo_root: Any, file_path: str) -> dict[str, Any] | None:
         return preview
 
     kind, excerpt = _outline_lines(text, file_path)
+    if kind == "headings":
+        preview["heading_count"] = len(excerpt)
     if excerpt:
-        preview[kind] = [ln[:_PREVIEW_MAX_LINE_CHARS] for ln in excerpt]
+        preview[kind] = [ln[:_PREVIEW_MAX_LINE_CHARS] for ln in excerpt[:_PREVIEW_MAX_LINES]]
     preview["note"] = (
-        "This file has no indexed symbols, so there is no structural card for "
-        "it. The fields above are counts and verbatim excerpts. Read the file "
-        "for its full content."
+        "No indexed symbols; counts and a short excerpt only. Read the file for its content."
     )
     return preview
 
@@ -241,6 +382,7 @@ async def _resolve_one_target(
     exclude_spec: Any = None,
     repo_root: Any = None,
     collector: OmissionCollector | None = None,
+    as_of_ts: datetime | None = None,
 ) -> dict:
     """Resolve a single target and return its full context."""
     repo_id = repository.id
@@ -266,6 +408,9 @@ async def _resolve_one_target(
     # Set only when a symbol target resolved through the call graph rather than
     # the symbol index (index-only mode); carries the fields the node has.
     graph_symbol: GraphNode | None = None
+    # The resolved symbol's graph id. Graph queries key on it, never on the
+    # caller's spelling, so ``Class.method`` and ``Class::method`` agree.
+    symbol_node_id: str | None = None
 
     if page and page.repository_id == repo_id:
         target_type = "file"
@@ -352,6 +497,7 @@ async def _resolve_one_target(
             if sym_matches:
                 target_type = "symbol"
                 file_path_for_git = sym_matches[0].file_path
+                symbol_node_id = sym_matches[0].symbol_id
             else:
                 # 4. Try file page by target_path search
                 res = await session.execute(
@@ -369,18 +515,25 @@ async def _resolve_one_target(
     if target_type is None:
         # Fallback 1: index-only mode (no wiki pages). Return the graph node,
         # typed by what it is: a symbol node is a symbol target whose file is
-        # the node's file, not its id.
+        # the node's file, not its id. Every separator form is tried, as the
+        # symbol rung does. Among several, the verbatim id wins, then a symbol
+        # node, then the id order, so the pick never depends on row order.
         res = await session.execute(
             select(GraphNode).where(
                 GraphNode.repository_id == repo_id,
-                GraphNode.node_id == target,
+                GraphNode.node_id.in_(symbol_id_variants(target)),
             )
         )
-        gnode = res.scalar_one_or_none()
+        gnode = min(
+            res.scalars().all(),
+            key=lambda g: (g.node_id != target, g.node_type != "symbol", g.node_id),
+            default=None,
+        )
         if gnode is not None and gnode.node_type == "symbol":
             target_type = "symbol"
             graph_symbol = gnode
             file_path_for_git = gnode.file_path
+            symbol_node_id = gnode.node_id
             page = None
         elif gnode is not None:
             target_type = "file"
@@ -448,16 +601,18 @@ async def _resolve_one_target(
         if target_type is None and "::" in target:
             file_part = target.split("::", 1)[0]
             if file_part and file_part != target and not is_excluded(file_part, exclude_spec):
-                # file_part contains no "::", so this recursion is depth-1.
+                # file_part contains no "::", so this recursion is depth-1. The
+                # caller is hunting for a name, so the symbol list is uncapped.
                 card = await _resolve_one_target(
                     session,
                     repository,
                     file_part,
-                    include,
+                    None if include is None else include | {"symbols"},
                     compact,
                     exclude_spec=exclude_spec,
                     repo_root=repo_root,
                     collector=collector,
+                    as_of_ts=as_of_ts,
                 )
                 if "error" not in card:
                     card["target"] = target
@@ -556,7 +711,10 @@ async def _resolve_one_target(
                 "section": parent.section_number,
             }
 
-    want_skeleton = bool(include and "skeleton" in include)
+    # Asking for both skeleton and skeleton+ renders one block, the plus view.
+    skeleton_plus = bool(include and "skeleton+" in include)
+    want_skeleton = skeleton_plus or bool(include and "skeleton" in include)
+    want_all_symbols = bool(include and "symbols" in include)
 
     # --- Docs ---
     # "full_doc" implies "docs" — entering the docs block whenever either is requested.
@@ -569,14 +727,18 @@ async def _resolve_one_target(
                 docs["summary"] = page.summary or ""
                 if want_full_doc:
                     docs["content_md"] = page.content
+                    if page.digest:
+                        docs["digest_md"] = page.digest
                 if page.human_notes:
                     docs["human_notes"] = page.human_notes
             # Symbols in this file
             res = await session.execute(
-                select(WikiSymbol).where(
+                select(WikiSymbol)
+                .where(
                     WikiSymbol.repository_id == repo_id,
                     WikiSymbol.file_path == target,
                 )
+                .order_by(WikiSymbol.start_line, WikiSymbol.symbol_id)
             )
             symbols = res.scalars().all()
             classes = [s.name for s in symbols if s.kind == "class"]
@@ -587,26 +749,17 @@ async def _resolve_one_target(
                 if not docs.get("summary"):
                     docs["summary"] = _synthesize_structural_summary(target, classes, functions)
             elif compact:
-                # Compact: name, kind, signature, line and symbol_id only. The
-                # cap stops a dense generated file blowing the budget; symbols
-                # are in start_line order, so the head is the useful slice.
-                symbol_cap = 40
-                visible = list(symbols)[:symbol_cap]
-                docs["symbols"] = [
-                    {
-                        "name": s.name,
-                        "kind": s.kind,
-                        "signature": _clean_signature(s.signature),
-                        "line": s.start_line,
-                        "symbol_id": symbol_identity(s.symbol_id),
-                    }
-                    for s in visible
-                ]
-                if len(symbols) > symbol_cap:
+                docs["symbols"] = await _compact_symbol_rows(
+                    session, repo_id, target, symbols
+                )
+                if not want_all_symbols and len(symbols) > _SYMBOL_CAP:
+                    docs["symbols"] = docs["symbols"][:_SYMBOL_CAP]
+                    # The budgeter's own total, so a later trim cannot report 15.
+                    docs["symbols_total"] = len(symbols)
                     docs["symbols_truncated"] = {
-                        "shown": symbol_cap,
+                        "shown": _SYMBOL_CAP,
                         "total": len(symbols),
-                        "hint": "Call with compact=False or include=['full_doc'] for the full list.",
+                        "hint": "Pass include=['symbols'] for the full list.",
                     }
                 if not docs.get("summary"):
                     docs["summary"] = _synthesize_structural_summary(target, classes, functions)
@@ -685,6 +838,10 @@ async def _resolve_one_target(
                 docs["section"] = page.section_number
             if want_full_doc:
                 docs["content_md"] = page.content
+                # Questions, identifiers, public API and git signals: kept off
+                # the reader's page body, served to agents beside it.
+                if page.digest:
+                    docs["digest_md"] = page.digest
             # Non-file children only; file children are in "files" below.
             res = await session.execute(
                 select(Page)
@@ -865,7 +1022,7 @@ async def _resolve_one_target(
         if triage_meta is not None:
             # Row exposes the selected columns as attributes, which is exactly
             # the shape fix_annotation reads off a full ORM row.
-            fixes = fix_annotation(triage_meta)
+            fixes = fix_annotation(triage_meta, now=as_of_ts)
             if fixes is not None:
                 result_data["fix_history"] = fixes
 
@@ -1079,6 +1236,10 @@ async def _resolve_one_target(
             freshness["confidence_score"] = None
             freshness["freshness_status"] = None
             freshness["is_stale"] = None
+        if file_path_for_git and uncommitted_targets(
+            getattr(repository, "local_path", None), [file_path_for_git]
+        ):
+            freshness["working_tree"] = "modified"
         result_data["freshness"] = freshness
 
     # --- KG layer + tour context (Phase 9) ---
@@ -1122,23 +1283,48 @@ async def _resolve_one_target(
         await _resolve_call_graph(
             session,
             repository,
-            target,
+            symbol_node_id or target,
             target_type,
             result_data,
             want_callers=want_callers,
             want_callees=want_callees,
             exclude_spec=exclude_spec,
             collector=collector,
+            repo_root=repo_root or getattr(repository, "local_path", None),
         )
+
+    # --- Reference edit set: every live site naming the symbol ---
+    if include and "references" in include:
+        ref_node = graph_symbol
+        if ref_node is None and target_type == "symbol" and symbol_node_id:
+            res = await session.execute(
+                select(GraphNode).where(
+                    GraphNode.repository_id == repo_id,
+                    GraphNode.node_id.in_(symbol_id_variants(symbol_node_id)),
+                    GraphNode.node_type == "symbol",
+                )
+            )
+            ref_node = min(
+                res.scalars().all(),
+                key=lambda g: (g.node_id != symbol_node_id, g.node_id),
+                default=None,
+            )
+        root = repo_root or getattr(repository, "local_path", None)
+        if ref_node is not None and root:
+            result_data["references"] = await reference_edit_set(
+                session, repo_id, root, ref_node, collector
+            )
+        else:
+            result_data["references_note"] = "references require a symbol target in the graph"
 
     # --- Metrics (replaces get_graph_metrics) ---
     if include and "metrics" in include:
-        await _resolve_metrics(session, repository, target, result_data)
+        await _resolve_metrics(session, repository, symbol_node_id or target, result_data)
 
     # --- Community (replaces get_community) ---
     if include and "community" in include:
         await _resolve_community(
-            session, repository, target, result_data, exclude_spec=exclude_spec
+            session, repository, symbol_node_id or target, result_data, exclude_spec=exclude_spec
         )
 
     # --- Code health (Phase 2) ---
@@ -1155,7 +1341,13 @@ async def _resolve_one_target(
     # --- Skeleton (distill) — opt-in only, see the module note ---
     if want_skeleton:
         await _resolve_skeleton(
-            session, repository, target, target_type, result_data, repo_root=repo_root
+            session,
+            repository,
+            target,
+            target_type,
+            result_data,
+            repo_root=repo_root,
+            mode="plus" if skeleton_plus else "smart",
         )
 
     return result_data

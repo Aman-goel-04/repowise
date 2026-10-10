@@ -160,6 +160,17 @@ def test_a_routine_response_carries_the_digest(tmp_path: Path) -> None:
     assert "git_history_coverage" not in out["index_scope"]
 
 
+def test_a_complete_index_leaves_the_digest_off(tmp_path: Path) -> None:
+    """``complete`` restates the default, so only a gap rides on a response."""
+    whole = {
+        **_FULL_STATE,
+        "index_scope": {**_FULL_STATE["index_scope"], "file_pages": _WHOLE_PAGES},
+    }
+    out = _meta.build_meta(repository=_write_state(tmp_path, whole))
+
+    assert "index_scope" not in out
+
+
 def test_an_orientation_call_carries_the_whole_scope(tmp_path: Path) -> None:
     out = _meta.build_meta_with_full_scope(
         repository=_write_state(tmp_path, _FULL_STATE)
@@ -252,6 +263,32 @@ def test_a_degraded_index_names_what_degraded() -> None:
 
     assert compact["status"] == "degraded"
     assert compact["degraded_analyses"] == ["health"]
+    assert "degraded_analyses_total" not in compact
+
+
+def test_a_long_degraded_list_is_sampled_with_its_count() -> None:
+    """The canonical scope keeps every entry; the compact one names a few and counts all."""
+    names = [f"skipped file {i}" for i in range(17)]
+    scope = resolve_index_scope({**_FULL_STATE, "degraded": names})
+
+    compact = compact_index_scope(scope)
+
+    assert compact["degraded_analyses"] == sorted(names)[:3]
+    assert compact["degraded_analyses_total"] == 17
+    assert compact["degraded_analyses_emitted"] == 3
+    assert compact["degraded_analyses_reduced_reason"] == "compact_projection"
+    assert len(scope["analysis"]["unavailable"]) == 17
+
+
+def test_a_real_analysis_id_survives_a_flood_of_run_warnings() -> None:
+    """Warnings with a leading space sort first alphabetically; the id still shows."""
+    warnings = [f"  Not indexed: big/file_{i}.cs (3,000 KB, over the limit)" for i in range(16)]
+    scope = resolve_index_scope({**_FULL_STATE, "degraded": [*warnings, "dead_code"]})
+
+    compact = compact_index_scope(scope)
+
+    assert compact["degraded_analyses"][0] == "dead_code"
+    assert compact["degraded_analyses_total"] == 17
 
 
 def test_a_sound_index_carries_no_degraded_names() -> None:

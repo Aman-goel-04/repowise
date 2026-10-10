@@ -88,7 +88,9 @@ async def test_sealed_pr_payload_is_directive_first_typed_and_count_exact(setup_
     )
     await session.flush()
 
-    payload = await get_risk(["src/measured.py"], changed_files=changed, include=["graph"])
+    payload = await get_risk(
+        ["src/measured.py"], changed_files=changed, include=["graph", "tests", "blast"]
+    )
     external = json.loads(json.dumps(payload))
     directive = external["directive"]
     full = external["pr_blast_radius"]["test_impact"]
@@ -122,4 +124,5 @@ async def test_sealed_pr_payload_is_directive_first_typed_and_count_exact(setup_
     assert directive["test_recommendations_repository_id"] == setup_mcp
     assert relation["dependency"]["source"] in directive["may_break"]
     assert relation["co_change"]["source"] not in directive["may_break"]
-    assert external["_meta"]["contract_version"]
+    # A routine response serves the lean envelope.
+    assert "contract_version" not in external["_meta"]

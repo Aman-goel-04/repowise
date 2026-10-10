@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,35 +89,85 @@ def _clean_flag(value: str | None) -> bool:
 # Logging / structlog helpers
 # ---------------------------------------------------------------------------
 
+MACHINE_OUTPUT_LOGGER_NAMES = ("httpx", "httpcore", "repowise.core", "repowise.server")
 
-def silence_logs_for_machine_output() -> None:
-    """Suppress info/debug log output when stdout is machine-readable (JSON/md).
+@contextlib.contextmanager
+def silence_logs_for_machine_output():
+    """Suppress info/debug log output while stdout is machine-readable (JSON/md).
 
     Structlog and stdlib loggers write to stdout by default. When a command
     emits JSON or Markdown, those lines corrupt the output for downstream
     consumers (e.g. ``repowise health --format json | jq .kpis``).
 
-    Call this at the top of any command that supports ``--format json`` or
-    ``--format md`` before the ingestion pipeline starts.
+    Context manager, not a bare call: logger levels and the structlog
+    wrapper class are process-global with no other owner, so a caller that
+    forgot to restore them would permanently silence its own process — the
+    case that mattered in practice was a test session, where the mutation
+    outlived the test that made it and broke unrelated caplog assertions
+    later in the same run (see #1976).
+
+    Use as:
+
+        with silence_logs_for_machine_output():
+            emit_json_or_markdown(...)
     """
     import logging
 
-    logging.getLogger("httpx").setLevel(logging.ERROR)
-    logging.getLogger("httpcore").setLevel(logging.ERROR)
-    for _name in ("repowise.core", "repowise.server"):
-        logging.getLogger(_name).setLevel(logging.ERROR)
+    loggers = [logging.getLogger(name) for name in MACHINE_OUTPUT_LOGGER_NAMES]
+    previous_levels = [logger.level for logger in loggers]
+
+    previous_structlog_config: dict[str, Any] | None = None
     try:
         import structlog
 
-        # cache_logger_on_first_use=False is required: module-level
-        # ``structlog.get_logger`` calls snapshot the logger before configure()
-        # runs and would bypass this filter without it.
-        structlog.configure(
-            wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
-            cache_logger_on_first_use=False,
-        )
+        previous_structlog_config = dict(structlog.get_config())
     except ImportError:
         pass
+
+    try:
+        for logger in loggers:
+            logger.setLevel(logging.ERROR)
+        if previous_structlog_config is not None:
+            import structlog
+
+            # cache_logger_on_first_use=False is required: module-level
+            # ``structlog.get_logger`` calls snapshot the logger before
+            # configure() runs and would bypass this filter without it.
+            structlog.configure(
+                wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
+                cache_logger_on_first_use=False,
+            )
+        yield
+    finally:
+        for logger, level in zip(loggers, previous_levels, strict=True):
+            logger.setLevel(level)
+        if previous_structlog_config is not None:
+            import structlog
+
+            structlog.configure(**previous_structlog_config)
+
+def silence_logs_for_machine_output_until_close() -> None:
+    """Enter ``silence_logs_for_machine_output`` and restore it when the
+    current click command finishes.
+
+    ``silence_logs_for_machine_output`` is a context manager because it must
+    always restore what it mutates — but not every call site has a single
+    lexical block to wrap it around. An option callback (see the ``--format``
+    and ``--json`` callbacks in ``output.py``) returns before the command body
+    even starts running, so a ``with`` block there would restore the levels
+    before the command does any work. Re-indenting an entire command
+    function's body under one ``with`` is also a large, easy-to-get-wrong
+    diff at call sites deep inside long functions.
+
+    Solved the same way ``update_cmd`` already solves it for restoring
+    ``console.file``: register the undo against click's context instead of a
+    lexical scope, so it fires when the command finishes regardless of how
+    much code runs in between or where the call sits.
+    """
+    ctx = click.get_current_context()
+    cm = silence_logs_for_machine_output()
+    cm.__enter__()
+    ctx.call_on_close(lambda: cm.__exit__(None, None, None))
 
 
 # ---------------------------------------------------------------------------
@@ -561,12 +612,14 @@ def _pending_commit_still_ahead(
         return False
     import subprocess
 
+    if as_commit_id(indexed_head) is None or as_commit_id(pending_head) is None:
+        return False
     try:
         # ``indexed_head`` is an ancestor of ``pending_head`` => pending is
         # newer than what we indexed and worth keeping. A non-zero exit
         # (including an unresolvable pending commit) means "not ahead".
         result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", indexed_head, pending_head],
+            ["git", "merge-base", "--is-ancestor", "--end-of-options", indexed_head, pending_head],
             cwd=str(repo_path),
             capture_output=True,
             timeout=10,
@@ -637,6 +690,22 @@ def rotate_update_log_if_needed(repo_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Git helpers
 # ---------------------------------------------------------------------------
+
+
+_COMMIT_ID_RE = re.compile(r"[0-9a-fA-F]{7,40}")
+
+
+def as_commit_id(value: object) -> str | None:
+    """*value* when it is a full or abbreviated hex commit id, else ``None``.
+
+    Commit ids read back from ``.repowise/state.json`` (or a file beside it)
+    can be edited by anyone who can commit that file, so they are checked
+    before they reach a ``git`` argument list, where a leading ``-`` would be
+    read as an option.
+    """
+    if isinstance(value, str) and _COMMIT_ID_RE.fullmatch(value):
+        return value
+    return None
 
 
 def get_head_commit(repo_path: Path) -> str | None:
@@ -828,6 +897,11 @@ def save_config(
     existing["embedder"] = embedder
     if embedding_model:
         existing["embedding_model"] = embedding_model
+    else:
+        # No model was resolved this run: dropping the key beats leaving a
+        # stale one that names a different provider's model, or one this
+        # embedder was not actually built with (#2627).
+        existing.pop("embedding_model", None)
     if exclude_patterns is not None:
         existing["exclude_patterns"] = exclude_patterns
     if commit_limit is not None:
@@ -869,8 +943,19 @@ def save_config_partial(
     keyword arguments. ``None`` values are skipped so callers can forward
     optional flags without clobbering existing keys.
 
-    No scalar-only fallback like :func:`save_config`: it would silently drop
-    ``exclude_patterns``, and PyYAML is a hard dependency anyway.
+    ``embedding_model`` is the one exception to "None is skipped": passed
+    explicitly as ``None``, it clears any pinned model instead of leaving it
+    alone, because that is the caller saying the model changed (or is no
+    longer known) for whatever embedder this call names. Merely *omitting*
+    ``embedding_model`` is not the same claim, so it does not clear anything
+    on its own -- ``reindex_cmd`` calls this after every reindex with only
+    ``embedder=``, having never had a model to pass, and a bare ``in extra``
+    check on ``embedder`` used to read that silence as "no model" and wipe a
+    real pin on every routine reindex (#2627, caught in review on the fix
+    itself). Distinguishing "not passed" from "passed as ``None``" needs the
+    raw ``extra`` dict, since a keyword default cannot do it: ``in extra``
+    only reports that once, but ``get`` cannot tell the two shapes apart
+    afterwards.
     """
     import yaml  # type: ignore[import-untyped]
 
@@ -880,13 +965,16 @@ def save_config_partial(
     if commit_limit is not None:
         updates["commit_limit"] = commit_limit
     updates.update({k: v for k, v in extra.items() if v is not None})
-    if not updates:
+    clear_embedding_model = "embedding_model" in extra and extra["embedding_model"] is None
+    if not updates and not clear_embedding_model:
         return
 
     ensure_repowise_dir(repo_path)
     config_path = get_repowise_dir(repo_path) / CONFIG_FILENAME
     existing = load_config(repo_path)
     existing.update(updates)
+    if clear_embedding_model:
+        existing.pop("embedding_model", None)
 
     config_path.write_text(
         yaml.dump(existing, default_flow_style=False, sort_keys=False),
@@ -945,14 +1033,6 @@ def config_fingerprint(repo_path: Path) -> str:
 # ---------------------------------------------------------------------------
 # Provider resolution
 # ---------------------------------------------------------------------------
-
-
-def _is_codex_cli_available() -> bool:
-    """Check if the Codex CLI binary is available."""
-
-    import shutil
-
-    return shutil.which("codex") is not None
 
 
 def resolve_provider(
@@ -1212,48 +1292,26 @@ def validate_provider_config(provider_name: str | None = None) -> list[str]:
 
     # Required environment variables per provider, read from the registry that
     # also drives resolution, so a provider added there is validated here without
-    # a second edit. The agent-CLI providers are absent by design: they need no
-    # env var, so they are handled by the binary checks below instead.
-    from repowise.core.providers.llm.registry import (
-        PROVIDER_API_KEY_ENVS,
-        provider_required_envs,
-    )
+    # a second edit. The agent-CLI providers need no env var; the check for them
+    # is whether their CLI is installed.
+    from repowise.core.agents.identity import identity_for_provider
+    from repowise.core.providers.llm.registry import provider_required_envs
+    from repowise.core.providers.llm.specs import PROVIDER_SPECS
 
     provider_env_vars = {
-        name: list(provider_required_envs(name)) for name in (*PROVIDER_API_KEY_ENVS, "ollama")
+        name: list(provider_required_envs(name))
+        for name in PROVIDER_SPECS
+        if provider_required_envs(name)
     }
 
     if provider_name:
-        if provider_name == "codex_cli":
-            if not _is_codex_cli_available():
+        agent = identity_for_provider(provider_name)
+        if agent is not None:
+            if not agent.is_installed():
                 warnings.append(
-                    "Provider 'codex_cli' requires the Codex CLI. "
-                    "Install it with: npm install -g @openai/codex"
-                )
-            return warnings
-
-        if provider_name == "claude_cli":
-            import shutil
-
-            if not shutil.which("claude"):
-                warnings.append(
-                    "Provider 'claude_cli' requires the Claude Code CLI.\n"
-                    "  Install:  https://claude.com/claude-code\n"
-                    "  Setup:    run 'claude login' once to authenticate"
-                )
-            return warnings
-
-        if provider_name == "opencode":
-            import shutil
-
-            if not shutil.which("opencode"):
-                warnings.append(
-                    "Provider 'opencode' requires the opencode CLI.\n"
-                    "  Install:  curl -fsSL https://opencode.ai/install | bash\n"
-                    "  Setup:    run 'opencode' once to configure your provider\n"
-                    "  Models:   opencode models (list available models)\n"
-                    "  More:     https://opencode.ai\n"
-                    "  Usage:    repowise init --provider opencode --model opencode/openai/gpt-5"
+                    f"Provider '{provider_name}' requires the {agent.display_name} CLI.\n"
+                    f"  Install:  {agent.install_hint}\n"
+                    f"  Setup:    {agent.login_hint}"
                 )
             return warnings
 
@@ -1262,46 +1320,22 @@ def validate_provider_config(provider_name: str | None = None) -> list[str]:
             warnings.append(f"Unknown provider '{provider_name}' - cannot validate configuration")
             return warnings
 
+        # Any one of a provider's env vars satisfies it (GEMINI_API_KEY or
+        # GOOGLE_API_KEY), the same rule resolution applies.
         env_vars = provider_env_vars[provider_name]
-        missing_vars = []
-
-        if provider_name == "gemini":
-            # Special case: either GEMINI_API_KEY or GOOGLE_API_KEY
-            if not (_is_env_var_set("GEMINI_API_KEY") or _is_env_var_set("GOOGLE_API_KEY")):
-                missing_vars = env_vars
-        else:
-            for var in env_vars:
-                if not _is_env_var_set(var):
-                    missing_vars.append(var)
-
-        if missing_vars:
-            warnings.append(
-                f"Provider '{provider_name}' requires environment variables: {', '.join(missing_vars)}"
-            )
+        if not any(_is_env_var_set(var) for var in env_vars):
+            warnings.append(f"Provider '{provider_name}' requires {' or '.join(env_vars)}")
     else:
         # Check all providers - warn about any that could be configured but are missing keys
         for name, env_vars in provider_env_vars.items():
-            if name == "gemini":
-                if os.environ.get("REPOWISE_PROVIDER") == "gemini" and not (
-                    _is_env_var_set("GEMINI_API_KEY") or _is_env_var_set("GOOGLE_API_KEY")
-                ):
-                    # Only warn if it looks like they might be trying to use gemini
-                    warnings.append(
-                        "Provider 'gemini' requires GEMINI_API_KEY or GOOGLE_API_KEY environment variable"
-                    )
+            if any(_is_env_var_set(var) for var in env_vars):
                 continue
-
-            missing = [var for var in env_vars if not _is_env_var_set(var)]
-            if missing:
-                # Only warn if this provider is explicitly requested OR
-                # if the env var exists but is invalid (empty)
-                env_var_exists = any(_is_env_var_exists(var) for var in env_vars)
-                explicitly_requested = os.environ.get("REPOWISE_PROVIDER") == name
-
-                if explicitly_requested or env_var_exists:
-                    warnings.append(
-                        f"Provider '{name}' requires environment variables: {', '.join(missing)}"
-                    )
+            # Only warn if this provider is explicitly requested OR
+            # if the env var exists but is invalid (empty)
+            env_var_exists = any(_is_env_var_exists(var) for var in env_vars)
+            explicitly_requested = os.environ.get("REPOWISE_PROVIDER") == name
+            if explicitly_requested or env_var_exists:
+                warnings.append(f"Provider '{name}' requires {' or '.join(env_vars)}")
 
     return warnings
 

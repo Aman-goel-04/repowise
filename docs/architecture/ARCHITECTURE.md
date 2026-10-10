@@ -10,14 +10,16 @@ they fit together. Read this before contributing.
 
 ### Package READMEs
 
-For per-package detail (installation, full API reference, all CLI flags, file maps):
+Each Python and web package has a short contributor README that says what the
+package is and where its code lives. The detail is in this document and in
+[`CLI_REFERENCE.md`](../reference/CLI_REFERENCE.md).
 
 | Package | README | What it covers |
 |---------|--------|----------------|
-| `packages/core` | [`packages/core/README.md`](../../packages/core/README.md) | Ingestion, generation, persistence, providers; all key classes with code examples |
-| `packages/cli` | [`packages/cli/README.md`](../../packages/cli/README.md) | CLI entrypoints and flags; full surface in [`CLI_REFERENCE.md`](../reference/CLI_REFERENCE.md) |
-| `packages/server` | [`packages/server/README.md`](../../packages/server/README.md) | All REST API endpoints, 11 MCP tools, webhook setup, scheduler jobs |
-| `packages/web` | [`packages/web/README.md`](../../packages/web/README.md) | Every frontend file with purpose, API client, hooks, components, pages |
+| `packages/core` | [`packages/core/README.md`](../../packages/core/README.md) | Ingestion, analysis, generation, persistence and providers |
+| `packages/cli` | [`packages/cli/README.md`](../../packages/cli/README.md) | The `repowise` command; full surface in [`CLI_REFERENCE.md`](../reference/CLI_REFERENCE.md) |
+| `packages/server` | [`packages/server/README.md`](../../packages/server/README.md) | REST API, the MCP server (18 registered tools, 10 on by default), webhooks, scheduler |
+| `packages/web` | [`packages/web/README.md`](../../packages/web/README.md) | The local dashboard and how to run it in development |
 
 ---
 
@@ -78,7 +80,7 @@ For per-package detail (installation, full API reference, all CLI flags, file ma
 │      Three Stores     │   │              Consumers                  │
 │                      │   │                                         │
 │  SQL (wiki pages,    │   │  Web UI     MCP Server   GitHub Action  │
-│  jobs, symbols,      │   │  (Next.js)  (11 tools)   (CI/CD)        │
+│  jobs, symbols,      │   │  (Next.js)  (18 tools)   (CI/CD)        │
 │  versions)           │   │                                         │
 │                      │   │  repowise CLI                           │
 │  Vector (LanceDB /   │   │  (init, update, watch,                  │
@@ -320,26 +322,25 @@ It can be rebuilt from scratch by re-parsing the source files.
 
 ## 4. Provider Abstraction Layer
 
-Every LLM call in the entire system goes through `LLMProvider`. No provider SDK
-is ever imported from business logic packages.
+Every LLM call in the entire system goes through `BaseProvider`
+(`packages/core/src/repowise/core/providers/llm/base.py`). No provider SDK is
+ever imported from business logic packages.
+
+Each provider is described once, by a `ProviderSpec` in
+`providers/llm/specs.py`: its key and endpoint env vars, models, rate limit,
+whether it needs a key, and whether it drives a local agent CLI. The registry
+tables, the server's `/api/providers` catalog, the init picker and the web UI
+are all derived from those records.
 
 ```
-                    ┌─────────────────┐
-                    │   LLMProvider   │  (abstract base class)
-                    │                 │
-                    │  generate()     │
-                    │  generate_stream│
-                    │  embed()        │
-                    │  generate_batch │  (optional, default = sequential)
-                    │  estimate_cost  │  (optional, returns None if unknown)
-                    └────────┬────────┘
-                             │
-          ┌──────────────────┼──────────────────┬──────────────────┐
-          ▼                  ▼                  ▼                  ▼
-  AnthropicProvider   OpenAIProvider     OllamaProvider    LiteLLMProvider
-  (claude-*)          (gpt-*, any        (any local model,  (100+ providers,
-  batch API + prompt   OpenAI-compat      fully offline,     optional dep)
-  caching support)     endpoint)          no API key)
+                         BaseProvider
+                              |
+      +-----------------------+------------------------+
+      |                       |                        |
+ SDK providers         OpenAICompatibleProvider   AgentCliProvider
+ (anthropic, gemini,   (deepseek, kimi, edenai)   (claude_cli, codex_cli,
+  openai, openrouter,                              opencode: the user's
+  ollama, litellm)                                 logged-in agent CLI)
 ```
 
 ### 4.1 Rate Limiter
@@ -351,8 +352,8 @@ Before every API call, the limiter acquires from both buckets. On a 429 response
 it calls `on_rate_limit_error()` which applies exponential backoff and temporarily
 reduces the refill rate. This is transparent to all callers.
 
-Default limits are configured per provider in `.repowise/config.yaml` and can be
-adjusted for users with higher API tiers.
+Default limits come from each provider's `ProviderSpec.rate_limit`. Agent CLI
+providers get no limiter; their own concurrency semaphore bounds them.
 
 ### 4.2 Prompt Caching
 
@@ -367,8 +368,7 @@ on large repos is typically 60–90%.
 
 ### 4.3 Adding a Provider
 
-Implement `LLMProvider`, add an entry to `LANGUAGE_CONFIGS` in `providers/registry.py`,
-and add a section to `.repowise/config.yaml`. See [Section 17](#17-adding-a-new-llm-provider).
+See [Section 17](#17-adding-a-new-llm-provider).
 
 ---
 
@@ -510,14 +510,14 @@ meaning is easy to get wrong:
 
 **Call resolution** is handled by the `CallResolver` module (`ingestion/call_resolver.py`),
 which runs after the static import graph is built. Every edge it emits is stamped
-with a `ResolutionOrigin`, a closed vocabulary of 29 values in
+with a `ResolutionOrigin`, a closed vocabulary of 39 values in
 `ingestion/models.py`, each carrying exactly one confidence, so the origin
 distribution and the confidence histogram are two views of the same data. The
 span runs from `same_file` and `self_scope` at 0.95, through import- and
 package-scoped origins at 0.88–0.90, down to `global_unique` at 0.50, a
 repo-wide name match, which the source comments label as a guess.
 
-Twelve of the 29 are **receiver-typing** origins: they resolve a call on a
+Twelve of the 39 are **receiver-typing** origins: they resolve a call on a
 variable by reading the variable's declaration (a local, a parameter, an
 enclosing class's field, or a type a framework decorator imposed), then resolving
 the method on that type. Registered for Java, C#, Python, Go, Kotlin and Swift.
@@ -532,15 +532,15 @@ architecture.
 
 **Named binding resolution** (`NamedBinding` dataclass in `ingestion/models.py`) ensures
 that aliased imports, barrel re-exports, and namespace imports resolve to the correct
-definition site. The parser's `_extract_import_bindings()` produces bindings for each
-import statement, and `GraphBuilder.build()` populates `Import.resolved_file` from them.
+definition site. `extract_import_bindings()` in `ingestion/extractors/bindings/` (one extractor
+per language) produces bindings for each import statement, and `GraphBuilder.build()` populates `Import.resolved_file` from them.
 Barrel files (`__init__.py`, `index.ts`) are followed one hop to resolve re-exports.
 
 **Two-tier graph isolation:**
 
 Symbol nodes and their `DEFINES`/`HAS_METHOD`/`CALLS` edges are stored in the same
 `DiGraph` as file nodes, but `file_subgraph()` returns a view containing only `file`
-and `package` nodes. All file-level metrics (PageRank, betweenness, SCCs, Louvain)
+and `package` nodes. All file-level metrics (PageRank, betweenness, SCCs, community detection)
 run on this subgraph so that the large number of symbol nodes does not distort centrality
 scores.
 
@@ -552,7 +552,7 @@ After graph construction, the builder computes:
   Logged as warnings. Require special generation handling (see below).
 - **Betweenness centrality**: identifies "bridge" symbols whose removal would
   disconnect the graph. These are the most critical to document well.
-- **Community detection (Louvain)**: discovers logical modules even when the
+- **Community detection (Leiden when the `graph-extra` extra is installed, Louvain otherwise)**: discovers logical modules even when the
   directory structure doesn't reflect them. These communities become module pages.
 
 **Circular dependency handling:**
@@ -1089,9 +1089,10 @@ and supports two transports:
 
 Canonical reference: [`docs/agent/MCP_TOOLS.md`](../agent/MCP_TOOLS.md).
 A single-repo server advertises **10** tools by default (the canonical set).
-Workspace mode adds `list_repos`. Six specialists are registered but opt-in:
+Workspace mode adds `list_repos`. Seven specialists are registered but opt-in:
 `get_architecture`, `get_blast_radius`, `get_dependency_path`,
-`get_execution_flows`, `generate_refactoring_code`, and `get_conformance`.
+`get_execution_flows`, `generate_refactoring_code`, `get_conformance`, and
+`set_finding_status`.
 
 | Tool | What it answers | When to call |
 |------|----------------|-------------|
@@ -1277,7 +1278,7 @@ JobSystem
        │              └──────────────┬─────────────────────┘
        │                             │
        │                             ▼
-       │                       LLMProvider.generate()
+       │                       BaseProvider.generate()
        │                             │
        │                             ▼
        │                      WikiPage stored:
@@ -1338,7 +1339,7 @@ ChangeDetector.get_affected_pages(cascade_budget=30)
     │
     ▼
 For each page in `regenerate`:
-    ContextAssembler → LLMProvider → update SQL + VectorStore + Graph
+    ContextAssembler → BaseProvider → update SQL + VectorStore + Graph
     │
     ▼
 For each page in `rename_patch`:
@@ -1595,38 +1596,16 @@ Two things worth knowing before you start:
 
 ## 17. Adding a New LLM Provider
 
-1. **Create `packages/core/providers/<name>.py`**
+1. Create `packages/core/src/repowise/core/providers/llm/<name>.py` with a
+   `BaseProvider` subclass (or `OpenAICompatibleProvider` for an
+   OpenAI-compatible API).
+2. Add one `ProviderSpec` to `_SPECS` in `providers/llm/specs.py`. Nothing else
+   lists providers.
+3. Add tests in `tests/unit/test_providers/`.
 
-   Subclass `LLMProvider` and implement:
-   - `generate(request: GenerationRequest) -> GenerationResponse`
-   - `generate_stream(request: GenerationRequest) -> AsyncIterator[str]`
-   - `embed(request: EmbedRequest) -> EmbedResponse`
-   - `name` property
-
-   Optionally override:
-   - `supports_batch` → `True` if the provider has a batch API
-   - `generate_batch(requests) -> list[GenerationResponse]`
-   - `estimate_cost(input_tokens, output_tokens) -> float`
-
-2. **Register in `providers/registry.py`**
-
-   ```python
-   case "myprovider": return MyProvider(config)
-   ```
-
-3. **Add config section to `.repowise/config.yaml` docs**
-
-   ```yaml
-   myprovider:
-     api_key: ${MYPROVIDER_API_KEY}
-     base_url: https://api.myprovider.com/v1
-   ```
-
-4. **Add default rate limits** to `PROVIDER_DEFAULT_LIMITS` in `rate_limiter.py`
-
-5. **Add a `MockProvider` fixture** for tests if the provider has unique response formats
-
-6. **Update `CONTRIBUTING.md`** with the new provider's environment variables
+The recipe, including the frozen picker test, is in
+[CONTRIBUTING.md](../../.github/CONTRIBUTING.md). A backend that drives an agent's
+CLI follows [agent-platform.md](agent-platform.md).
 
 ---
 

@@ -27,6 +27,7 @@ from repowise.cli.helpers import (
 )
 from repowise.cli.state_persistence import build_kg_state, save_knowledge_graph_json
 from repowise.core.analysis.health import HEALTH_ANALYZER_VERSION
+from repowise.core.analysis.security_scan import SECURITY_SCANNER_VERSION
 from repowise.core.docs_mode import docs_mode_state_fields
 from repowise.core.generation.models import count_stub_fallbacks
 from repowise.core.index_scope import (
@@ -97,13 +98,21 @@ async def _index_preserved_pages(sf: Any, fts: Any, preserved_page_ids: set[str]
                             Page.content,
                             Page.summary,
                             Page.target_path,
+                            Page.digest,
                         ).where(Page.id.in_(batch))
                     )
                 ).all()
             await fts.index_many(
                 [
-                    (page_id, title or "", content or "", summary or "", target_path or "")
-                    for page_id, title, content, summary, target_path in rows
+                    (
+                        page_id,
+                        title or "",
+                        content or "",
+                        summary or "",
+                        target_path or "",
+                        digest or "",
+                    )
+                    for page_id, title, content, summary, target_path, digest in rows
                 ]
             )
     except Exception as exc:  # pragma: no cover - defensive
@@ -364,6 +373,11 @@ def _stamp_full_init_scope(
         )
     else:
         pages = {"effective_cap": None, "eligible": None, "generated": None, "omitted": None}
+    from repowise.cli.providers import semantic_search_status
+
+    semantic = semantic_search_status(
+        embedder_name_resolved, getattr(result, "embed_failed_pages", 0)
+    )
     stamp_index_scope(
         state,
         {"commit_limit": resolved_commit_limit, "max_file_pages": max_file_pages},
@@ -383,8 +397,8 @@ def _stamp_full_init_scope(
         },
         search={
             "full_text": "available",
-            "semantic": "unavailable" if embedder_name_resolved == "mock" else "available",
-            "next_command": "repowise reindex" if embedder_name_resolved == "mock" else None,
+            "semantic": semantic,
+            "next_command": "repowise reindex" if semantic == "unavailable" else None,
         },
         upgrade={"status": "not_applicable", "retryable": False, "completed_stages": []},
     )
@@ -512,6 +526,9 @@ def save_full_state_and_config(
     # tracking it here — otherwise a fresh install carries no stamp and the
     # first analyzer change after it cannot tell it needs a re-score.
     state["health_analyzer_version"] = HEALTH_ANALYZER_VERSION
+    # Same reasoning for the security scanner (#3072): this run just scanned
+    # every file, so start tracking its version here too.
+    state["security_scanner_version"] = SECURITY_SCANNER_VERSION
     # This run just scored every file, so the periodic re-score cadence starts
     # now. Without the stamp the gate reads "never re-scored" and the very next
     # update re-scores the whole repo that init had only just finished scoring.

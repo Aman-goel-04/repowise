@@ -61,6 +61,7 @@ from repowise.cli.ui import (
     WARN,
     MaybeCountColumn,
     RichProgressCallback,
+    agent_providers_set_up,
     interactive_advanced_config,
     interactive_customize_offer,
     interactive_fast_mode_offer,
@@ -78,6 +79,7 @@ from repowise.cli.ui import (
 )
 from repowise.core.analysis.health import HEALTH_ANALYZER_VERSION
 from repowise.core.analysis.health.coverage import PARSERS as COVERAGE_PARSERS
+from repowise.core.analysis.security_scan import SECURITY_SCANNER_VERSION
 from repowise.core.docs_mode import docs_mode_state_fields, resolve_docs_mode
 from repowise.core.generation.languages import SUPPORTED_LANGUAGES
 from repowise.core.generation.styles import DEFAULT_STYLE, list_styles, resolve_style
@@ -252,6 +254,7 @@ def _run_deterministic_generation_phase(
     embedder_was_requested: bool,
     resume: bool,
     timings: Any | None = None,
+    warnings: list[str] | None = None,
 ) -> str:
     """Render the whole wiki from templates, for ``init --index-only``.
 
@@ -319,6 +322,7 @@ def _run_deterministic_generation_phase(
         resume=resume,
         verbose=True,
         timings=timings,
+        warnings=warnings,
     )
     return embedder
 
@@ -413,8 +417,10 @@ def _run_generation_phase(
         console.print(f"  Languages: {', '.join(lang_parts)}")
 
     # Warn when a local provider runs with default concurrency
-    local_providers = ("ollama", "codex_cli", "claude_cli", "opencode")
-    if provider.provider_name in local_providers and concurrency > 4:
+    from repowise.core.providers.llm.specs import PROVIDER_SPECS
+
+    spec = PROVIDER_SPECS.get(provider.provider_name)
+    if spec is not None and spec.local and concurrency > 4:
         warn(
             f"  {provider.provider_name} is a local provider "
             f"running with concurrency={concurrency}. "
@@ -1176,6 +1182,7 @@ def init_command(
                 reasoning,
                 repo_path=repo_path,
                 save_key=save_key,
+                prefer=agent_providers_set_up(repo_path),
             )
             provider_name = selection.provider_name
             model = selection.model
@@ -1429,6 +1436,9 @@ def init_command(
                         )
                     )
                 except ProviderError as exc:
+                    from repowise.cli.hints import maybe_hint
+
+                    maybe_hint("provider_fail")
                     raise reasoned_error(
                         f"Provider validation failed: {exc}",
                         reason="provider_validation_failed",
@@ -1560,6 +1570,9 @@ def init_command(
                 f"\n{mini(EYES_SLEEPY)} [{WARN}]Interrupted.[/] Indexed work so far has been "
                 "saved — run [bold]repowise init --resume[/] to continue where it stopped."
             )
+            from repowise.cli.hints import maybe_hint
+
+            maybe_hint("interrupt")
             return
 
     # What the run degraded on, in a place an agent can read after the
@@ -1629,6 +1642,7 @@ def init_command(
             embedder_was_requested=embedder_was_requested,
             resume=resume,
             timings=callback.table,
+            warnings=run_warnings,
         )
     else:
         gen_stop, cost_declined = _run_generation_phase(
@@ -1691,6 +1705,7 @@ def init_command(
                 embedder_name_resolved=embedder_name_resolved,
                 resume=resume,
                 timings=callback.table,
+                warnings=run_warnings,
             )
 
     # ---- Persistence ----
@@ -1819,6 +1834,7 @@ def init_command(
     base_state["run_mode"] = run_mode
     base_state["git_tier"] = git_tier_for_run_mode(run_mode)
     apply_git_history_coverage_state(base_state, result)
+    from repowise.cli.providers import semantic_search_status
     from repowise.core.generation.selection import count_documentable_files
     from repowise.core.index_scope import dropped_files_scope, file_page_scope, stamp_index_scope
 
@@ -1860,8 +1876,10 @@ def init_command(
         search={
             "full_text": "available" if result.generated_pages else "unavailable",
             "semantic": (
-                "available"
-                if result.generated_pages and _scope_embedder and _scope_embedder != "mock"
+                semantic_search_status(
+                    _scope_embedder, getattr(result, "embed_failed_pages", 0)
+                )
+                if result.generated_pages
                 else "unavailable"
             ),
             "next_command": "repowise reindex" if result.generated_pages else None,
@@ -1917,6 +1935,9 @@ def init_command(
         # their stamp. Without it `health_analyzer_changed` reads absent-as-
         # unchanged and the version trigger never fires for them.
         base_state["health_analyzer_version"] = HEALTH_ANALYZER_VERSION
+        # Same reasoning for the security scanner (#3072): this run just
+        # scanned every file, so start tracking its version here too.
+        base_state["security_scanner_version"] = SECURITY_SCANNER_VERSION
         # This run just scored every file, so the periodic re-score cadence
         # starts now. Without the stamp the gate reads "never re-scored" and the
         # very next update re-scores the whole repo init had only just scored.
@@ -2017,3 +2038,13 @@ def init_command(
         setup=_setup_outcome,
         files_written=files_written,
     )
+    # Raised last, so everything above is kept: pages, state and full-text
+    # search are fine. Exiting 0 here is what let a scripted run record a
+    # healthy semantic index that held no vectors.
+    from repowise.cli.providers import embed_failure_message
+
+    _embed_error = embed_failure_message(
+        _scope_embedder, getattr(result, "embed_failed_pages", 0)
+    )
+    if _embed_error:
+        raise click.ClickException(_embed_error)

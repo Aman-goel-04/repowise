@@ -91,6 +91,9 @@ export interface ActionsResponse {
 export interface ActiveProviderSelection {
   provider?: string | null;
   model?: string | null;
+  input_cost_per_1k?: number | null;
+  output_cost_per_1k?: number | null;
+  embedder?: string | null;
 }
 
 export interface AgentPromptResponse {
@@ -1266,6 +1269,13 @@ export interface EgoGraphResponse {
   outbound_count: number;
 }
 
+/** One registered embedder, as the settings picker renders it. */
+export interface EmbedderEntry {
+  id: string;
+  env_vars?: string[];
+  semantic?: boolean;
+}
+
 /**
  * Counts by tier and by kind, from a grouped read of the same filters.
  *
@@ -2042,6 +2052,11 @@ export interface HotspotResponse {
   original_path?: string | null;
 }
 
+export interface IdentityResponse {
+  signed_in: boolean;
+  hints_enabled: boolean;
+}
+
 /** One file on the impact / effort plane. */
 export interface ImpactEffortPoint {
   file_path: string;
@@ -2387,6 +2402,7 @@ export interface PageResponse {
   created_at: string;
   updated_at: string;
   content: string;
+  digest?: string;
   metadata: Record<string, unknown>;
 }
 
@@ -2618,11 +2634,16 @@ export interface ProviderEntry {
   models?: string[];
   default_model?: string | null;
   configured?: boolean;
+  requires_key?: boolean;
+  env_vars?: string[];
+  setup_hint?: string;
 }
 
 export interface ProviderStatusResponse {
   active: ActiveProviderSelection;
   providers?: ProviderEntry[];
+  flag_only_providers?: string[];
+  embedders?: EmbedderEntry[];
 }
 
 /**
@@ -2636,6 +2657,20 @@ export interface ProviderValidationResponse {
   provider?: string | null;
   model?: string | null;
   error?: string | null;
+}
+
+export interface PublishRequest {
+  repo_id: string;
+}
+
+/** ``repowise publish --format json``, passed through unchanged. */
+export interface PublishResponse {
+  outcome: string;
+  message: string;
+  url?: string | null;
+  details?: string[];
+  open_url?: string | null;
+  repo?: string | null;
 }
 
 /** What the ``fix_first`` scope leaves out of a page's filtered set. */
@@ -3438,6 +3473,17 @@ export interface WorkspaceCoChangesResponse {
   truncated_by?: "total" | "per_repo_pair" | null;
 }
 
+export interface WorkspaceCodeApiCoverage {
+  manifests?: number;
+  published?: number;
+  unsupported_ecosystem?: number;
+  providers?: number;
+  consumers?: number;
+  linked_providers?: number;
+  published_ratio?: number | null;
+  linked_ratio?: number | null;
+}
+
 export interface WorkspaceConformanceResponse {
   version?: number;
   generated_at?: string | null;
@@ -3560,6 +3606,10 @@ export interface WorkspaceExtractionDiagnostics {
   consumers_by_layer?: Record<string, number>;
   http_consumers_unresolved?: number;
   http_consumer_coverage?: number | null;
+  symbol_identity?: Record<string, WorkspaceSymbolIdentity>;
+  schema_coverage?: WorkspaceSchemaCoverage;
+  code_api?: WorkspaceCodeApiCoverage;
+  openapi?: WorkspaceOpenApiCoverage;
 }
 
 export interface WorkspaceGraphEdge {
@@ -3614,6 +3664,19 @@ export interface WorkspaceNodeArchitectureRole {
   visibility_fan_in?: number;
   visibility_fan_out?: number;
   role?: string;
+}
+
+export interface WorkspaceOpenApiCoverage {
+  documents?: number;
+  parsed_documents?: number;
+  unresolved_documents?: number;
+  operations?: number;
+  providers?: number;
+  schemas_merged?: number;
+  spec_only_providers?: number;
+  request_states?: Record<string, number>;
+  response_states?: Record<string, number>;
+  refusal_reasons?: Record<string, number>;
 }
 
 export interface WorkspaceOrphanProvider {
@@ -3675,6 +3738,26 @@ export interface WorkspaceResponse {
   default_repo?: string | null;
   cross_repo_summary?: WorkspaceCrossRepoSummary | null;
   contract_summary?: WorkspaceContractSummary | null;
+}
+
+export interface WorkspaceSchemaCoverage {
+  total?: number;
+  bound?: number;
+  recovered?: number;
+  shared_symbol?: number;
+  unsupported_language?: number;
+  non_callable?: number;
+  eligible?: number;
+  recovered_ratio?: number | null;
+  recovered_ratio_eligible?: number | null;
+}
+
+export interface WorkspaceSymbolIdentity {
+  total?: number;
+  bound?: number;
+  unindexed_file?: number;
+  bound_ratio?: number | null;
+  bound_ratio_indexed?: number | null;
 }
 
 export interface WorkspaceSyncResponse {

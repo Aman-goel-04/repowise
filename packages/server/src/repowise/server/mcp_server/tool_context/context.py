@@ -10,9 +10,13 @@ The split keeps the cached prompt prefix small on multi-turn agent sessions:
 ``get_context`` stays under ~2k tokens for common targets.
 
 Optional ``include`` parameter widens the response:
-  - include=["full_doc"]  → full wiki markdown content
+  - include=["full_doc"]  -> full wiki markdown content, plus the page's agent
+                            digest (questions, identifiers, git signals)
   - include=["callers"]   → who calls this symbol (symbol targets only)
   - include=["callees"]   → what this symbol calls (symbol targets only)
+  - include=["references"]→ every live edit site of a symbol (definition,
+                            imports, calls, other mentions) and whether
+                            the list is complete (symbol targets only)
   - include=["ownership"] → primary owner, bus factor, contributor count
   - include=["last_change"]→ last commit date and author
   - include=["metrics"]   → PageRank, betweenness, percentile ranks
@@ -24,8 +28,10 @@ Optional ``include`` parameter widens the response:
                             two appear only when non-empty, and are capped.
                             A dismissed record is in none of them.
   - include=["skeleton"]  → body-elided file rendering (signatures + top-PageRank bodies)
+  - include=["skeleton+"] → all non-function code kept, every function/method body elided
   - include=["health"]    → code-health scores and biomarkers for the target
   - include=["doc_drift"] → documents that name this file, and their drift
+  - include=["symbols"]   → every symbol in a file card, not the ranked top 15
 
 An unrecognised key is dropped and named in ``ignored_arguments`` rather than
 silently ignored: an unknown key otherwise produces exactly the response the
@@ -41,7 +47,10 @@ import asyncio
 import logging
 from typing import Any
 
+from sqlalchemy import func, select
+
 from repowise.core.persistence.database import get_session
+from repowise.core.persistence.models import GitMetadata
 from repowise.core.registry import ToolRecipe
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.server.mcp_server import _state
@@ -74,37 +83,19 @@ _INCLUDE_BLOCKS = frozenset(
         "full_doc",
         "callers",
         "callees",
+        "references",
         "ownership",
         "last_change",
         "metrics",
         "community",
         "decisions",
         "skeleton",
+        "skeleton+",
         "health",
         "doc_drift",
+        "symbols",
     }
 )
-
-
-async def _scope_hint(session: Any, repository: Any, raw_results: list[Any]) -> str | None:
-    """One sentence naming index layers that hold none of the files served here."""
-    try:
-        from repowise.server.mcp_server._index_state import index_state_key
-        from repowise.server.mcp_server._scope import unrelated_scope_hint
-
-        served = [
-            r.get("path") or str(r.get("target") or "").split("::", 1)[0]
-            for r in raw_results
-            if isinstance(r, dict)
-        ]
-        return await unrelated_scope_hint(
-            session,
-            repository.id,
-            served,
-            cache_key=f"{repository.id}:{index_state_key(repository)}",
-        )
-    except Exception:
-        return None
 
 
 @mcp.tool(
@@ -128,8 +119,9 @@ async def get_context(
     """Triage card for files / modules / symbols — relationships, not source bytes.
 
     Returns title, summary, signatures with line numbers, hotspot bit, and
-    decision_record titles. fix_history appears only on files with counted bug
-    fixes (count, age, bug_magnet); hotspot is churn. Either one is a cue to
+    decision_record titles. A symbol row without symbol_id is path::name.
+    fix_history appears only on files with counted bug fixes (count, age,
+    bug_magnet); hotspot is churn. Either one is a cue to
     call get_risk. episodes counts the dated records bound to a target — what
     happened here and why — and appears only when there is at least one;
     get_why serves the bodies. A symbol target is counted as its file, and a
@@ -137,6 +129,8 @@ async def get_context(
     Batch targets in one call. No source bytes by default: pass
     include=["skeleton"] for the whole file body-elided and line-verified in
     ONE call, or Read it. Do not call get_symbol per signature.
+    For a rename or update-all-callers task, include=["references"] is the
+    whole edit set when complete is true.
 
     Default responses fit 24,000 serialized chars; nonempty ``include`` uses
     32,000. Reductions carry counts and ``_meta.omitted`` recovery refs;
@@ -146,9 +140,9 @@ async def get_context(
     Args:
         targets: file paths, module paths, or "path::Symbol" ids.
         include: opt-in blocks: full_doc | ownership | last_change | callers
-            | callees | metrics | community | decisions | skeleton | health
-            | doc_drift (documents naming this file).
-            An unrecognised key is named in ignored_arguments.
+            | callees | references | metrics | community | decisions | skeleton
+            | skeleton+ | health | doc_drift (docs naming this file)
+            | symbols (all of a file's symbols, not the top 15).
         compact: default True; False adds structure+imports+docstrings.
         repo: usually omitted.
     """
@@ -183,6 +177,13 @@ async def get_context(
     _t0 = _time.perf_counter()
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
+        as_of_ts = (
+            await session.execute(
+                select(func.max(GitMetadata.last_commit_at)).where(
+                    GitMetadata.repository_id == repository.id
+                )
+            )
+        ).scalar()
 
         # return_exceptions=True isolates a single target's failure: one
         # target raising (e.g. a malformed lookup) must not sink the whole
@@ -200,6 +201,7 @@ async def get_context(
                     exclude_spec=exclude_spec,
                     repo_root=ctx.path,
                     collector=collector,
+                    as_of_ts=as_of_ts,
                 )
                 for t in targets
             ],
@@ -218,10 +220,6 @@ async def get_context(
             exclude_spec=exclude_spec,
             collector=collector,
         )
-
-        # repo="all" already returned above, so ctx here is always one repo.
-        # Computed on the open session: never open a second one for this.
-        scope_hint = await _scope_hint(session, repository, raw_results)
 
     results: list[dict[str, Any]] = []
     for t, r in zip(targets, raw_results, strict=True):
@@ -254,8 +252,6 @@ async def get_context(
             targets=targets,
         ),
     }
-    if scope_hint:
-        response["_meta"]["scope_hint"] = scope_hint
     # A "raw" skeleton is the file's own source served untouched; the
     # signatures and smart modes elide bodies, so they are not whole files.
     whole_files = sum(

@@ -34,6 +34,15 @@ from repowise.core.test_paths import is_test_related_path
 
 logger = logging.getLogger(__name__)
 
+# Bump whenever a change alters what the scanner reports: a new/removed
+# pattern, a changed severity, a precision fix to an existing rule. ``update``
+# compares this against the value stamped in state.json and, on a mismatch,
+# rescans every tracked working-tree file instead of only the changed ones,
+# the same way ``HEALTH_ANALYZER_VERSION`` forces a full health re-score
+# (#3072). Without this, a scanner fix only ever reaches a file a user
+# happens to edit.
+SECURITY_SCANNER_VERSION = 1
+
 _CREDENTIAL_EXACT_PLACEHOLDERS: frozenset[str] = frozenset({"password", "changeit"})
 
 _CREDENTIAL_SUBSTRING_PLACEHOLDERS: tuple[str, ...] = (
@@ -311,7 +320,14 @@ _SYMBOL_KEYWORDS = re.compile(r"\b(auth|token|password|jwt|session|crypto)\b", r
 # comments and string literals blanked, so a docstring, a comment or a regex
 # literal that merely mentions the call does not fire.
 _MASKED_KINDS = frozenset(
-    {"pickle_loads", "subprocess_shell_true", "os_system", "new_function_call"}
+    {
+        "pickle_loads",
+        "subprocess_shell_true",
+        "os_system",
+        "new_function_call",
+        "tls_verify_false",
+        "reject_unauthorized_false",
+    }
 )
 
 # Prose is documentation, not executable code. Only secret kinds scan it,
@@ -347,10 +363,11 @@ SYMBOL_NAME_KINDS: frozenset[str] = frozenset({"security_sensitive_symbol"})
 
 _KEYWORD_KINDS: frozenset[str] = frozenset({"hardcoded_password", "hardcoded_secret"})
 
-# A snake_case name is a key's name (a constant holding its own name) and a
-# template placeholder or shell substitution is filled in when it runs; none of
-# them is a credential.
-_KEY_NAME_VALUE = re.compile(r"[a-z_]*_[a-z_]*")
+# A snake_case or kebab-case name (``x-api-key``, ``repowise-security-ignore``)
+# is a key's or marker's name, a constant holding its own name, and a template
+# placeholder or shell substitution is filled in when it runs; none of them is a
+# credential. Letters only: a digit or capital makes it look like a key.
+_KEY_NAME_VALUE = re.compile(r"[a-z]+(?:[_-][a-z]+)+|[a-z_]*_[a-z_]*")
 _TEMPLATE_VALUE = re.compile(r"\{\{.*\}\}|\$\{[^}]*\}|\$\(.*\)")
 
 

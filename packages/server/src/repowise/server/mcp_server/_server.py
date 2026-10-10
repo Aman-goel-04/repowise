@@ -388,6 +388,28 @@ async def _warm_lancedb() -> None:
             _state._lancedb_ready.set()
 
 
+def _mark_vector_store_unreadable(exc: BaseException, alias: str | None = None) -> None:
+    """Flag semantic search degraded: the index exists but cannot be opened.
+
+    Recorded in ``_state._vector_store_errors``, which ``build_meta`` reads
+    beside the embedder status, so ``embedder_degraded`` and
+    ``embedder_warning`` carry it and a later embedder resolve cannot erase it.
+    Without this a broken LanceDB install served an empty in-memory store with
+    ``embedder_degraded: false``.
+    """
+    from repowise.core.persistence.vector_store.lancedb_store import store_open_fix_hint
+
+    where = f" for '{alias}'" if alias else ""
+    reason = (
+        f"The semantic index{where} exists but could not be opened "
+        f"({type(exc).__name__}: {exc}). Semantic search (search_codebase, "
+        "get_answer) is off; full-text search still works. To fix: "
+        f"{store_open_fix_hint(exc)}, then restart the MCP server."
+    )
+    _log.error(reason)
+    _state._vector_store_errors[alias or ""] = reason
+
+
 async def _load_vector_stores(repo_path: str | None) -> None:
     """Load embedder + vector stores in the background.
 
@@ -412,25 +434,26 @@ async def _load_vector_stores(repo_path: str | None) -> None:
         embedder = _query_embedder()
         vector_store: Any = InMemoryVectorStore(embedder=embedder)
 
+        from pathlib import Path
+
+        lance_dir = Path(repo_path) / ".repowise" / "lancedb" if repo_path else None
         try:
             # Step 1 — import lancedb in a thread to keep event loop free.
             await _asyncio.to_thread(__import__, "lancedb")
 
             from repowise.core.persistence.vector_store import LanceDBVectorStore
 
-            if repo_path:
-                from pathlib import Path
-
-                lance_dir = Path(repo_path) / ".repowise" / "lancedb"
-                if lance_dir.exists():
-                    vs = LanceDBVectorStore(str(lance_dir), embedder=embedder)
-                    # Step 2 — pre-connect so first search() is instant.
-                    await vs._ensure_connected()
-                    vector_store = vs
-        except ImportError:
-            pass
-        except Exception:
-            _log.warning("LanceDB pre-connect failed — using InMemory fallback")
+            if lance_dir is not None and lance_dir.exists():
+                vs = LanceDBVectorStore(str(lance_dir), embedder=embedder)
+                # Step 2: pre-connect so first search() is instant.
+                await vs._ensure_connected()
+                vector_store = vs
+                _state._vector_store_errors.pop("", None)
+        except Exception as exc:
+            # ImportError included: with an index on disk, a missing lancedb
+            # is as broken as an unreadable one. No index is a keyless repo.
+            if lance_dir is not None and lance_dir.exists():
+                _mark_vector_store_unreadable(exc)
 
         # decision_store is repointed to the shared page store — decisions are
         # now embedded under the "decision:" namespace within the same table.
@@ -537,6 +560,7 @@ async def _lifespan(server: FastMCP):
             workspace_root=ws_root,
             ws_config=ws_config,
             embedder_factory=_query_embedder,
+            on_vector_store_error=lambda alias, exc: _mark_vector_store_unreadable(exc, alias),
         )
 
         # Eagerly load the default repo so tools work immediately. A failure
@@ -624,13 +648,19 @@ async def _lifespan(server: FastMCP):
             db_path = get_repo_db_path(_state._repo_path)
             repowise_dir = db_path.parent
             store_location = str(repowise_dir)
-            if not repowise_dir.exists():
-                _log.warning(
-                    "No .repowise directory at %s — run 'repowise init' first",
+            if not repowise_dir.is_dir():
+                # Creating the store directory here made whatever directory an
+                # MCP host spawned the server from look initialised: it left a
+                # stray .repowise/ behind, silenced the CLI's "run 'repowise
+                # init'" warning for every later start, and seeded an empty
+                # wiki.db. Fail the way an unopenable store does instead (#3163).
+                await _abort_startup(_release_task, _warm_task)
+                raise _store_unavailable(
+                    store_location,
                     _state._repo_path,
+                    FileNotFoundError(f"no {repowise_dir.name} directory"),
                 )
-                repowise_dir.mkdir(parents=True, exist_ok=True)
-            elif not db_path.exists():
+            if not db_path.exists():
                 _log.warning(
                     "No wiki.db in %s — run 'repowise init' to generate the wiki",
                     repowise_dir,
@@ -695,12 +725,28 @@ async def _lifespan(server: FastMCP):
 
 mcp = FastMCP(
     "repowise",
+    # Hosts that defer tool schemas show the model only tool names and this
+    # string, so it says when to call; tests pin the key lines and a length cap.
     instructions=(
-        "repowise is a codebase documentation engine. Use these tools to query "
-        "the wiki for architecture overviews, contextual docs on files/modules/"
-        "symbols, modification and change-risk assessment, architectural decision "
-        "rationale, semantic search, dead code, and code health. In workspace mode, "
-        "get_architecture and get_blast_radius are also available. If the tools "
+        "repowise indexes this repository's code graph, git history and "
+        "decisions. One call here often replaces several text searches and "
+        "file reads.\n"
+        "- Use search_codebase(query) to find an identifier or literal: it "
+        "returns `lines` (path, line, kind, text; definitions first) read from "
+        "live files, and `complete: true` means that is every match. Path-like "
+        "and concept queries rank files.\n"
+        '- Use get_context(targets=[symbol], include=["references"]) before a '
+        "rename or an update-all-callers change: it lists the definition, "
+        "imports and calls, and a `complete` list is the whole edit set.\n"
+        "- Use get_answer(question) for a how/where/why question: one cited "
+        "answer.\n"
+        "- Use get_risk before a non-trivial edit to a widely imported file, "
+        "get_change_risk before committing a multi-file change, and get_why "
+        "before changing an established pattern. Skip them for one-line fixes.\n"
+        "- Targets with uncommitted edits are flagged; the index is stale for "
+        "them until `repowise update --working-tree` runs.\n"
+        "In workspace mode, get_architecture and get_blast_radius are also "
+        "available. If the tools "
         "report that the repo has no index, tell the user to run "
         "'repowise init --yes' in the repo root; it needs no API key. Suggest it, "
         "do not run it yourself."

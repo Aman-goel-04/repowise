@@ -9,8 +9,10 @@ import { FirstIndexExperience } from "@/components/repos/first-index-experience"
 import { QuickActionsWrapper } from "@/components/dashboard/quick-actions-wrapper";
 import { AskAnythingRow } from "@/components/overview/ask-anything-row";
 import { NextActionsPanel } from "@/components/overview/next-actions-panel";
+import { PublishOverviewSection } from "@/components/hosted/publish";
 import {
   OverviewBody,
+  OverviewSection,
   RepoIdentityHeader,
   type OverviewRoutes,
   type RepoIdentityMeta,
@@ -86,6 +88,13 @@ export default async function OverviewPage({ params }: Props) {
     });
   }
 
+  // Priced by the server; no rates means the dialog shows no estimate.
+  const active = providers?.active;
+  const costPer1k =
+    active?.input_cost_per_1k != null && active.output_cost_per_1k != null
+      ? { input: active.input_cost_per_1k, output: active.output_cost_per_1k }
+      : null;
+
   const header = (
     <RepoIdentityHeader
       name={repo.name}
@@ -101,6 +110,7 @@ export default async function OverviewPage({ params }: Props) {
             repoName={repo.name}
             pageCount={sync.page_count || stats.file_count}
             modelName={providers?.active.model ?? sync.last_sync_model ?? ""}
+            costPer1k={costPer1k}
             lastSyncAt={sync.last_sync_at}
             lastResyncAt={sync.last_resync_at}
           />
@@ -138,6 +148,7 @@ export default async function OverviewPage({ params }: Props) {
       slots={{
         header,
         ask: <AskAnythingRow repoId={id} />,
+        beforeExplore: <PublishOverviewSection repoId={id} />,
         // A server that predates actions returns 404; the page then keeps the
         // attention areas in their old place rather than showing an empty list.
         actions: actions ? (
