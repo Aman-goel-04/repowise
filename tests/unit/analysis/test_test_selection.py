@@ -326,6 +326,62 @@ def test_any_route_through_a_test_helper_runs_everything() -> None:
     assert "src/a.py is reached through the test helper tests/helpers.py, and no test" in sel.reasons[0]
 
 
+def test_an_unimported_helper_adds_nothing_when_every_known_test_runs() -> None:
+    """Its unknown users are tests, and all of them are selected already."""
+    changed = "src/env.ts"
+    tiers = _tiers(
+        inferred=[
+            _inferred(changed, "test/setup.ts", "import-graph"),
+            _inferred(changed, "src/a.test.ts", "import-graph"),
+            _inferred(changed, "src/b.test.ts", "import-graph"),
+            _inferred(changed, "extensions/tw/test/setup.ts", "import-graph"),
+        ]
+    )
+    tiers["helper_importers"] = {"test/setup.ts": ["src/a.test.ts", "src/b.test.ts"]}
+    known = ["src/a.test.ts", "src/b.test.ts"]
+    sel = _select([changed], tiers, known_tests=known)
+    assert not sel.run_all
+    assert sel.test_files == ("src/a.test.ts", "src/b.test.ts")
+    assert sel.reasons[0] == (
+        f"{changed} is reached through the test helper extensions/tw/test/setup.ts, which "
+        "no test imports, but every known test already runs for that change."
+    )
+    # --explain names the change behind a test a setup-file route added.
+    assert sel.why["src/a.test.ts"] == f"{changed} changed (import-graph)"
+    # A test in another language may start the helper by path: it must run too.
+    sel = _select([changed], tiers, known_tests=[*known, "tests/test_launch.py"])
+    assert sel.run_all
+    assert "no test imports that helper" in sel.reasons[0]
+
+
+def test_an_unimported_helper_still_runs_everything_when_a_peer_is_not_selected() -> None:
+    tiers = _tiers(
+        inferred=[
+            _inferred("src/a.py", "tests/test_a.py", "import-graph"),
+            _inferred("src/a.py", "tests/helpers.py", "import-graph"),
+        ]
+    )
+    sel = _select(["src/a.py"], tiers, known_tests=["tests/test_a.py", "tests/test_b.py"])
+    assert sel.run_all
+    assert "reached through the test helper tests/helpers.py, and no test" in sel.reasons[0]
+    # A test the graph cannot see into runs with every selection, so it counts.
+    sel = _select(
+        ["src/a.py"],
+        tiers,
+        known_tests=["tests/test_a.py", "tests/test_b.py"],
+        unplaced_tests=["tests/test_b.py"],
+    )
+    assert not sel.run_all
+    # So does a detected always-run test.
+    sel = _select(
+        ["src/a.py"],
+        tiers,
+        known_tests=["tests/test_a.py", "tests/test_b.py"],
+        always_run_tests={"tests/test_b.py": "it runs the CLI in a subprocess"},
+    )
+    assert not sel.run_all
+
+
 def test_coverage_does_not_hide_a_helper_route() -> None:
     tiers = _tiers(
         covered={

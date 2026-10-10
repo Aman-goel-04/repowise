@@ -16,7 +16,8 @@ is chosen when any of these hold:
 4. a changed file is neither code the index knows nor documentation, or is
    documentation some code names (a test may read it);
 5. a changed code file has no known test, only a filename guess names one, or
-   a route to it passes through a test helper no test imports, or any Python
+   a route to it passes through a test helper no test imports (unless every
+   known test is selected anyway), or any Python
    test helper while a conftest or pytest config loads plugins by name (its
    users are unknown);
 6. the index is missing, disagrees with itself about its commit, or its graph
@@ -484,7 +485,7 @@ def select_tests(inp: SelectionInput) -> Selection:
     )
     return Selection(
         run_all=bool(run_all),
-        reasons=tuple(run_all + _notes(inp, triage.skipped, always, traced)),
+        reasons=tuple(run_all + evidence.notes + _notes(inp, triage.skipped, always, traced)),
         tests=tests,
         test_files=test_files,
         packages=_go_packages(triage.code, deleted, inp.go_test_dirs),
@@ -819,6 +820,10 @@ class _Evidence:
     known_tests: tuple[str, ...]
     plugin_loader: str | None
     gap: frozenset[str] = frozenset()
+    # Tests every subset runs (unplaced and detected always-run).
+    every_subset: frozenset[str] = frozenset()
+    # Explanations that do not force a full run, gathered while deciding.
+    notes: list[str] = field(default_factory=list)
 
     @classmethod
     def of(cls, inp: SelectionInput, deleted: set[str]) -> _Evidence:
@@ -839,6 +844,7 @@ class _Evidence:
             known_tests=tuple(inp.known_tests),
             plugin_loader=inp.plugin_loader,
             gap=frozenset(inp.index_gap or ()),
+            every_subset=frozenset(inp.unplaced_tests) | frozenset(inp.always_run_tests),
         )
 
     def found(self, path: str) -> list[_TestRef]:
@@ -898,7 +904,7 @@ def _file_tests(
     if is_test_helper(path):
         return tests, "helper-importers", _own_helper_reasons(path, ev)
 
-    reasons = _helper_route_reasons(path, helpers, ev) + _unfiled_reasons(path, tests)
+    reasons = _helper_route_reasons(path, helpers, tests, ev) + _unfiled_reasons(path, tests)
     # A deleted test needs no run of its own; the tests importing it do.
     if path in ev.deleted and is_runnable_test(path):
         basis = "deleted-test"
@@ -947,22 +953,39 @@ def _plugin_reason(helper: str, ev: _Evidence) -> str | None:
     )
 
 
-def _helper_route_reasons(path: str, helpers: list[str], ev: _Evidence) -> list[str]:
+def _helper_route_reasons(
+    path: str, helpers: list[str], tests: list[_TestRef], ev: _Evidence
+) -> list[str]:
     """A helper on a route stands for its importers, which the walk adds beside it.
 
     One no test imports is used some other way (a fixture, a plugin), so its
-    users are unknown.
+    users are unknown, unless every known test already runs for *path*: then
+    no user it could have is left out. Any language counts, since a test can
+    start a helper in another language by path.
     """
     plugins = [r for h in helpers if (r := _plugin_reason(h, ev))]
     if plugins:
         return [f"{path} is reached through a test helper: {plugins[0]}"]
     unimported = [h for h in helpers if not ev.importers.get(h)]
+    if unimported and _all_tests_selected(tests, ev):
+        ev.notes.extend(
+            f"{path} is reached through the test helper {h}, which no test imports, "
+            "but every known test already runs for that change."
+            for h in unimported
+        )
+        return []
     if not unimported:
         return []
     return [
         f"{path} is reached through the test helper {unimported[0]}, and no test "
         "imports that helper; tests that use it without an import are not tracked."
     ]
+
+
+def _all_tests_selected(tests: list[_TestRef], ev: _Evidence) -> bool:
+    """Whether *tests*, with the tests every selection runs, hold every known test."""
+    selected = {f for _, f in tests if f} | ev.every_subset
+    return bool(ev.known_tests) and set(ev.known_tests) <= selected
 
 
 def _unfiled_reasons(path: str, tests: list[_TestRef]) -> list[str]:
