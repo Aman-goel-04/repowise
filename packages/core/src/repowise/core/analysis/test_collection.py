@@ -20,10 +20,11 @@ and the gap as inputs is the upgrade.
 
 from __future__ import annotations
 
+import asyncio
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
 
 import structlog
@@ -69,7 +70,7 @@ def read_checkout(repo_path) -> Checkout:
         except OSError:
             return None
 
-    tracked = git_refs.tracked_paths(str(root))
+    tracked = sorted(git_refs.tracked_paths(str(root)))
     texts = [
         (p, text)
         for p in tracked
@@ -80,6 +81,20 @@ def read_checkout(repo_path) -> Checkout:
     return Checkout(tracked, texts, roots, read, lambda p: (root / p).is_file())
 
 
+class SelectionCancelledError(Exception):
+    """The caller gave up on this selection; whatever it had found is discarded."""
+
+
+def _never() -> bool:
+    return False
+
+
+def _stop(cancelled: Callable[[], bool]) -> bool:
+    if cancelled():
+        raise SelectionCancelledError
+    return False
+
+
 class Plan(NamedTuple):
     """Who names each changed doc or asset, the scope each scoped file runs, and its routes."""
 
@@ -88,8 +103,14 @@ class Plan(NamedTuple):
     routes: list[str]
 
 
-def plan_scopes(change, config, checkout: Checkout) -> Plan:
-    """The change's scopes, reading the sources once and only when a file needs its namers."""
+def plan_scopes(
+    change, config, checkout: Checkout, cancelled: Callable[[], bool] = _never
+) -> Plan:
+    """The change's scopes, reading the sources once and only when a file needs its namers.
+
+    *cancelled* is polled between file reads, so an abandoned selection stops
+    reading the checkout.
+    """
     from .selection_scopes import (
         keeps_full_run,
         needs_namers,
@@ -107,7 +128,7 @@ def plan_scopes(change, config, checkout: Checkout) -> Plan:
         texts = (
             (p, known[p]) if p in known else (p, checkout.read(p) or "")
             for p in checkout.tracked
-            if is_scan_source(p)
+            if is_scan_source(p) and not _stop(cancelled)
         )
         namers = file_namers(asked, texts)
     scopes = trigger_scopes(paths, checkout.tracked, namers, config)
@@ -149,13 +170,18 @@ async def collect(
     summary = await get_test_coverage_summary(session, repo_id)
     out["map_empty"] = summary.get("pair_count", 0) == 0
     out["map_truncated"] = summary.get("pair_count", 0) >= MAX_TEST_COVERAGE_ROWS
-    measured = summary.get("ingested_commit_sha")
+    out["measured_commit"] = measured = summary.get("ingested_commit_sha")
     out["map_current"] = out["map_empty"] or measured in {change.base, change.head} - {None}
 
     # Repo file keys back the filename-pattern fallback (same source the
     # aggregate coverage ingest resolves against).
     repo_keys = {m.file_path for m in await get_health_metrics(session, repo_id)}
-    routes = [] if config is None else _gap_routes(repo_path, change, config, repo_keys, out)
+    # git runs off the event loop: a server shares it with other requests.
+    routes = (
+        []
+        if config is None
+        else await asyncio.to_thread(_gap_routes, repo_path, change, config, repo_keys, out)
+    )
     routes = sorted({*routes, *scope_routes})
     await resolve_impacted(
         session,
@@ -294,6 +320,7 @@ def empty_result(changed_files: int) -> dict:
         "map_empty": False,
         "map_current": True,
         "map_truncated": False,
+        "measured_commit": None,
         "indexed_commit": None,
         "index_problem": None,
         "index_gap": None,
@@ -354,7 +381,7 @@ async def resolve_impacted(
         Nothing said anything. Run the full suite.
     """
     from ..persistence.crud import tests_covering, tests_covering_files
-    from .health.coverage import paired_test_file
+    from .test_reachability import tests_matching_by_name
 
     covered: dict[str, dict] = out["covered"]
     has_rows: set[str] = set()
@@ -395,12 +422,12 @@ async def resolve_impacted(
             continue
         if source_file in has_rows or source_file not in changed:
             continue  # coverage answered, or a route; a name-shaped guess adds nothing
-        guess = paired_test_file(source_file, repo_keys)
+        guess = tests_matching_by_name([source_file], repo_keys).get(source_file)
         if guess:
             out["inferred"].append(
                 {
                     "source_file": source_file,
-                    "test_file": guess,
+                    "test_file": guess.tests[0],
                     "via": "filename-pattern",
                 }
             )
@@ -552,7 +579,12 @@ def select(change, result: dict, config, checkout: Checkout, plan: Plan) -> Sele
             map_truncated=result["map_truncated"],
             index_gap=result["index_gap"],
             gap=result["gap"],
-            index_problem=result["index_problem"],
+            index_problem=result["index_problem"]
+            or (
+                None
+                if tracked
+                else "git could not list the checkout's files, so its tests are unknown."
+            ),
             graph_error=result["graph_error"],
             missing={f for f in named if not checkout.exists(f)},
             go_test_dirs=go_test_dirs,
@@ -575,9 +607,15 @@ async def select_for_change(
     checkout: Checkout,
     *,
     indexed_commit: str | None = None,
+    cancelled: Callable[[], bool] = _never,
 ) -> tuple[dict[str, Any], Selection]:
-    """:func:`plan_scopes`, :func:`collect` then :func:`select`: what *change* needs, and why."""
-    plan = plan_scopes(change, config, checkout)
+    """:func:`plan_scopes`, :func:`collect` then :func:`select`: what *change* needs, and why.
+
+    Raises :class:`SelectionCancelledError` once *cancelled* turns true.
+    """
+    # The namer search reads every source when a doc or asset changed: off the loop.
+    plan = await asyncio.to_thread(plan_scopes, change, config, checkout, cancelled)
+    _stop(cancelled)
     result = await collect(
         session,
         repo_id,
@@ -591,4 +629,51 @@ async def select_for_change(
         indexed_commit=indexed_commit,
     )
     result["diff"] = change.label
-    return result, select(change, result, config, checkout, plan)
+    _stop(cancelled)
+    return result, await asyncio.to_thread(select, change, result, config, checkout, plan)
+
+
+async def narrow_scopes(
+    session, repo_id: str, reached: Mapping[str, Sequence[str]], test_files: Collection[str]
+) -> dict[str, list[str]]:
+    """*reached* with each conftest or test package a walk stopped at replaced by its tests.
+
+    For surfaces that walk a few hops and do not select: a conftest reached
+    only through its imports stands for the tests the selection narrows it to
+    (:mod:`repowise.core.analysis.conftest_routes`, the same graph walk), and
+    any other scope for every runnable test under its directory. The walk runs
+    only for targets that reached a scope. The conftests and pytest configs
+    (nested ones included) come from :func:`read_checkout` of the indexed
+    checkout. A target the walk gives nothing for, or a checkout that cannot
+    be read, keeps every test under each scope it reached. Keys may be symbol
+    ids (``path::name``); the walk starts at their file.
+    """
+    from ..persistence.models import Repository
+    from .test_selection import expand_test_scopes, scope_kind
+
+    scoped = {t: list(v) for t, v in reached.items() if any(scope_kind(x) for x in v)}
+    out = {t: list(v) for t, v in reached.items()}
+    if not scoped:
+        return out
+    local = await session.get(Repository, repo_id)
+    texts: dict[str, str] = {}
+    if local is not None and local.local_path and Path(local.local_path).is_dir():
+        try:
+            checkout = await asyncio.to_thread(read_checkout, local.local_path)
+            texts = dict(checkout.pytest_texts)
+        except Exception as exc:  # unread conftests keep every test under them
+            log.debug("narrow_scopes_checkout_failed", error=str(exc))
+    files = sorted({t.split("::", 1)[0] for t in scoped})
+    try:
+        candidates, _, _ = await _graph_candidates(session, repo_id, files, pytest_texts=texts)
+    except Exception as exc:  # the walk's own answer stands: every test under each scope
+        log.debug("narrow_scopes_failed", error=str(exc))
+        candidates = {}
+    for target, tests in scoped.items():
+        scopes = [x for x in tests if scope_kind(x)]
+        dirs = {str(PurePosixPath(s).parent) for s in scopes}
+        picked = [t for t, _ in candidates.get(target.split("::", 1)[0], ())]
+        under = [t for t in picked if any(d == "." or t.startswith(f"{d}/") for d in dirs)]
+        kept = [x for x in tests if not scope_kind(x)]
+        out[target] = expand_test_scopes([*kept, *(under or scopes)], test_files)
+    return out
