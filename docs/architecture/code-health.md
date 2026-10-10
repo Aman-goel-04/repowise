@@ -723,9 +723,11 @@ carries one `actionability` state (`plan_ready`, `advisory`, `investigate`,
 startup, shutdown or crash recovery (`perf/cold_paths.py`) is `expected` with reason
 `cold_path`, with or without a strategy; `gated_off` takes precedence. The identity
 kernel's `execution_context` stays path-only.
-The default queue holds production `plan_ready` and `advisory`, ranked
-by `rank_score`; actionability only breaks ties. Excluded reasons are counted in
-`default_queue`.
+The default queue holds production `plan_ready` and `advisory` with
+`cost_proof = proven`, ranked by `rank_score`; actionability only breaks ties.
+Excluded reasons are counted in `default_queue`. A cause whose loop size nothing
+measured is stored as `cost_proof = unproven`: it never leads, and the `proof`
+filter and facet expose it.
 
 **Plans.** Proven means the transformation, not the runtime: parallelizing awaits
 against a DB or network client is advisory with a `bounded_concurrency`

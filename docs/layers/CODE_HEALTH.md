@@ -256,8 +256,10 @@ repetition is real and nothing should change, such as deleting N files; reason
 `gated_off` when a constant flag switches the function off, `cold_path` when it is
 named for a migration, startup, shutdown or crash recovery and so runs once per
 deploy, boot or incident). The default queue holds production `plan_ready` and
-`advisory` opportunities, ranked by cost first; state only breaks ties. Everything
-left out is counted by reason.
+`advisory` opportunities whose cost is measured, ranked by cost first; state only
+breaks ties. Everything left out is counted by reason. A loop whose size nothing
+measured never leads and stays out of the list unless you ask for it with the
+`proof=unproven` filter.
 
 Performance analysis covers Python, TypeScript/JavaScript (including Vue and Svelte
 scripts), Java, Go, C# (including Razor), Rust, Kotlin, Scala, Ruby, C++, Dart and
