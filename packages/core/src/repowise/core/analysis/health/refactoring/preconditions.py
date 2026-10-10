@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ..refactoring_summary import groups_named, needs_design
 from .models import RefactoringSuggestion
 from .recommendations import affected_files, blast_size
 
@@ -38,7 +39,7 @@ JUDGMENT_REASONS = (
     "changes_symbol_home",
     "detector_confidence_below_high",
     "inverts_imports_across_files",
-    "no_named_target",
+    "needs_design",
     "reshapes_class_surface",
     "rewrites_dependent_imports",
     "unclassified_refactoring_type",
@@ -75,19 +76,6 @@ def _int_or_none(value: Any) -> int | None:
     return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
-def _named_groups(plan: dict[str, Any]) -> bool | None:
-    """Whether every proposed group names the file it lands in.
-
-    ``None`` when the plan proposes no groups at all: absence of groups is not
-    evidence that the naming succeeded, and R1 made an unnameable group emit
-    ``null`` rather than invent a filename.
-    """
-    groups = [group for group in (plan.get("groups") or []) if isinstance(group, dict)]
-    if not groups:
-        return None
-    return all(group.get("suggested_file") for group in groups)
-
-
 # Which facts each refactoring type can even have. A key absent here is not
 # unknown, it is meaningless: asking whether an Extract Method needs a
 # re-export shim has no answer, and reporting one as ``None`` would read as a
@@ -97,7 +85,7 @@ _BASE_FACT_KEYS = ("affected_file_count", "cross_file", "blast_size", "confidenc
 _TYPE_FACT_KEYS: dict[str, tuple[str, ...]] = {
     "extract_method": ("local_scope",),
     "split_file": ("shim_required", "groups_named", "dependents", "framework_registration"),
-    "extract_class": ("dependents", "framework_registration"),
+    "extract_class": ("groups_named", "dependents", "framework_registration"),
     "move_method": ("callers", "framework_registration"),
     "break_cycle": ("framework_registration",),
     "extract_helper": ("co_change_count",),
@@ -126,7 +114,7 @@ def step_facts(suggestion: RefactoringSuggestion) -> tuple[dict[str, Any], tuple
         "callers": _int_or_none(blast.get("callers")),
         "co_change_count": _int_or_none(evidence.get("co_change_count")),
         "shim_required": plan.get("shim_required") if "shim_required" in plan else None,
-        "groups_named": _named_groups(plan),
+        "groups_named": groups_named(plan),
         # No graph is in scope here, so whether a framework registers the symbols
         # a step moves is never known. It is reported rather than omitted because
         # it is the fact that keeps every symbol-moving step a judgment call.
@@ -175,8 +163,6 @@ def _split_file_reasons(_suggestion: RefactoringSuggestion, facts: dict[str, Any
     """
     if facts["shim_required"] is not False:
         return ["rewrites_dependent_imports", "changes_symbol_home"]
-    if facts["groups_named"] is not True:
-        return ["no_named_target"]
     return ["build_constraints_unknown"]
 
 
@@ -200,6 +186,8 @@ def classify_step(suggestion: RefactoringSuggestion) -> StepApplicability:
         reasons = _split_file_reasons(suggestion, facts)
     else:
         reasons = list(_JUDGMENT_BY_TYPE.get(kind, ("unclassified_refactoring_type",)))
+    if needs_design(suggestion):
+        reasons.insert(0, "needs_design")
     # ``all`` over nothing is True, so a future branch that returned no reason
     # would promote silently. Mechanical has to be positively argued.
     mechanical = bool(reasons) and all(reason in MECHANICAL_REASONS for reason in reasons)
@@ -217,5 +205,6 @@ __all__ = [
     "Applicability",
     "StepApplicability",
     "classify_step",
+    "needs_design",
     "step_facts",
 ]

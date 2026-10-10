@@ -100,7 +100,10 @@ a file whose only plan is a cycle). The plan list's `structural_total` leaves
 Break Cycle out, matching the opportunities; `by_type` still counts it.
 
 Names are never invented. A suggested helper or file name is `null` when nothing
-in the code anchors one.
+in the code anchors one. A Split File or Extract Class plan with an unnamed group
+is held as `needs_design`, like a cycle: it is not a step and never reaches Fix
+first. Code only moves within a language family, so Java, Kotlin and Scala are
+separate. A callback is named after the call it is passed to.
 
 An empty list means no detector found work that clears its gates. It does not mean
 the code needs no attention: check the findings in
