@@ -28,6 +28,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     false,
+    func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -2336,8 +2337,9 @@ class CoverageIngest(Base):
 class ActionState(Base):
     """A person's answer to one next action: dismissed, snoozed, or done.
 
-    Actions themselves are computed on read (``analysis.actions``), so this is
-    the only stored half. ``action_id`` is stable across re-index because it is
+    Actions themselves are derived from the other stores (``analysis.actions``,
+    cached in :class:`ReadSnapshot`), so this is the only half a person writes.
+    ``action_id`` is stable across re-index because it is
     derived from the rule and its target. ``fingerprint`` is the one the action
     carried when the person acted; a dismissal holds only while it still
     matches, so an action whose facts changed materially comes back.
@@ -2359,6 +2361,35 @@ class ActionState(Base):
 
     __table_args__ = (
         UniqueConstraint("repository_id", "action_id", name="uq_action_states"),
+    )
+
+
+class ReadSnapshot(Base):
+    """A read view built at index or update time, served while its key holds.
+
+    ``kind`` names the view (the Fix first queue, the next-actions view) and
+    ``key`` the code that built it (repowise and model versions). Any write
+    to a store a view reads deletes the rows in the same transaction
+    (``persistence.read_snapshots``), so a row that exists is current and a
+    missing one is built live. Derived data: losing a row costs one build.
+    """
+
+    __tablename__ = "read_snapshots"
+
+    repository_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("repositories.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    kind: Mapped[str] = mapped_column(String(32), primary_key=True)
+    key: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_now_utc,
+        onupdate=_now_utc,
+        server_default=func.now(),
     )
 
 

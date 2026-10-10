@@ -16,21 +16,29 @@ time, as refactoring and performance already are, and rank them in SQL.
 
 The built queue is cached in process, keyed by the repository and the
 newest write to each store it reads, so repeated calls between updates cost
-one aggregate read.
+one aggregate read. Index and update also store the production queue
+(:func:`write_fix_first_snapshot`), kept only until a store it reads is
+written (``persistence.read_snapshots``), so the first call of a new process
+reads one row instead of building.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict, namedtuple
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Any
 
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.analysis.finding_registry import excluded_types
-from repowise.core.analysis.health.fix_first import DEFAULT_LIMIT, FixFirstQueue, build_fix_first
+from repowise.core.analysis.health.fix_first import (
+    DEFAULT_LIMIT,
+    FIX_FIRST_MODEL_VERSION,
+    FixFirstQueue,
+    build_fix_first,
+)
 from repowise.core.analysis.health.fix_first.build import (
     DEAD_CONFIDENCE,
     MIN_WORTH,
@@ -61,6 +69,7 @@ from ...models import (
     RefactoringOpportunity,
     RefactoringSuggestion,
 )
+from ...read_snapshots import decode_or_none, read_snapshot, refresh_snapshot, snapshot_key
 from ...sql import json_text
 
 #: Files read for plan-less finding items, by open code-shape deduction.
@@ -517,6 +526,35 @@ async def _stamp(session: AsyncSession, repo_id: str) -> tuple[Any, ...]:
     return tuple(stamps)
 
 
+#: The stored production queue's ``read_snapshots.kind``.
+SNAPSHOT_KIND = "fix_first"
+_KEY = snapshot_key(SNAPSHOT_KIND, FIX_FIRST_MODEL_VERSION)
+
+
+async def write_fix_first_snapshot(session: AsyncSession, repository_id: str) -> bool:
+    """Store the whole production queue, tests resolved, for the next reader.
+
+    The whole queue rather than its head: an id lookup, a page past the
+    first, the counts and the refactoring list's exclusion reasons are all
+    read from it. The writer of the stores calls this once they are final.
+    Returns whether it wrote (a row still current writes nothing).
+    """
+
+    async def build() -> dict[str, Any]:
+        full = await _build(session, repository_id, limit=None, scope="production", item_id=None)
+        return asdict(full)
+
+    return await refresh_snapshot(session, repository_id, SNAPSHOT_KIND, _KEY, build)
+
+
+async def _stored(session: AsyncSession, repo_id: str, scope: str) -> FixFirstQueue | None:
+    """The stored production queue, when one is current and fits the model."""
+    if scope != "production":
+        return None
+    payload = await read_snapshot(session, repo_id, SNAPSHOT_KIND, _KEY)
+    return decode_or_none(FixFirstQueue, payload) if payload is not None else None
+
+
 def clear_fix_first_cache() -> None:
     _cache.clear()
 
@@ -538,7 +576,8 @@ async def load_fix_first(
 
     The full queue is built once per store write and every ``limit`` and id
     is a slice of it: the reads are the same whatever is kept, and writing
-    every item costs little next to them.
+    every item costs little next to them. The production queue comes from the
+    stored snapshot while it is current.
     """
     base = (
         str(session.bind.url) if session.bind is not None else None,
@@ -553,10 +592,15 @@ async def load_fix_first(
     # A verified queue answers an unverified ask too; never the reverse.
     full = _cached((*base, True, None, None)) or _cached((*base, verify, None, None))
     if full is None:
-        full = await _build(
-            session, repository_id, limit=None, scope=scope, item_id=None, verify=verify
-        )
-        _remember((*base, verify, None, None), full)
+        # The stored queue is verified, so it answers either ask.
+        full = await _stored(session, repository_id, scope)
+        if full is not None:
+            _remember((*base, True, None, None), full)
+        else:
+            full = await _build(
+                session, repository_id, limit=None, scope=scope, item_id=None, verify=verify
+            )
+            _remember((*base, verify, None, None), full)
     queue = full if key[-2:] == (None, None) else queue_view(full, limit=limit, item_id=item_id)
     _remember(key, queue)
     return queue
@@ -628,4 +672,12 @@ async def _build(
     )
 
 
-__all__ = ["CACHE_SIZE", "FINDING_FILES", "clear_fix_first_cache", "load_fix_first", "queue_view"]
+__all__ = [
+    "CACHE_SIZE",
+    "FINDING_FILES",
+    "SNAPSHOT_KIND",
+    "clear_fix_first_cache",
+    "load_fix_first",
+    "queue_view",
+    "write_fix_first_snapshot",
+]
