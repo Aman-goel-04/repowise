@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from repowise.core.analysis.communities import NO_COMMUNITY, stored_community_id
+from repowise.core.analysis.communities import NO_COMMUNITY, has_community, stored_community_id
 from repowise.core.persistence.crud.graph import (
     batch_upsert_graph_edges,
     batch_upsert_graph_nodes,
@@ -30,6 +30,13 @@ def test_stored_community_id():
 
 def _node(node_id: str, community_id: int) -> dict:
     return {"node_id": node_id, "node_type": "file", "community_id": community_id}
+
+
+def test_has_community():
+    assert has_community(0)
+    assert has_community(7)
+    assert not has_community(None)
+    assert not has_community(NO_COMMUNITY)
 
 
 @pytest.mark.asyncio

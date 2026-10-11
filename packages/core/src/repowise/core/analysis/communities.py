@@ -49,6 +49,16 @@ def stored_community_id(assignment: dict[str, int], node_id: str) -> int:
     return NO_COMMUNITY if is_external(node_id) else 0
 
 
+def has_community(community_id: int | None) -> bool:
+    """True when *community_id* names a real community.
+
+    ``None`` (never assigned) and ``NO_COMMUNITY`` (external code, left out of
+    the partition) both mean no community, so readers must not treat them as a
+    cluster.
+    """
+    return community_id is not None and community_id >= 0
+
+
 # Edge types to include when building file-level community subgraph.
 # Was {imports, framework, dynamic, extends, implements}: "dynamic" matched no
 # real edge, and extends/implements are symbol-to-symbol so they never joined
