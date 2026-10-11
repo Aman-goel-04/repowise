@@ -209,7 +209,7 @@ def keyless_upgrade_note(semantic_available: bool, reindex_command: str | None =
     )
     if semantic_available:
         return f"{prose}."
-    command = reindex_command or "repowise reindex --embedder ..."
+    command = reindex_command or "repowise reindex"
     return f"{prose}; {command} adds semantic search."
 
 

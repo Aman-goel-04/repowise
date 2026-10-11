@@ -607,7 +607,8 @@ class TestInitClosingKeylessNote:
         out = self._output(monkeypatch, setup=setup, pages=[_page("file_page:a")])
         assert "repowise generate writes the subsystem pages" in out
         assert "--provider ollama" in out
-        assert "repowise reindex --embedder ..." in out
+        assert "repowise reindex adds semantic search" in out
+        assert "--embedder ..." not in out
 
     def test_note_drops_the_search_half_when_semantic_search_is_available(self, monkeypatch):
         state = {

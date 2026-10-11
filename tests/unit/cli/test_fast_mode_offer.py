@@ -202,7 +202,8 @@ def test_keyless_upgrade_note_names_both_commands_by_default():
     note = keyless_upgrade_note(semantic_available=False)
     assert "repowise generate" in note
     assert "--provider ollama" in note
-    assert "repowise reindex --embedder ..." in note
+    assert "repowise reindex" in note
+    assert "..." not in note  # a user must be able to copy-paste it
 
 
 def test_keyless_upgrade_note_omits_search_half_when_already_available():
@@ -213,11 +214,13 @@ def test_keyless_upgrade_note_omits_search_half_when_already_available():
 
 
 def test_keyless_upgrade_note_uses_the_scope_s_own_next_command():
-    note = keyless_upgrade_note(semantic_available=False, reindex_command="repowise reindex")
-    assert "repowise reindex" in note
-    assert "--embedder ..." not in note
+    note = keyless_upgrade_note(
+        semantic_available=False, reindex_command="repowise reindex --embedder ollama"
+    )
+    assert "repowise reindex --embedder ollama" in note
 
 
 def test_keyless_upgrade_note_falls_back_without_a_next_command():
     note = keyless_upgrade_note(semantic_available=False, reindex_command=None)
-    assert "repowise reindex --embedder ..." in note
+    assert "repowise reindex" in note
+    assert "..." not in note
