@@ -35,6 +35,7 @@ Routine responses carry a lean envelope. `get_overview`, called once per session
 | `embedder_degraded` | When an embedder is resolved | `true` or `false` |
 | `embedder`, `embedder_warning` | Only when the embedder fell back to a mock or degraded mode, or the semantic index on disk could not be opened | Which embedder, and why |
 | `newer_release` | Once per server process | A newer repowise is published; restart the MCP server after upgrading |
+| `keyless_note` | Once per server process, on the first `get_answer` reply that degrades with `no-llm-provider` | Names what a model would add: `repowise generate` writes synthesized answers with a model (needs a key, or `--provider ollama` for a local model). Not repeated on later replies, and never sent when a provider is configured |
 | `response_budget` | When the budget cut something or could not fit the protected fields (`enforcement_error`); always on `get_overview` | `limit_chars` (the ceiling), `tier` (`default` or `expanded`), `serialized_chars` (size delivered) |
 | `omitted` | When content was cut | `refs`, `tokens`, `restore`. See [Truncation and recovery](#truncation-and-recovery) |
 | `recovery_unavailable` | When the omission store could not be written | Names the storage failure; the cut rows cannot be restored |
