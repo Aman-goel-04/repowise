@@ -66,7 +66,7 @@ def _render_refactoring_targets(
 
         ranked_plans = serialize_recommendations(build_recommendations(suggestions))[:limit]
     else:
-        ranked_plans = [_suggestion_to_dict(s) for s in suggestions][:limit]
+        ranked_plans = [_list_row(_suggestion_to_dict(s)) for s in suggestions][:limit]
 
     # The composed unit. One opportunity per file, ranked, with its plans as
     # ordered steps - the same vocabulary the board, the drawer and the agent
@@ -155,6 +155,7 @@ def _render_stored_refactoring_targets(
                 "summary": summary,
                 "total": page.total,
                 "hidden": page.hidden,
+                "counts": page.counts,
                 "details": details,
                 "metrics": metrics,
                 "findings": findings,
@@ -171,11 +172,14 @@ def _render_stored_refactoring_targets(
     analyzed_commit = stored["summary"].get("analyzed_commit")
     if fmt == "table":
         commit = f" at {analyzed_commit[:7]}" if analyzed_commit else ""
-        hidden = (stored["hidden"] or {}).get("total") or 0
+        counts = stored["counts"]
+        # Each number names its level, so "of N" never mixes the eligible
+        # queue with the inventory.
         scope = (
-            f"{stored['total']} worth doing ({hidden} more in the full inventory)"
+            f"{stored['total']:,} eligible plans ({counts['inventory']:,} open, "
+            f"{counts['due']:,} due now or next)"
             if stored["hidden"] is not None
-            else f"{stored['total']} open opportunities"
+            else f"{stored['total']:,} open plans ({counts['eligible']:,} eligible)"
         )
         console.print(
             f"[dim]Read from the index{commit}. Showing {len(rows)} of {scope}. "
@@ -193,13 +197,50 @@ def _render_stored_refactoring_targets(
             "source": "index",
             "analyzed_commit": analyzed_commit,
             "opportunities_total": stored["total"],
+            # Restated by ``counts.excluded``; kept for scripts, remove next major.
             "opportunities_hidden": stored["hidden"],
+            "counts": stored["counts"],
             "targets": targets,
             "refactoring_opportunities": rows,
-            "refactoring_plans": plans,
+            "refactoring_plans": [_list_row(plan) for plan in plans],
         },
     )
     return True
+
+
+def _render_plan_recipe(repo_path: Path, plan_id: str, *, fmt: str) -> bool:
+    """One stored plan: its recipe as JSON, else the prompt an agent starts
+    from. False when no index or no plan answers *plan_id*."""
+    from repowise.cli.helpers import repo_index_session, run_async
+    from repowise.core.agent_prompts import render_plan
+    from repowise.core.analysis.health.refactoring.recipe import build_recipe
+    from repowise.server.services.refactoring_health import RefactoringHealthService
+
+    async def _read() -> dict[str, Any] | None:
+        async with repo_index_session(Path(repo_path)) as opened:
+            if opened is None:
+                return None
+            session, repo_id = opened
+            service = RefactoringHealthService(session, repo_id, Path(repo_path).name)
+            return (await service.plan_detail(plan_id)).get("plan")
+
+    plan = run_async(_read())
+    if plan is None:
+        return False
+    if fmt == "json":
+        click.echo(json.dumps(build_recipe(plan), indent=2))
+    else:
+        click.echo(render_plan(plan, repo_name=Path(repo_path).name))
+    return True
+
+
+def _list_row(plan: dict) -> dict:
+    """A plan as a list row: the rendered Extract Method texts stay on plan
+    detail, as on every other list."""
+    from repowise.core.analysis.health.refactoring.render import list_plan
+
+    body = plan.get("plan")
+    return {**plan, "plan": list_plan(body)} if isinstance(body, dict) else plan
 
 
 def _rankable(findings: list, metrics: list) -> list:

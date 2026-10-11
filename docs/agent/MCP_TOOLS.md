@@ -322,12 +322,12 @@ Code-health scores and findings from the stored analysis, across defect risk, ma
 | Parameter | Type | Default | Meaning |
 |-----------|------|---------|---------|
 | `targets` | list[string] | none (dashboard) | File paths or `module:<name>`. Misses are named in `unresolved` |
-| `include` | list[string] | none | Blocks: `biomarkers`, `refactoring`, `trend`, `coverage`, `accuracy`, `signals`, `churn_complexity`, `doc_drift`, `semantics`, `unverified`. Dimension filters: `performance`, `defect`, `maintainability`, `advisory` |
+| `include` | list[string] | none | Blocks: `biomarkers`, `refactoring`, `trend`, `coverage`, `accuracy`, `signals`, `churn_complexity`, `doc_drift`, `semantics`, `unverified`, `recipe` (with `plan_id`). Dimension filters: `performance`, `defect`, `maintainability`, `advisory` |
 | `only` | list[string] | none | Keep just these top-level keys; identity, totals and recovery fields always survive. An unknown key is named in `unknown_only_keys` with `unknown_only_keys_hint` |
 | `limit` | int | `20` | Max rows in every ranked list, capped at 50; `0` for none. `fix_first` shows five unless `limit` is passed with `only=["fix_first"]`, which pages up to 25; `refactoring_plans` up to 25 |
 | `cursor` | int | `0` | Offset into a ranked list (and into `fix_first` when named in `only`); the `recovery` block names the next call |
 | `fix_id` | string | none | Open one `fix_first` item in full |
-| `finding_id`, `plan_id` | string | none | Open one finding or refactoring plan by id |
+| `finding_id`, `plan_id` | string | none | Open one finding or refactoring plan by id. With `plan_id`, `include=["recipe"]` adds `plan.recipe`: the plan's preconditions, ordered steps, postconditions and what it must not do |
 | `opportunity_id` | string | none | Open one opportunity: `perf...` for performance, `refop...` for a refactoring |
 | `refactoring_view` | string | `"diversified"` | `diversified`, `canonical` or `file_spread` |
 | `refactoring_scope` | string | `fix_first` without targets, `all` with | Which open refactoring opportunities, and their plans, to list |
@@ -341,7 +341,7 @@ Code-health scores and findings from the stored analysis, across defect risk, ma
 
 Only one of `fix_id`, `finding_id`, `plan_id`, `opportunity_id` per call; passing two returns `mode: "conflict"`.
 
-**Key return fields:** `mode`, `fix_first` (`lead` with its `next_call`, up to five `items`, `counts`, `totals`), `kpis`, `gap_analysis`, `worst_files`, `high_leverage_files` (ranked by `weighted_deficit`), `top_findings`, `unresolved`, and the opt-in blocks you named. `_meta.health_analysis` says whether stored analysis exists and which commit it describes.
+**Key return fields:** `mode`, `fix_first` (`lead` with its `next_call`, up to five `items`, `counts`, `totals`; a due lead carries its `first_step` and `verify` command, so it can be started without a `fix_id` call; `only=["fix_first"]` adds them to the other due items on the page), `kpis`, `gap_analysis`, `worst_files`, `high_leverage_files` (ranked by `weighted_deficit`), `top_findings`, `unresolved`, and the opt-in blocks you named. `_meta.health_analysis` says whether stored analysis exists and which commit it describes.
 
 The response is bounded. Pair `include` with `only` to keep one block, e.g. `get_health(include=["refactoring"], only=["refactoring_opportunities"])`.
 
@@ -437,7 +437,7 @@ get_execution_flows(entry_point="src/cli/main.py::main", max_depth=4)
 
 Turns one refactoring plan from `get_health(include=["refactoring"])` into generated code and a unified diff, grounded on the plan and the source spans it names. Extract Class results include an LCOM4 before-and-after check. It calls the repo's configured LLM provider, and caches by content hash so an unchanged plan never regenerates.
 
-Adding the tool to the surface is the opt-in step. Generation then runs unless `.repowise/config.yaml` sets `refactoring.llm.enabled: false`, in which case the plan is returned with `generation.available: false` and `reason: "disabled"`. With no provider configured it returns `error: "no_provider"`.
+Adding the tool to the surface is the opt-in step. Generation then runs only when `.repowise/config.yaml` sets `refactoring.llm.enabled: true` (off by default); otherwise the plan is returned with `generation.available: false` and `reason: "disabled"`. With no provider configured it returns `error: "no_provider"`.
 
 | Parameter | Type | Default | Meaning |
 |-----------|------|---------|---------|

@@ -8,6 +8,7 @@ projection gates the work as well as the payload.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -18,6 +19,7 @@ from repowise.core.analysis.health.churn_complexity import churn_complexity_poin
 from repowise.core.analysis.health.fix_first import FixFirstQueue
 from repowise.core.analysis.health.grading import TARGET_SCORE
 from repowise.core.analysis.health.perf.coverage import PerfCoverage, coverage_for_metrics
+from repowise.core.analysis.health.queue.eligibility import path_verdict
 from repowise.core.analysis.health.ranking import deduction_by_path, sort_metrics_worst_first
 from repowise.core.analysis.health.refactoring.serving import parse_query as parse_refactoring_query
 from repowise.core.analysis.health.signals import file_signals
@@ -37,6 +39,7 @@ from repowise.core.persistence.crud import (
     load_coverage_history,
 )
 from repowise.core.persistence.crud.analysis.fix_first import load_fix_first, queue_view
+from repowise.core.persistence.crud.analysis.queue_counts import unit_counts
 from repowise.core.persistence.models import HealthFileMetric
 from repowise.server.mcp_server._helpers import filter_rows_by_attr
 from repowise.server.mcp_server.tool_health.findings import (
@@ -94,9 +97,13 @@ class HealthData:
     fix_first: FixFirstQueue | None = None
     #: The whole queue the page was cut from: its lead and its counts.
     fix_first_full: FixFirstQueue | None = None
+    #: The findings' count vocabulary, read only when ``top_findings`` is named.
+    finding_counts: dict[str, Any] | None = None
     # Dashboard only: the worst-first test files, ranked apart from
     # ``metric_rows`` so a test never heads the production worklist.
     test_metric_rows: list[HealthFileMetric] = field(default_factory=list)
+    #: Dashboard only: files in neither list, by the scope reason that left them out.
+    worst_files_hidden: dict[str, int] = field(default_factory=dict)
 
 
 async def load_health_data(
@@ -118,12 +125,13 @@ async def load_health_data(
     # input order, so every block must see the same order as ``worst_files``.
     pop.all_metrics = sort_metrics_worst_first(pop.all_metrics, deductions)
     targets = set(pop.effective_targets)
-    # Targeted mode keeps what was named. The dashboard's ranked lists are
-    # production files; tests get their own list.
+    # Targeted mode keeps what was named. The dashboard's ranked lists hold the
+    # files Fix first and refactoring keep in scope; tests get their own list.
+    reasons = {} if pop.scoped else _scope_reasons(pop.all_metrics)
     metric_rows = (
         [m for m in pop.all_metrics if m.file_path in targets]
         if pop.scoped
-        else [m for m in pop.all_metrics if not _is_test(m, test_paths)]
+        else [m for m in pop.all_metrics if reasons[m.file_path] is None]
     )
     data = HealthData(
         repository=repository,
@@ -138,7 +146,10 @@ async def load_health_data(
         by_leverage=[],
         leads={},
         test_metric_rows=(
-            [] if pop.scoped else [m for m in pop.all_metrics if _is_test(m, test_paths)]
+            [] if pop.scoped else [m for m in pop.all_metrics if reasons[m.file_path] == "test"]
+        ),
+        worst_files_hidden=dict(
+            Counter(r for r in reasons.values() if r is not None and r != "test")
         ),
     )
     data.hotspot_paths = await _read_hotspot_paths(session, repository, pop, req)
@@ -165,12 +176,23 @@ async def load_health_data(
         pop, metric_rows, findings, req, data.test_metric_rows
     )
     data.fix_first, data.fix_first_full = await _read_fix_first(session, repository, pop, req)
+    if "top_findings" in req.only_set and not pop.nothing_resolved:
+        counts = await unit_counts(session, repository.id, "findings", file_paths=pop.target_paths)
+        data.finding_counts = counts.as_dict()
     return data
 
 
-def _is_test(m: HealthFileMetric, test_paths: set[str]) -> bool:
-    """Test material by the metric's own flag or the graph's, whichever is read."""
-    return bool(m.is_test) or m.file_path in test_paths
+def _scope_reasons(metrics: list[HealthFileMetric]) -> dict[str, str | None]:
+    """Each file's scope exclusion (``test``, ``tooling``, ``generated``...), ``None``
+    in scope: Fix first's rule on Fix first's inputs, the row's flag and origin.
+
+    Ceiling: recomputed per process (about 0.3 s cold on 5k files, 1.2 s on 18k; 0.02 s
+    warm). Upgrade path: persist the verdict per file when the health pass finalizes.
+    """
+    return {
+        m.file_path: path_verdict(m.file_path, m.is_test, origin=m.code_origin).reason
+        for m in metrics
+    }
 
 
 async def _read_test_paths(

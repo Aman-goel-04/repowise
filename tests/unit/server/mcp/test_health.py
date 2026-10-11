@@ -221,7 +221,7 @@ async def _seed_plans(session, rid, plans):
                 "target_symbol": p.get("target_symbol", "authenticate"),
                 "line_start": 10,
                 "line_end": 80,
-                "plan": {"groups": []},
+                "plan": p.get("plan", {"groups": []}),
                 "evidence": {},
                 "impact_delta": p["impact_delta"],
                 "effort_bucket": "S",
@@ -1041,6 +1041,7 @@ async def test_include_names_work_as_only_aliases(setup_mcp, health_data, alias,
             "refactoring_plans_status",
             "refactoring_plans_scope",
             "refactoring_plans_hidden",
+            "refactoring_plans_counts",
             "refactoring_plans_opportunities_total",
         }
     assert set(result) - {"mode", "targets", "_meta"} <= allowed
@@ -1527,6 +1528,75 @@ async def test_refactoring_plans_follow_the_queue_in_queue_order(setup_mcp, heal
 
 
 @pytest.mark.asyncio
+async def test_a_split_stands_for_the_plans_it_relocates(setup_mcp, health_data, session):
+    """The plans after a split work on code it moves: the split's row lists
+    them as ``relocates`` and they take no rows, so one file cannot fill the
+    list. Offsets and the total still count every plan."""
+    from repowise.server.mcp_server import get_health
+
+    await _seed_plans(
+        session,
+        health_data,
+        [
+            {
+                "refactoring_type": "split_file",
+                "file_path": "src/auth/service.py",
+                "target_symbol": "service.py",
+                "plan": {
+                    "groups": [
+                        {"suggested_file": "src/auth/tokens.py", "symbols": ["moved_0"]},
+                        {"suggested_file": "src/auth/login.py", "symbols": ["moved_1"]},
+                    ]
+                },
+                "source_biomarker": "large_file",
+                "impact_delta": 9.0,
+            }
+        ]
+        + [
+            {
+                "file_path": "src/auth/service.py",
+                "target_symbol": f"moved_{i}",
+                "source_biomarker": "complex_method",
+                "impact_delta": 5.0,
+            }
+            for i in range(3)
+        ]
+        + [
+            {
+                "file_path": "src/utils/helpers.py",
+                "target_symbol": f"other_{i}",
+                "source_biomarker": "complex_method",
+                "impact_delta": 0.1,
+            }
+            for i in range(2)
+        ],
+    )
+    asked = {"include": ["refactoring"], "only": ["refactoring_plans"], "refactoring_scope": "all"}
+    first = await get_health(**asked, limit=2)
+    rows = first["refactoring_plans"]
+    assert [r["refactoring_type"] for r in rows] == ["split_file", "extract_method"]
+    assert len(rows[0]["relocates"]) == 3
+    assert rows[1]["file_path"] == "src/utils/helpers.py"
+    assert first["refactoring_plans_total"] == 6
+    # The page covered the split, the three it stands for and one more plan.
+    assert first["recovery"]["refactoring_plans"]["call"].endswith("cursor=5)")
+    rest = (await get_health(**asked, limit=10, cursor=5))["refactoring_plans"]
+    assert [r["target_symbol"] for r in rest] == ["other_1"]
+    detail = await get_health(plan_id=rows[0]["relocates"][0])
+    assert detail["plan"]["target_symbol"].startswith("moved_")
+    # The REST plan list ranks plans one by one and folds nothing.
+    from repowise.server.services.refactoring_health import (
+        PlanListQuery,
+        RefactoringHealthService,
+    )
+
+    ranked = await RefactoringHealthService(session, health_data, "default").ranked_plans(
+        PlanListQuery()
+    )
+    assert {p["target_symbol"] for p in ranked["plans"]} >= {f"moved_{i}" for i in range(3)}
+
+
+@pytest.mark.asyncio
 async def test_refactoring_plans_honour_scope(setup_mcp, health_data, session):
     """``refactoring_scope="all"`` lists the inventory; the default lists what
     Fix first takes and counts the rest by reason, as the queue does."""
@@ -1603,6 +1673,54 @@ async def test_fix_first_named_page_honours_limit_and_cursor(setup_mcp, health_d
 
 
 @pytest.mark.asyncio
+async def test_due_items_carry_their_first_step_once_and_only_in_the_head(
+    setup_mcp, health_data, monkeypatch
+):
+    """The dashboard inlines a due lead's first step and verify on ``lead``
+    only; a named page inlines them on its first five other due items and
+    leaves the rest to ``fix_id``."""
+    from dataclasses import replace
+
+    from repowise.core.analysis.health.fix_first.model import FixStep
+    from repowise.server.mcp_server import get_health
+    from repowise.server.mcp_server.tool_health import loading
+
+    real = loading.load_fix_first
+
+    async def due(session, repository_id, **kwargs):
+        queue = await real(session, repository_id, **kwargs)
+        head = queue.items[0]
+        step = FixStep(1, "Extract lines 5-9 of run into _load(path)", "src/other.py", 5)
+        items = tuple(
+            replace(
+                head,
+                id=f"fix1_{index:020d}",
+                rank=index,
+                tier="next",
+                action=replace(head.action, steps=(step,)),
+                verify=replace(head.verify, command="pytest tests/test_run.py"),
+            )
+            for index in range(8)
+        )
+        return replace(queue, items=items, totals=replace(queue.totals, eligible=8, shown=8))
+
+    monkeypatch.setattr(loading, "load_fix_first", due)
+
+    block = (await get_health())["fix_first"]
+    assert block["lead"]["first_step"] == {
+        "action": "Extract lines 5-9 of run into _load(path)",
+        "line": 5,
+        "file": "src/other.py",
+    }
+    assert block["lead"]["verify"] == {"command": "pytest tests/test_run.py"}
+    assert not any({"first_step", "verify"} & set(item) for item in block["items"])
+    default = (await get_health(only=["fix_first"]))["fix_first"]["items"]
+    assert [("verify" in item) for item in default] == [False, *[True] * 4]
+    page = (await get_health(only=["fix_first"], limit=25))["fix_first"]["items"]
+    assert [("first_step" in item) for item in page] == [False, *[True] * 4, *[False] * 3]
+
+
+@pytest.mark.asyncio
 async def test_fix_first_page_grows_only_when_limit_is_passed(
     setup_mcp, health_data, monkeypatch
 ):
@@ -1667,7 +1785,7 @@ def test_fix_first_counts_split_scope_from_worth():
     excluded = dict.fromkeys(("test", "tooling", "below_min_worth", "vendored"), 0)
     excluded.update(test=4, tooling=1, below_min_worth=3)
     queue = FixFirstQueue(totals=FixTotals(candidates=10, eligible=2, shown=2, excluded=excluded))
-    assert queue.counts(shown=1) == {
+    assert queue.counts(shown=1).as_dict() == {
         "inventory": 10,
         "in_scope": 5,
         "eligible": 2,

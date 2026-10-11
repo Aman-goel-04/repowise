@@ -18,6 +18,7 @@ import type {
   RefactoringOpportunityPage,
   RefactoringOpportunityRollup,
 } from "@repowise-dev/types/refactoring";
+import type { QueueCounts } from "@repowise-dev/types/queue";
 
 /** The page's facet counts, by facet then value. */
 export type RefactoringFacets = RefactoringOpportunityPage["facets"];
@@ -25,6 +26,10 @@ export type RefactoringFacets = RefactoringOpportunityPage["facets"];
 export interface RefactoringLedeProps {
   /** The repository rollup. Absent or unavailable and the lede does not render. */
   summary?: RefactoringOpportunityRollup | null | undefined;
+  /** The plans' count vocabulary; names how many of the open ones are worth doing now. */
+  counts?: QueueCounts | null | undefined;
+  /** Files indexed, for the all-clear line. */
+  indexedFileCount?: number | undefined;
   /** The page's facet counts. Absent and the chips do not render. */
   facets?: RefactoringFacets | null | undefined;
   /** Whether the list is narrowed to small effort, which the Quick wins chip toggles. */
@@ -47,6 +52,8 @@ function plural(n: number, one: string, many: string): string {
 
 export function RefactoringLede({
   summary,
+  counts,
+  indexedFileCount,
   facets,
   quickWinsActive = false,
   onToggleQuickWins,
@@ -58,6 +65,26 @@ export function RefactoringLede({
 
   const total = summary.opportunities_total;
   const files = summary.files_total;
+  if (total === 0) {
+    return (
+      <PageLede
+        label="Open opportunities"
+        value="0"
+        unit={
+          indexedFileCount ? `across ${formatNumber(indexedFileCount)} indexed files` : undefined
+        }
+        layout="beside"
+        action={action}
+      >
+        <p>
+          <span className="font-medium text-[var(--color-text-primary)]">
+            Nothing is worth splitting, cutting or extracting right now.
+          </span>{" "}
+          New opportunities appear here as files grow or cycles form.
+        </p>
+      </PageLede>
+    );
+  }
   const steps = summary.steps_total;
   const mechanical = summary.mechanical_steps_total;
   const judgment = summary.judgment_steps_total;
@@ -74,7 +101,12 @@ export function RefactoringLede({
     <PageLede
       label="Open opportunities"
       value={formatNumber(total)}
-      unit={files ? `one per file, across ${plural(files, "file", "files")}` : undefined}
+      unit={
+        files
+          ? `one per file, across ${plural(files, "file", "files")}` +
+            (counts ? `; ${formatNumber(counts.eligible)} worth doing first` : "")
+          : undefined
+      }
       action={action}
     >
       <p>

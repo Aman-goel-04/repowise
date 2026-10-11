@@ -52,21 +52,43 @@ def _load_persisted_coverage_map(repo_path: object) -> dict[str, dict]:
         return {}
 
 
-def _load_fix_first(repo_path: object, *, limit: int) -> Any:
-    """The stored Fix-first queue, or ``None`` when the store cannot answer.
+def _load_fix_first(repo_path: object, *, limit: int) -> tuple[Any, Any] | None:
+    """The stored Fix-first head and the items' stored counts, or ``None``
+    when the store cannot answer.
 
     Best-effort like the coverage read: a missing repo row or an older store
     leaves the report without the section; the report itself still prints.
     """
     from repowise.cli.helpers import repo_index_session
     from repowise.core.persistence.crud.analysis.fix_first import load_fix_first
+    from repowise.core.persistence.crud.analysis.queue_counts import unit_counts
 
     async def _do() -> Any:
         async with repo_index_session(Path(str(repo_path))) as opened:
             if opened is None:
                 return None
             session, repo_id = opened
-            return await load_fix_first(session, repo_id, limit=limit)
+            queue = await load_fix_first(session, repo_id, limit=limit)
+            counts = await unit_counts(session, repo_id, "items", shown=len(queue.items))
+            return queue, counts
+
+    try:
+        return run_async(_do())
+    except Exception:
+        return None
+
+
+def _load_queue_counts(repo_path: object) -> dict[str, Any] | None:
+    """Every queue unit's stored counts, by noun; ``None`` when the store cannot answer."""
+    from repowise.cli.helpers import repo_index_session
+    from repowise.core.persistence.crud.analysis.queue_counts import all_unit_counts
+
+    async def _do() -> Any:
+        async with repo_index_session(Path(str(repo_path))) as opened:
+            if opened is None:
+                return None
+            session, repo_id = opened
+            return await all_unit_counts(session, repo_id)
 
     try:
         return run_async(_do())
@@ -128,11 +150,13 @@ def _load_recommendations(
     from repowise.cli.helpers import get_db_url_for_repo, reconcile_schema_best_effort
     from repowise.core.analysis.health.refactoring.recommendations import (
         build_recommendations,
-        hydrate_recommendations,
         serialize_recommendations,
     )
     from repowise.core.persistence import create_engine, create_session_factory, get_session
     from repowise.core.persistence.crud import get_repository_by_path
+    from repowise.core.persistence.crud.analysis.refactoring_recommendations import (
+        hydrate_recommendations,
+    )
 
     async def _do() -> list[dict[str, Any]]:
         url = get_db_url_for_repo(repo_path)
@@ -144,7 +168,7 @@ def _load_recommendations(
             if repo is None:
                 return []
             recommendations = await hydrate_recommendations(
-                session, repo.id, suggestions, metric_rows=metrics
+                session, repo.id, suggestions, metric_rows=metrics, checkout=str(repo_path)
             )
             return serialize_recommendations(recommendations)
 

@@ -20,10 +20,9 @@ from collections.abc import Mapping
 from math import log2
 from typing import Any
 
+from ...execution_roles import COLD_ROLES
 from ..rank_common import top_factors, weakest
-from ..rows import detail_map, field
-from ..worth import cost_proof, lead_reason
-from .actionability import EXPECTED_REASONS
+from ..worth import lead_reason
 
 BOUNDARY_POINTS = {"subprocess": 5, "network": 4, "db": 4, "lock": 3, "filesystem": 2}
 """What one crossing of each boundary costs, as an order of magnitude.
@@ -111,6 +110,16 @@ MAGNITUDE_POINTS = {"grows_with_data": 2, "n/a": 1, "bounded": 0, "unknown": 0}
 """A loop over a query result is paid again as the data grows; a retry loop or a
 constant-width slice is not. Unknown earns nothing, so a guess never outranks a fact."""
 PROVENANCE_POINTS = {"call-site": 3, "direct": 3, "reliable-edge": 2, "name-fallback": 0}
+ROLE_POINTS = {
+    "request": 3,
+    "event_consumer": 2,
+    "scheduled_job": 1,
+    "unknown": 1,
+    **dict.fromkeys(COLD_ROLES, 0),
+}
+"""What runs the loop: once per request outranks once per message, a scheduled
+job, and a run nobody's seeds reached; startup, CLI, tooling and tests earn
+nothing, since their loops run once per process."""
 
 AMPLIFICATION = {
     "nested_loop_with_io": "quadratic",
@@ -137,30 +146,6 @@ should say "worth it". A plan-ready group is still never buried by an equal
 one, and the default queue leaves out what has no strategy at all, which is
 what kept a generic sink's volume from crowding out actionable work.
 """
-
-DEFAULT_QUEUE_CONTEXTS = frozenset({"production"})
-DEFAULT_QUEUE_STATES = frozenset({"plan_ready", "advisory"})
-DEFAULT_QUEUE_PROOFS = frozenset({"proven"})
-"""What the queue holds when a caller names no filter: production work with a
-strategy whose cost is measured.
-
-Test, tooling and unclassified code, ``expected`` repetition, causes with no
-supported strategy (``investigate``, whose plan state is always ``no_safe_plan``)
-and causes whose loop nobody measured (``worth.cost_proof``) are true and stay one
-filter away, but none of them is work to schedule. Each is counted by
-:func:`default_queue_exclusion` so leaving it out is never silent.
-"""
-
-DEFAULT_QUEUE_EXCLUSIONS = (
-    "test",
-    "tooling",
-    "unknown",
-    *EXPECTED_REASONS,
-    "expected",
-    "no_strategy",
-    "unmeasured_cost",
-)
-"""Every reason the default queue leaves a cause out, in the order it is checked."""
 
 _LEVERAGE_BANDS = ((1, "isolated"), (3, "local"), (9, "shared"))
 _CHANGE_RISK_BANDS = ((1, "contained"), (4, "moderate"))
@@ -255,7 +240,7 @@ def rank_factors(
     marker: str,
     boundary: str | None,
     context: str,
-    reachable: bool | None,
+    role: str,
     site_count: int,
     provenance: str,
     magnitude: str,
@@ -269,7 +254,7 @@ def rank_factors(
         "multiplier_shape": MULTIPLIER_POINTS.get(marker, 1),
         "boundary_kind": BOUNDARY_POINTS.get(boundary or "", 0),
         "execution_context": CONTEXT_POINTS.get(context, 1),
-        "entry_reachability": 3 if reachable is True else 0,
+        "execution_role": ROLE_POINTS.get(role, 1),
         "affected_call_sites": min(8, int(log2(site_count + 1) * 2)),
         "provenance": PROVENANCE_POINTS.get(provenance, 0),
         "loop_magnitude": MAGNITUDE_POINTS[magnitude],
@@ -288,53 +273,6 @@ def why_ranked(factors: dict[str, int], values: dict[str, Any], limit: int = 3) 
         {"factor": name, "value": values.get(name), "points": points}
         for name, points in top_factors(factors, limit)
     )
-
-
-def strategy_exclusion(
-    item: Any, contexts: frozenset[str] = DEFAULT_QUEUE_CONTEXTS
-) -> str | None:
-    """Why *item* is no work to schedule, by context and state, or ``None``.
-
-    Reads an opportunity, an ORM row or a plain row. *contexts* widens it for a
-    caller that asked for more (Fix first's ``scope="all"`` keeps test code);
-    the state rule never moves. Fix first reads this rather than the default
-    queue because it keeps an unproven cause, as a ``later`` item.
-    """
-    context = field(item, "execution_context")
-    if context not in contexts:
-        return context
-    state = field(item, "actionability_state")
-    if state in DEFAULT_QUEUE_STATES:
-        return None
-    if state != "expected":
-        return "no_strategy"
-    reason = field(item, "actionability_reason") or detail_map(item).get("actionability_reason")
-    return reason if reason in EXPECTED_REASONS else "expected"
-
-
-def default_queue_exclusion(item: Any) -> str | None:
-    """Why the default queue leaves *item* out, or ``None`` when it is queued.
-
-    One reason per cause, context first and proof last, so the counts of every
-    reason and the queue add up to the whole.
-    """
-    reason = strategy_exclusion(item)
-    if reason is None and cost_proof(item) not in DEFAULT_QUEUE_PROOFS:
-        return "unmeasured_cost"
-    return reason
-
-
-def default_queue_counts(items: list[Any]) -> dict[str, Any]:
-    """The default queue's size and what it leaves out, by reason."""
-    excluded = dict.fromkeys(DEFAULT_QUEUE_EXCLUSIONS, 0)
-    queued = 0
-    for item in items:
-        reason = default_queue_exclusion(item)
-        if reason is None:
-            queued += 1
-        else:
-            excluded[reason] = excluded.get(reason, 0) + 1
-    return {"total": queued, "excluded": excluded}
 
 
 def rank_sort_key(item: Any) -> tuple[int, int, int, str]:
@@ -356,21 +294,16 @@ __all__ = [
     "BOUNDARY_POINTS",
     "CONTEXT_POINTS",
     "CROSS_FUNCTION_POINTS",
-    "DEFAULT_QUEUE_CONTEXTS",
-    "DEFAULT_QUEUE_EXCLUSIONS",
-    "DEFAULT_QUEUE_PROOFS",
-    "DEFAULT_QUEUE_STATES",
     "LEADING_ORMS",
     "MAGNITUDE_POINTS",
     "MULTIPLIER_POINTS",
     "NON_LEADING_MARKERS",
     "PROVENANCE_POINTS",
+    "ROLE_POINTS",
     "UNKNOWN_MULTIPLIER_POINTS",
     "amplification",
     "band",
     "change_risk",
-    "default_queue_counts",
-    "default_queue_exclusion",
     "dominant_marker",
     "exposure",
     "leverage",
@@ -379,7 +312,6 @@ __all__ = [
     "observation_rank",
     "rank_factors",
     "rank_sort_key",
-    "strategy_exclusion",
     "weakest_provenance",
     "why_ranked",
 ]

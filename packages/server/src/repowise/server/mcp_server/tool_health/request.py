@@ -59,6 +59,8 @@ _KNOWN_INCLUDES = frozenset(
         "unverified",
         # The shared legend for deficit points and percentiles, in ``_meta``.
         "semantics",
+        # With ``plan_id``: the plan as preconditions, steps and postconditions.
+        "recipe",
     }
 )
 
@@ -200,6 +202,21 @@ class HealthRequest:
             or self.wants("metrics")
             or ("refactoring" in self.include_set and self.wants("suggestion_legend"))
         )
+
+    @property
+    def ranks_findings(self) -> bool:
+        """Whether the dashboard prints findings, so their tier order matters.
+
+        The bare dashboard turns its finding lists into calls, so there only
+        ``biomarkers`` and the suggestion legend print one. Every other block
+        reads totals, which need no order.
+        """
+        listed = bool(self.only) and (self.wants("top_findings") or self.wants("test_findings"))
+        biomarkers = "biomarkers" in self.include_set and (
+            self.wants("findings") or self.wants("test_findings")
+        )
+        legend = "refactoring" in self.include_set and self.wants("suggestion_legend")
+        return listed or biomarkers or legend
 
     @property
     def plans_requested(self) -> bool:

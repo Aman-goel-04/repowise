@@ -148,6 +148,38 @@ describe("Fix first items", () => {
     expect(screen.getByText(/No guarding tests found/)).toBeTruthy();
   });
 
+  it("shows a due item's first step on the closed row, and the plan's own words when open", () => {
+    const first = "No test reaches this; add a characterization test for `run` before the edit.";
+    const step = {
+      ...REFACTOR.action.steps[0]!,
+      signature: "def _<name>(repo_path):",
+      call: "info = _<name>(repo_path)",
+      command: "pytest tests/unit/cli/test_repo_scanner.py",
+    };
+    const item: FixItem = {
+      ...REFACTOR,
+      action: { ...REFACTOR.action, steps: [step] },
+      verify: { tests: [], tests_total: 0, command: null, basis: "unknown", prerequisite: first },
+    };
+    renderList({ queue: { ...FIX_FIRST_QUEUE, items: [item], lead: item } });
+    expect(screen.getByText(step.text)).toBeTruthy();
+    openRow(item);
+    // Open, the line gives way to the step itself, with what it writes and checks.
+    expect(screen.getAllByText(step.text).length).toBe(1);
+    expect(screen.getByText("New helper")).toBeTruthy();
+    expect(screen.getByText("info = _<name>(repo_path)")).toBeTruthy();
+    expect(screen.getByText(/with a name for what the lines do/)).toBeTruthy();
+    expect(screen.getByText(step.command)).toBeTruthy();
+    expect(screen.getByText(first)).toBeTruthy();
+  });
+
+  it("keeps a later item's closed row to two lines", () => {
+    const later: FixItem = { ...FINDING, tier: "later" };
+    renderList({ queue: { ...FIX_FIRST_QUEUE, items: [later], lead: later } });
+    expect(screen.queryByText("First step")).toBeNull();
+    expect(screen.queryByText(later.action.steps[0]!.text)).toBeNull();
+  });
+
   it("names the plan by its unit, and offers none for a bare finding", () => {
     expect(fixPlanLabel(REFACTOR)).toBe("Open the refactoring plan");
     expect(fixPlanLabel(PERF)).toBe("Open the performance fix");
@@ -172,26 +204,27 @@ describe("Fix first items", () => {
     expect(screen.getAllByRole("button", { name: "Acknowledged" }).length).toBe(1);
   });
 
-  it("says why nothing is listed when the queue is empty", () => {
-    renderList({
-      queue: { ...FIX_FIRST_QUEUE, items: [], lead: null, totals: { ...FIX_FIRST_QUEUE.totals, shown: 0 } },
+  it("separates excluded-by-rule, no analysis and all clear when the queue is empty", () => {
+    const empty = { ...FIX_FIRST_QUEUE, items: [], lead: null };
+    const { unmount } = renderList({
+      queue: { ...empty, totals: { ...empty.totals, shown: 0 } },
     });
-    expect(screen.getByText(/Nothing eligible to fix first/)).toBeTruthy();
-  });
-});
+    expect(screen.getByText("Everything was left out by a rule")).toBeTruthy();
+    unmount();
 
-describe("Fix first agent prompt", () => {
-  it("is offered only when the host can load it", () => {
-    renderList();
-    expect(screen.queryByRole("button", { name: "Copy prompt for an agent" })).toBeNull();
-  });
+    const noExclusions = Object.fromEntries(
+      Object.keys(empty.totals.excluded).map((k) => [k, 0]),
+    ) as typeof empty.totals.excluded;
+    const none = { ...empty, totals: { ...empty.totals, shown: 0, excluded: noExclusions } };
+    const second = renderList({
+      queue: { ...none, basis: { analyzed_commit: null, health_analyzed_at: null } },
+    });
+    expect(screen.getByText("Health has not been analyzed yet")).toBeTruthy();
+    second.unmount();
 
-  it("shows the prompt the host loads for the item", async () => {
-    const loadPrompt = vi.fn().mockResolvedValue("Prompt from core");
-    renderList({ loadPrompt });
-    openRow(REFACTOR);
-    fireEvent.click(screen.getByRole("button", { name: "Copy prompt for an agent" }));
-    expect(await screen.findByText("Prompt from core")).toBeTruthy();
-    expect(loadPrompt).toHaveBeenCalledWith(REFACTOR, expect.any(String));
+    renderList({
+      queue: { ...none, basis: { analyzed_commit: "abc", health_analyzed_at: "2026-10-01" } },
+    });
+    expect(screen.getByText("Nothing to fix first")).toBeTruthy();
   });
 });

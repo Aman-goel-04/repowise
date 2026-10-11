@@ -13,26 +13,28 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
     Select,
-    String,
-    Text,
     bindparam,
     case,
-    collate,
     func,
+    inspect,
     or_,
     select,
     update,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ....analysis.finding_registry import excluded_types
 from ...models import RefactoringSuggestion, _new_uuid, _now_utc
-from ...sql import LIKE_ESCAPE, escape_like, rule_predicate
+from ...sql import rule_predicate
 from .._shared import _BATCH_SIZE, _finding_file_path
+
+if TYPE_CHECKING:
+    from .refactoring_payoff import PayoffContext
 
 # The finding-triage vocabulary, shared with health findings so Code Health has
 # one triage system rather than one per layer.
@@ -138,22 +140,30 @@ def _scope_predicates(
     return predicates
 
 
+def _field(item: Any, name: str) -> Any:
+    """*name* off a ``RefactoringSuggestion`` dataclass or a plain dict."""
+    return item.get(name) if isinstance(item, dict) else getattr(item, name, None)
+
+
+def _target_of(item: Any) -> tuple[str, str, str]:
+    return (
+        _field(item, "refactoring_type"),
+        _finding_file_path(item),
+        _field(item, "target_symbol"),
+    )
+
+
 def _scope_suggestions(
     suggestions: list[Any],
     *,
     allowed: set[str] | None,
     refactoring_type: str | None,
 ) -> list[Any]:
-    def _type_of(item: Any) -> Any:
-        if hasattr(item, "refactoring_type"):
-            return item.refactoring_type
-        return item.get("refactoring_type")
-
     return [
         item
         for item in suggestions
         if (allowed is None or _finding_file_path(item) in allowed)
-        and (refactoring_type is None or _type_of(item) == refactoring_type)
+        and (refactoring_type is None or _field(item, "refactoring_type") == refactoring_type)
     ]
 
 
@@ -164,6 +174,7 @@ async def finalize_refactoring_suggestions(
     *,
     file_paths: list[str] | None = None,
     refactoring_type: str | None = None,
+    payoff: PayoffContext | None = None,
 ) -> int:
     """Reconcile a detector run against the stored plans. Returns rows left open.
 
@@ -188,6 +199,9 @@ async def finalize_refactoring_suggestions(
       answering and stops reading as current;
     - a row from an older model, or one written before public ids existed, is
       resolved for the same reason. Ids are not translated across models.
+
+    With *payoff*, each current-model plan this call resolves gets a payoff row
+    (``refactoring_payoff``), and a reopened plan loses its own.
     """
     from ....analysis.health.refactoring.identity import (
         REFACTORING_MODEL_VERSION,
@@ -240,6 +254,8 @@ async def finalize_refactoring_suggestions(
     now = _now_utc()
     seen: set[str] = set()
     pending: list[RefactoringSuggestion] = []
+    reopened: list[str] = []
+    resolved: list[RefactoringSuggestion] = []
     for suggestion, public_id in zip(scoped, public_ids, strict=True):
         if public_id in seen:
             # Two plans reaching one id would violate the uniqueness readers rely
@@ -268,6 +284,7 @@ async def finalize_refactoring_suggestions(
             row.status = "open"
             row.status_reason = None
             row.status_changed_at = now
+            reopened.append(row.id)
         row.updated_at = now
 
     for row in stored_rows:
@@ -275,6 +292,9 @@ async def finalize_refactoring_suggestions(
             continue
         if row.status in ("resolved", "false_positive"):
             continue
+        # An older model's row resolves because its id changed, not its code.
+        if row.public_id and row.model_version == REFACTORING_MODEL_VERSION:
+            resolved.append(row)
         row.status = "resolved"
         row.status_reason = "no_longer_detected"
         row.status_changed_at = now
@@ -285,6 +305,17 @@ async def finalize_refactoring_suggestions(
             session.add(row)
         await session.flush()
     await session.flush()
+    if payoff is not None:
+        from .refactoring_payoff import settle_refactoring_payoffs
+
+        await settle_refactoring_payoffs(
+            session,
+            repository_id,
+            resolved=resolved,
+            reopened=reopened,
+            detected={_target_of(item) for item in scoped},
+            ctx=payoff,
+        )
 
     return sum(1 for row in stored_rows if row.status == "open") + len(pending)
 
@@ -293,13 +324,15 @@ async def save_refactoring_suggestions(
     session: AsyncSession,
     repository_id: str,
     suggestions: list[Any],
+    *,
+    payoff: PayoffContext | None = None,
 ) -> None:
     """Reconcile every refactoring suggestion for *repository_id*.
 
     The full-reindex entry point. Accepts ``RefactoringSuggestion`` dataclasses
     or plain dicts.
     """
-    await finalize_refactoring_suggestions(session, repository_id, suggestions)
+    await finalize_refactoring_suggestions(session, repository_id, suggestions, payoff=payoff)
 
 
 async def upsert_refactoring_suggestions(
@@ -309,6 +342,7 @@ async def upsert_refactoring_suggestions(
     *,
     file_paths: list[str],
     refactoring_type: str | None = None,
+    payoff: PayoffContext | None = None,
 ) -> None:
     """Reconcile suggestions **only for the given file paths**.
 
@@ -325,6 +359,7 @@ async def upsert_refactoring_suggestions(
         suggestions,
         file_paths=list(file_paths),
         refactoring_type=refactoring_type,
+        payoff=payoff,
     )
 
 
@@ -539,6 +574,27 @@ async def store_plan_ranks(
     )
     for index in range(0, len(values), _BATCH_SIZE):
         await session.execute(statement, values[index : index + _BATCH_SIZE])
+    _sync_loaded_ranks(session, repository_id, values)
+
+
+def _sync_loaded_ranks(
+    session: AsyncSession, repository_id: str, values: list[dict[str, Any]]
+) -> None:
+    """Give every plan this session holds the rank just written: the Core writes
+    bypass the identity map, and a later select returns a held instance as loaded."""
+    # Not an ORM bulk update by id instead: that fires ``updated_at``'s onupdate.
+    written = {item["plan_id"]: item for item in values}
+    for instance in list(session.sync_session.identity_map.values()):
+        if not isinstance(instance, RefactoringSuggestion):
+            continue
+        loaded = inspect(instance).dict
+        if loaded.get("repository_id") != repository_id:
+            continue
+        # A plan this finalize did not rank was cleared above, so it reads None.
+        item = written.get(loaded.get("id"), {})
+        set_committed_value(instance, "rank_position", item.get("position"))
+        set_committed_value(instance, "blast_size", item.get("surface"))
+        set_committed_value(instance, "rank_json", item.get("facts"))
 
 
 def _base_order(view: str, predicates: list[Any]) -> tuple[Select[Any], tuple[Any, ...]]:
@@ -566,86 +622,23 @@ def _base_order(view: str, predicates: list[Any]) -> tuple[Select[Any], tuple[An
     return query, (spread.c.spread_round, spread.c.first)
 
 
-def _sort_keys(sort: str, base: tuple[Any, ...], *, byte_order: bool) -> tuple[Any, ...]:
-    """A named sort from the shared table, ties broken by the view order.
-
-    *byte_order* collates text as Python compares it; SQLite's default already
-    does, and it has no ``"C"`` collation to name.
-    """
-    from ....analysis.health.refactoring.recommendations import (
-        EFFORT_RANK,
-        PLAN_SORTS,
-        UNKNOWN_EFFORT,
-    )
-
-    if sort == "effort":
-        bucket = case(EFFORT_RANK, value=RefactoringSuggestion.effort_bucket, else_=UNKNOWN_EFFORT)
-        return (bucket, *base)
-    keys = PLAN_SORTS.get(sort)
-    if keys is None:
-        return base
-    ordered = []
-    for name, descending in keys:
-        column = getattr(RefactoringSuggestion, name)
-        if byte_order and isinstance(column.type, String | Text):
-            column = collate(column, "C")
-        ordered.append(column.desc() if descending else column.asc())
-    return (*ordered, *base)
-
-
-def _search_prefilter(search: str) -> list[Any]:
-    """Every word of *search* in some searchable column: a superset of the
-    exact match, which :func:`matches_search` then decides.
-
-    A word ``plan_json`` may store escaped (non-ASCII, a quote, a backslash),
-    or SQLite cannot case-fold (non-ASCII), is left to the exact match alone.
-    """
-    columns = (
-        RefactoringSuggestion.file_path,
-        RefactoringSuggestion.target_symbol,
-        RefactoringSuggestion.refactoring_type,
-        RefactoringSuggestion.source_biomarker,
-        RefactoringSuggestion.plan_json,
-    )
-    return [
-        or_(
-            *(
-                func.lower(column).like(f"%{escape_like(word)}%", escape=LIKE_ESCAPE)
-                for column in columns
-            )
-        )
-        for word in search.split()
-        if word.isascii() and '"' not in word and "\\" not in word
-    ]
-
-
 async def ranked_refactoring_suggestions(
     session: AsyncSession,
     repository_id: str,
     *,
     min_confidence: str | None = None,
     filters: Mapping[str, Any] | None = None,
-    search: str = "",
-    sort: str = "canonical",
     view: str = "canonical",
-    limit: int | None = None,
-    offset: int = 0,
-) -> tuple[list[RefactoringSuggestion], int] | None:
-    """One page of open plans in persisted rank order, and its total.
+) -> list[RefactoringSuggestion] | None:
+    """The open plans in persisted rank order.
 
     *filters* are the params of the shared ``PLAN_FILTERS``. They narrow after
     the view is dealt, as the in-memory path does, so a filtered
-    ``file_spread`` keeps the order the unfiltered one had. A search reads
-    every row its SQL prefilter keeps, so its cost is bounded only by that
-    prefilter. ``None`` when an open plan was not ranked by the last
-    finalize: the caller ranks live.
+    ``file_spread`` keeps the order the unfiltered one had. ``None`` when an
+    open plan was not ranked by the last finalize: the caller ranks live.
     """
     from ....analysis.health.queue_rules import active_filters
-    from ....analysis.health.refactoring.recommendations import (
-        PLAN_FILTERS,
-        matches_search,
-        rehydrate_suggestion,
-    )
+    from ....analysis.health.refactoring.recommendations import PLAN_FILTERS
 
     base = _suggestion_filters(
         repository_id,
@@ -666,26 +659,8 @@ async def ranked_refactoring_suggestions(
         rule_predicate(RefactoringSuggestion, rule, value)
         for rule, value in active_filters(PLAN_FILTERS, filters or {})
     ]
-    byte_order = session.get_bind().dialect.name == "postgresql"
-    query = query.where(*narrowing, *_search_prefilter(search)).order_by(
-        *_sort_keys(sort, order, byte_order=byte_order)
-    )
-    if search:
-        # The prefilter bounds the read; the exact match is the shared one.
-        rows = [
-            row
-            for row in (await session.execute(query)).scalars().all()
-            if matches_search(rehydrate_suggestion(row), search)
-        ]
-        end = None if limit is None else offset + limit
-        return rows[offset:end], len(rows)
-    total = int(
-        (await session.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
-    )
-    query = query.offset(offset)
-    if limit is not None:
-        query = query.limit(limit)
-    return list((await session.execute(query)).scalars().all()), total
+    query = query.where(*narrowing).order_by(*order)
+    return list((await session.execute(query)).scalars().all())
 
 
 async def summarize_open_plans(
@@ -719,3 +694,21 @@ async def summarize_open_plans(
         )
     )
     return summarize_plans(rows.all())
+
+
+async def refactoring_suggestions_by_public_id(
+    session: AsyncSession, repository_id: str, public_ids: list[str]
+) -> list[RefactoringSuggestion]:
+    """The plans named by *public_ids*, in that order, in one indexed query."""
+    if not public_ids:
+        return []
+    rows = (
+        await session.execute(
+            select(RefactoringSuggestion).where(
+                RefactoringSuggestion.repository_id == repository_id,
+                RefactoringSuggestion.public_id.in_(public_ids),
+            )
+        )
+    ).scalars()
+    by_id = {row.public_id: row for row in rows}
+    return [by_id[pid] for pid in public_ids if pid in by_id]
