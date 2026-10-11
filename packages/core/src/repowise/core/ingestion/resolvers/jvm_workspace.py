@@ -44,6 +44,58 @@ _TOP_LEVEL_TYPE_RE = re.compile(
 )
 _JVM_EXTENSIONS = frozenset({".java", ".kt", ".scala"})
 
+# Kotlin top-level callables (``fun`` / ``val`` / ``var`` / ``const val``),
+# including extension forms. A Kotlin import can name one directly
+# (``import com.acme.util.shout``), and the declaring file rarely shares the
+# name (``StringUtils.kt``), so the type scan above never sees it.
+#
+# "Top level" is approximated by column 0: the match is anchored at the start
+# of the line with no leading indentation, which excludes members of a class
+# body and local declarations. It is a line scan, not a parse, so a column-0
+# declaration inside a raw string or an unindented class body is a (rare)
+# false positive.
+_KT_TOP_LEVEL_CALLABLE_RE = re.compile(
+    r"^(?P<mods>(?:(?:@\w+(?:\([^)\n]*\))?|public|internal|private|protected"
+    r"|inline|infix|operator|tailrec|suspend|external|expect|actual|const"
+    r"|lateinit|override|open|final|abstract)[ \t]+)*)"
+    r"(?P<kw>fun|val|var)[ \t]+(?P<rest>[^\n]*)",
+    re.MULTILINE,
+)
+_KT_GENERIC_RE = re.compile(r"<[^<>]*>")
+_KT_TRAILING_IDENT_RE = re.compile(r"(\w+)\s*$")
+_KT_KEYWORD_ONLY_RE = re.compile(r"^(?:interface)\b")
+
+
+def _kotlin_top_level_callables(text: str) -> tuple[str, ...]:
+    """Names of non-private top-level ``fun`` / ``val`` / ``var`` in Kotlin text.
+
+    Extension declarations yield the member name, not the receiver:
+    ``fun <T : Any> Mono<T>.captureMetrics(`` -> ``captureMetrics`` and
+    ``val String.shout: String`` -> ``shout``. ``private`` declarations are
+    file-local and cannot be imported, so they are skipped.
+    """
+    names: list[str] = []
+    for m in _KT_TOP_LEVEL_CALLABLE_RE.finditer(text):
+        if re.search(r"\bprivate\b", m.group("mods")):
+            continue
+        rest = m.group("rest")
+        if m.group("kw") == "fun" and _KT_KEYWORD_ONLY_RE.match(rest):
+            continue  # ``fun interface Foo`` declares a type, not a function
+        # Drop generic argument lists (innermost first) so ``<T : Any>`` and
+        # ``Map<String, List<Int>>`` receivers cannot hide the name.
+        prev = None
+        while prev != rest:
+            prev = rest
+            rest = _KT_GENERIC_RE.sub("", rest)
+        if m.group("kw") == "fun":
+            head = rest.split("(", 1)[0]
+        else:
+            head = re.split(r":|=|\bby\b", rest, maxsplit=1)[0]
+        ident = _KT_TRAILING_IDENT_RE.search(head)
+        if ident:
+            names.append(ident.group(1))
+    return tuple(names)
+
 # Chained Scala package clauses (``package org.example`` then ``package
 # tools`` → org.example.tools) are scanned line-wise from the top of the
 # file; ``package object foo`` is a definition, not a clause.
@@ -124,7 +176,7 @@ class JvmWorkspaceIndex:
     """Maps repo-relative file path → package FQN."""
 
     fqn_to_files: dict[str, list[str]] = field(default_factory=dict)
-    """Maps a fully-qualified class name → defining file(s)."""
+    """Maps a fully-qualified class (or Kotlin top-level function/property) name → defining file(s)."""
 
     services: dict[str, tuple[str, ...]] = field(default_factory=dict)
     """META-INF/services/<Iface> → impl FQNs (for Phase 3/4 reachability)."""
@@ -227,9 +279,11 @@ class JvmWorkspaceIndex:
 
 
 def _scan_jvm_text(abs_path: str, text: str) -> tuple[str, tuple[str, ...]]:
-    """Return (package_fqn, top_level_type_names) from already-read text.
+    """Return (package_fqn, top_level_names) from already-read text.
 
-    Cheap line scan — no AST.
+    ``top_level_names`` are the file's top-level type names and, for Kotlin
+    files, its non-private top-level ``fun`` / ``val`` / ``var`` names too —
+    both are importable by ``package.name``. Cheap line scan — no AST.
     """
     if abs_path.endswith(".scala"):
         package = _scala_package(text)
@@ -237,7 +291,18 @@ def _scan_jvm_text(abs_path: str, text: str) -> tuple[str, tuple[str, ...]]:
         pkg_match = _PACKAGE_RE.search(text)
         package = pkg_match.group(1) if pkg_match else ""
 
-    return package, tuple(m.group(1) for m in _TOP_LEVEL_TYPE_RE.finditer(text))
+    names = [m.group(1) for m in _TOP_LEVEL_TYPE_RE.finditer(text)]
+    if abs_path.endswith((".kt", ".kts")):
+        # Types stay first and keep their duplicates (the same-package pass
+        # reads a repeated name as ambiguous); callables are appended once and
+        # only when not already recorded, so ``fun Foo()`` beside
+        # ``class Foo`` adds no second entry for the file.
+        seen = set(names)
+        for name in _kotlin_top_level_callables(text):
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+    return package, tuple(names)
 
 
 @lru_cache(maxsize=16384)
