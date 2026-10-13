@@ -191,6 +191,9 @@ def build_go_package_index(ctx: ResolverContext) -> GoPackageIndex:
     # back to a fresh read, then to the legacy single-module field so
     # manually-built test contexts still map import paths.
     go_modules = ctx.go_modules or read_go_modules(ctx.repo_path)
+    # Only modules read from a real go.mod; ``exported_go_files`` keys off
+    # ``index.modules`` and must export nothing without one.
+    real_modules = tuple(go_modules)
     if not go_modules and ctx.go_module_path:
         go_modules = (("", ctx.go_module_path),)
 
@@ -203,7 +206,7 @@ def build_go_package_index(ctx: ResolverContext) -> GoPackageIndex:
             parent = ""
         files_by_dir.setdefault(parent, []).append(path)
 
-    index = GoPackageIndex(modules=tuple(go_modules))
+    index = GoPackageIndex(modules=real_modules)
     for pkg_dir, files in files_by_dir.items():
         files.sort()
         pkg_name = ""
