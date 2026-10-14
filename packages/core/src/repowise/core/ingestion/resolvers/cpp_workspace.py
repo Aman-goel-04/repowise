@@ -360,6 +360,34 @@ def _register_target(index: CppWorkspaceIndex, t: CppTarget) -> None:
                 index.public_header_includes.setdefault(rel, hdr)
 
 
+_HEADER_SUFFIXES = (".h", ".hpp", ".hxx")
+_MAX_HEADER_CANDIDATES = 200
+
+
+def _headers_near_target_sources(index: CppWorkspaceIndex, path_set: set[str]) -> list[str]:
+    """Headers in the directories of each target's own sources.
+
+    Fallback for export-macro discovery when no target declares public
+    headers. Deterministic (targets and paths are sorted) and capped, so a
+    huge tree cannot make the scan unbounded.
+    """
+    src_dirs: set[str] = set()
+    for tid in sorted(index.targets):
+        for src in index.targets[tid].sources:
+            src_dirs.add(PurePosixPath(src.replace("\\", "/")).parent.as_posix())
+    if not src_dirs:
+        return []
+    found: list[str] = []
+    for p in sorted(path_set):
+        if not p.lower().endswith(_HEADER_SUFFIXES):
+            continue
+        if PurePosixPath(p.replace("\\", "/")).parent.as_posix() in src_dirs:
+            found.append(p)
+            if len(found) > _MAX_HEADER_CANDIDATES:
+                break
+    return found
+
+
 def build_cpp_workspace_index(ctx: ResolverContext) -> CppWorkspaceIndex:
     index = CppWorkspaceIndex()
     if ctx.repo_path is None:
@@ -422,6 +450,11 @@ def build_cpp_workspace_index(ctx: ResolverContext) -> CppWorkspaceIndex:
                 header_candidates.append(p)
                 if len(header_candidates) > 200:
                     break
+    if not header_candidates:
+        # No target declares public headers and there is no ``include/``
+        # tree (Flutter FFI plugins, small shared libraries): the header
+        # that defines the project's export macro sits beside the sources.
+        header_candidates.extend(_headers_near_target_sources(index, path_set))
     for rel in header_candidates:
         data = source_map.get(rel) if source_map is not None else None
         if data is not None:
