@@ -51,6 +51,10 @@ from ..external_systems.cmake import (
 )
 from ..source_text import decode_source
 
+# One list of C/C++ header extensions: the resolver's, so the fallback scan
+# below cannot drift from what the include resolver treats as a header.
+from .cpp import _HEADER_EXTS
+
 if TYPE_CHECKING:
     from .context import ResolverContext
 
@@ -360,7 +364,6 @@ def _register_target(index: CppWorkspaceIndex, t: CppTarget) -> None:
                 index.public_header_includes.setdefault(rel, hdr)
 
 
-_HEADER_SUFFIXES = (".h", ".hpp", ".hxx")
 _MAX_HEADER_CANDIDATES = 200
 
 
@@ -379,7 +382,7 @@ def _headers_near_target_sources(index: CppWorkspaceIndex, path_set: set[str]) -
         return []
     found: list[str] = []
     for p in sorted(path_set):
-        if not p.lower().endswith(_HEADER_SUFFIXES):
+        if not p.lower().endswith(_HEADER_EXTS):
             continue
         if PurePosixPath(p.replace("\\", "/")).parent.as_posix() in src_dirs:
             found.append(p)

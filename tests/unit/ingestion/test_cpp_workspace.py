@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import networkx as nx
+import pytest
 
 from repowise.core.ingestion.resolvers.context import ResolverContext
 from repowise.core.ingestion.resolvers.cpp import (
@@ -162,6 +163,16 @@ def test_export_macro_found_in_header_beside_sources(tmp_path):
     # Flutter FFI plugin layout: no public headers declared, no include/.
     index = build_cpp_workspace_index(_ffi_plugin_fixture(tmp_path))
     assert "FFI_PLUGIN_EXPORT" in index.project_export_macros
+
+
+@pytest.mark.parametrize("header", ["api.hh", "api.h++", "api.hpp", "api.hxx"])
+def test_export_macro_found_in_other_header_extensions(tmp_path, header):
+    _write(tmp_path, "CMakeLists.txt", "add_library(coffee SHARED src/brew.cc)\n")
+    _write(tmp_path, f"src/{header}", "#define COFFEE_EXPORT __declspec(dllexport)\n")
+    _write(tmp_path, "src/brew.cc", "")
+    paths = [f"src/{header}", "src/brew.cc", "CMakeLists.txt"]
+    index = build_cpp_workspace_index(_make_ctx(tmp_path, paths))
+    assert "COFFEE_EXPORT" in index.project_export_macros
 
 
 def test_non_export_macro_beside_sources_is_filtered(tmp_path):
