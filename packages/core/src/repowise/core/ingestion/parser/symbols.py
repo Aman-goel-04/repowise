@@ -337,6 +337,10 @@ def _symbol_from_match(capture_dict: dict, file: _SymbolPass) -> tuple[Symbol, N
         export_type_parents=file.cpp_exports.parents,
     )
 
+    # Anonymous Go interface methods have no named owner and are not symbols.
+    if node_type == "method_elem" and parent_name is None:
+        return None
+
     # A ``field_declaration`` cannot occur outside a class body, so a
     # missing parent means the class did not parse. Grammar recovery,
     # not a member function.
@@ -519,6 +523,18 @@ def _resolve_parent_name(
     return None
 
 
+def _go_interface_owner(def_node: Node, src: str) -> str | None:
+    """Name of the interface type_spec that directly declares def_node."""
+    iface = def_node.parent
+    if iface is None or iface.type != "interface_type":
+        return None
+    spec = iface.parent
+    if spec is None or spec.type != "type_spec":
+        return None
+    name = spec.child_by_field_name("name")
+    return _node_text(name, src).strip() if name is not None else None
+
+
 def _find_parent(
     def_node: Node,
     config: LanguageConfig,
@@ -527,6 +543,9 @@ def _find_parent(
 ) -> str | None:
     """Determine the parent class/type for a symbol."""
     if config.parent_extraction == "receiver":
+        # Go interface methods belong to their named interface declaration.
+        if def_node.type == "method_elem":
+            return _go_interface_owner(def_node, src)
         # Go: extract type name from receiver parameter list
         if receiver_nodes:
             return extract_go_receiver_type(_node_text(receiver_nodes[0], src))
