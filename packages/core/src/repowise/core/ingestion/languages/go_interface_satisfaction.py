@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ..heritage_resolver import heritage_ancestors
+from ..type_names import bare_type_name, type_qualifier
 
 if TYPE_CHECKING:
     import networkx as nx
@@ -126,7 +127,7 @@ def _interface_facts(iface_node: Node, src: bytes) -> tuple[set[str], list[str]]
             # method-bearing embeds.
             if "|" in text or "~" in text:
                 continue
-            bare = text.split(".")[-1].strip()
+            bare = bare_type_name(text)
             if bare and bare[0].isalpha():
                 embedded.append(bare)
     return methods, embedded
@@ -221,9 +222,10 @@ def go_embedded_interfaces(type_source: str) -> list[tuple[str | None, str]]:
         text = src[elem.start_byte : elem.end_byte].decode("utf-8", "ignore").strip()
         if "|" in text or "~" in text or "[" in text:
             continue
-        qualifier, _, name = text.rpartition(".")
+        qualifier = type_qualifier(text) or None
+        name = bare_type_name(text)
         if name and name[0].isalpha():
-            found.append((qualifier or None, name))
+            found.append((qualifier, name))
     return found
 
 
