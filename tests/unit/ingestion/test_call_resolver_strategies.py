@@ -2331,3 +2331,53 @@ class TestPythonNameAliasAssignment:
         edges = _edges(parsed, tmp_path)
         assert ("mod.py::use_it", "mod.py::s", 0.95, "same_file") in edges
         assert ("attr.py::use_it", "attr.py::s", 0.95, "same_file") in edges
+
+    def test_chained_alias_does_not_overwrite_real_definition(
+        self, tmp_path: Path
+    ) -> None:
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "mod.py": (
+                    "python",
+                    "def attributes():\n"
+                    "    pass\n"
+                    "\n"
+                    "def widget():\n"
+                    "    pass\n"
+                    "\n"
+                    "s = attributes = widget\n"
+                    "\n"
+                    "def use_attributes():\n"
+                    "    attributes()\n"
+                    "\n"
+                    "def use_alias():\n"
+                    "    s()\n",
+                )
+            },
+        )
+
+        edges = _edges(parsed, tmp_path)
+
+        assert (
+            "mod.py::use_attributes",
+            "mod.py::widget",
+            0.95,
+            "same_file",
+        ) in edges
+
+        assert (
+            "mod.py::use_alias",
+            "mod.py::widget",
+            0.95,
+            "same_file",
+        ) in edges
+
+        attributes_symbols = [
+            symbol
+            for symbol in parsed["mod.py"].symbols
+            if symbol.name == "attributes"
+        ]
+
+        assert len(attributes_symbols) == 2
+        assert len({symbol.id for symbol in attributes_symbols}) == 2
