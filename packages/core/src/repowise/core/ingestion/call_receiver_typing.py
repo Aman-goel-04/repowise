@@ -141,7 +141,6 @@ def _store_capped(cache: dict[_K, _V], key: _K, value: _V, cap: int) -> None:
     cache[key] = value
 
 
-
 def _is_its_own_container(type_name: str | None, spelling: str | None, language: str) -> bool:
     """Whether *type_name*, a name's value type, is just the head of its container.
 
@@ -151,7 +150,7 @@ def _is_its_own_container(type_name: str | None, spelling: str | None, language:
     """
     if language != "dart" or type_name is None or spelling is None:
         return False
-    return spelling.split("<", 1)[0].strip() == type_name
+    return strip_type_arguments(spelling).strip() == type_name
 
 
 class _Scope(NamedTuple):
