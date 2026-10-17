@@ -931,7 +931,7 @@ def _python_assignment_alias_symbols(
         extra.append(
             replace(
                 symbol,
-                id=f"{file_path}::{target}",
+                id=f"{file_path}::{target}::alias@{def_node.start_byte}",
                 name=target,
                 qualified_name=_build_qualified_name(file_path, None, target),
                 alias_of=terminal if target != terminal else None,

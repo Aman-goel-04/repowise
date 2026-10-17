@@ -817,7 +817,9 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
                 definitions[decl_key].append((path, index_id))
             _index_bare_name(sym, index_id, file_syms, top_level)
 
-            if sym.alias_of is not None and binding_counts[sym.name] == 1:
+            if sym.alias_of is not None and (
+                binding_counts[sym.name] == 1 or "::alias@" in sym.id
+            ):
                 aliases.append((sym.id, sym.alias_of))
 
             # Method index: (class_name, method_name) → symbol_id
