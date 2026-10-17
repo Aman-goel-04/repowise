@@ -24,7 +24,7 @@ per strategy, and it is what the edge carries.
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import PurePosixPath
@@ -799,6 +799,9 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         top_level: dict[str, str] = {}
         file_methods: dict[tuple[str, str], str] = {}
         representatives = self._index_overload_sets(parsed)
+        binding_counts = Counter(
+            sym.name for sym in parsed.symbols if sym.parent_name is None
+        )
         # (alias symbol id, the bare name it aliases) — resolved against
         # ``file_syms`` only once the whole file is indexed, so an alias
         # written above the name it aliases is not missed by source order.
@@ -814,7 +817,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
                 definitions[decl_key].append((path, index_id))
             _index_bare_name(sym, index_id, file_syms, top_level)
 
-            if sym.alias_of is not None:
+            if sym.alias_of is not None and binding_counts[sym.name] == 1:
                 aliases.append((sym.id, sym.alias_of))
 
             # Method index: (class_name, method_name) → symbol_id
@@ -1060,25 +1063,32 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         """
         return self._decl_to_def
 
+    
     def _redirect_to_definition(self, resolved: ResolvedCall) -> ResolvedCall:
-        """Move a call edge off a forward declaration, or a name alias, onto the real thing.
+        """Redirect calls through aliases and declarations to the final target."""
+        original = resolved.callee_id
+        target = original
+        visited: set[str] = set()
 
-        No-op for a tier that already landed on a definition. ``_decl_to_def``
-        is C/C++ only; ``_alias_to_target`` is the Python
-        ``s = widget`` / ``s = attributes = widget`` case (#2791) -- a
-        resolved call lands on whichever id the lookup actually used (``s``'s
-        own id, or ``attributes``'s), and this moves it onto ``widget``.
+        while target not in visited:
+            visited.add(target)
+            next_target = self._decl_to_def.get(target)
+            if next_target is None:
+                next_target = self._alias_to_target.get(target)
+            if next_target is None:
+                break
+            target = next_target
 
-        The self-edge guard carries a recursive function whose prototype sits
-        in a header: Tier 1 declines to link the call to the body it is
-        already inside, Tier 2 then finds the header declaration, and the
-        redirect would point the edge straight back at the caller.
-        """
-        target = self._decl_to_def.get(resolved.callee_id) or self._alias_to_target.get(
-            resolved.callee_id
-        )
-        if target is None or target == resolved.caller_id:
+        # A cycle makes the redirect ambiguous; keep the original resolution.
+        if target in visited and (
+            self._decl_to_def.get(target) is not None
+            or self._alias_to_target.get(target) is not None
+        ):
             return resolved
+
+        if target == original or target == resolved.caller_id:
+            return resolved
+
         return ResolvedCall(
             resolved.caller_id,
             target,
