@@ -1063,7 +1063,6 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         """
         return self._decl_to_def
 
-    
     def _redirect_to_definition(self, resolved: ResolvedCall) -> ResolvedCall:
         """Redirect calls through aliases and declarations to the final target."""
         original = resolved.callee_id
