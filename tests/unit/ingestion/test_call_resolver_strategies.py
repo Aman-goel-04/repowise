@@ -1994,6 +1994,84 @@ class TestModuleAliasReachesTopLevelOnly:
             "module_alias",
         ) in _edges(parsed, tmp_path, import_targets)
 
+    def test_rebound_alias_is_not_redirected_to_original_definition(
+        self, tmp_path: Path
+    ) -> None:
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "mod.py": (
+                    "python",
+                    "def _impl():\n"
+                    "    pass\n"
+                    "\n"
+                    "wrapped = _impl\n"
+                    "wrapped = cache(wrapped)\n"
+                    "\n"
+                    "def use_it():\n"
+                    "    wrapped()\n",
+                ),
+            },
+        )
+
+        edges = _edges(parsed, tmp_path)
+
+        assert (
+            "mod.py::use_it",
+            "mod.py::wrapped",
+            0.95,
+            "same_file",
+        ) in edges
+
+        assert (
+            "mod.py::use_it",
+            "mod.py::_impl",
+            0.95,
+            "same_file",
+        ) not in edges
+
+    
+    def test_chained_alias_redirects_to_final_definition(
+        self, tmp_path: Path
+    ) -> None:
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "mod.py": (
+                    "python",
+                    "def real():\n"
+                    "    pass\n"
+                    "\n"
+                    "widget = real\n"
+                    "s = widget\n"
+                    "\n"
+                    "def use_it():\n"
+                    "    s()\n",
+                ),
+            },
+        )
+
+        edges = _edges(parsed, tmp_path)
+
+        assert (
+            "mod.py::use_it",
+            "mod.py::real",
+            0.95,
+            "same_file",
+        ) in edges
+        assert (
+            "mod.py::use_it",
+            "mod.py::widget",
+            0.95,
+            "same_file",
+        ) not in edges
+        assert (
+            "mod.py::use_it",
+            "mod.py::s",
+            0.95,
+            "same_file",
+        ) not in edges
+
 
 class TestExternalReceiverType:
     """A Java receiver declared with a type the repo does not own is refused.
