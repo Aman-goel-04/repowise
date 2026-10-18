@@ -1600,6 +1600,27 @@ class TestNoAlarmOnCodeThatDoesNotShip:
         assert self._found(path, source) == []
 
     @pytest.mark.parametrize(
+        ("path", "source"),
+        [
+            ("README.md", "key {key} pragma: allowlist secret\n"),
+            ("README.md", "key {key} <!-- nosec -->\n"),
+            ("README.md", "key {key} # pragma: allowlist secret\n"),
+            ("docs/guide.rst", "key {key} nosec\n"),
+            ("README.md", "pragma: allowlist nextline secret\nkey {key}\n"),
+        ],
+    )
+    def test_prose_allow_markers_need_no_comment_opener(self, path: str, source: str) -> None:
+        assert self._found(path, source.format(key=self.KEY)) == []
+
+    def test_a_word_containing_a_marker_does_not_silence_prose(self) -> None:
+        source = f"key {self.KEY} nosecurity\n"
+        assert self._found("README.md", source) == [("aws_access_key", "high")]
+
+    def test_a_bare_marker_outside_a_comment_still_fires_in_code(self) -> None:
+        source = f'key = "{self.KEY}"  nosec\n'
+        assert self._found("src/settings.py", source) == [("aws_access_key", "high")]
+
+    @pytest.mark.parametrize(
         "source",
         [
             'key = "{key}"  # noqa: E501\n',
