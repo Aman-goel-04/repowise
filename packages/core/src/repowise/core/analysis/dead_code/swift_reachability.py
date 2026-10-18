@@ -79,12 +79,17 @@ _FUNC_USE = re.compile(
     rf"|(?:[,(:\[{{]|[-+*/%<>=!&|^~?]+|\breturn\b|\bin\b)\s*(?!(?:return|in)\b)({_NAME})\b(?!\s*:)"
 )
 _OP_CHARS = r"/=\-+!*%<>&|^~?."
-_OP_TOKEN = rf"[{_OP_CHARS}]+"
+_OP_CHARS_NO_DOT = _OP_CHARS.replace(".", "")
+#: An operator is a run of operator characters, and may contain a ``.`` only
+#: when it starts with one (``.+.``, ``..<``); a lone ``.`` is member access.
+_OP_TOKEN = rf"\.[{_OP_CHARS}]+|[{_OP_CHARS_NO_DOT}]+"
 #: ``infix|prefix|postfix operator X`` and ``func X`` where X is an operator.
 _OP_DECL = re.compile(rf"\boperator\s+({_OP_TOKEN})|\bfunc\s+({_OP_TOKEN})(?=\s*[<(])")
 #: A run of operator characters, read as one token.
-_OP_USE = re.compile(rf"[{_OP_CHARS.replace('.', '')}]+")
+_OP_USE = re.compile(_OP_TOKEN)
 _OP_DECL_BEFORE = re.compile(r"\b(?:func|operator)\s*$")
+#: ``func`` right before a name: a declaration header, not a call.
+_FUNC_DECL_BEFORE = re.compile(r"\bfunc\s+$")
 
 #: Function names too common to say which declaration a text use means.
 _SWIFT_COMMON_FUNCS: frozenset[str] = frozenset(
@@ -187,6 +192,21 @@ def _names(pattern: re.Pattern[str], text: str) -> set[str]:
     return {a or b for a, b in pattern.findall(text)}
 
 
+def _bare_names(text: str) -> set[str]:
+    """Names written as a bare identifier, skipping ``func name(`` headers.
+
+    A method declared as ``func helper(...)`` is not a use of a top-level
+    ``helper``, so a declaration header never counts.
+    """
+    names: set[str] = set()
+    for match in _FUNC_USE.finditer(text):
+        called = match.group(1)
+        if called and _FUNC_DECL_BEFORE.search(text[max(0, match.start(1) - 16) : match.start(1)]):
+            continue
+        names.add(called or match.group(2))
+    return names
+
+
 def _top_level(graph: Any, path: str) -> Iterable[dict]:
     for _path, symbol, edge in graph.out_edges(path, data=True):
         if edge.get("edge_type") == "defines":
@@ -286,7 +306,7 @@ class _SwiftFacts:
             self.type_users.setdefault(name, set()).add(path)
         for name in _names(_MEMBER_USE, text):
             self.member_users.setdefault(name, set()).add(path)
-        for name in _names(_FUNC_USE, text):
+        for name in _bare_names(text):
             self.func_users.setdefault(name, set()).add(path)
         self._read_operators(path, text)
 

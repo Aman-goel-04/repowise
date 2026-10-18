@@ -452,3 +452,39 @@ def test_a_playground_file_is_not_rescued_by_a_name_it_declares() -> None:
     named = _top_level_graph(decls, sources)
     assert playground not in named
     assert "Lib/Real.swift" in named
+
+
+def test_a_custom_operator_starting_with_a_dot_is_read_whole() -> None:
+    decls = {_ROOT: [("Main", "class", None)], "Lib/Dot.swift": [("Marker", "class", None)]}
+    sources = {
+        _ROOT: b"struct Main {\n  let t = 1 .+. 2\n  let u = a.b\n}\n",
+        "Lib/Dot.swift": (
+            b"infix operator .+.: AdditionPrecedence\n"
+            b"func .+. (a: Int, b: Int) -> Int { a }\nstruct Marker {}\n"
+        ),
+    }
+    assert "Lib/Dot.swift" in _top_level_graph(decls, sources)
+
+
+def test_a_member_dot_is_not_an_operator() -> None:
+    decls = {_ROOT: [("Main", "class", None)], "Lib/Dot.swift": [("Marker", "class", None)]}
+    sources = {
+        _ROOT: b"struct Main {\n  let u = a.b + c.d\n}\n",
+        "Lib/Dot.swift": (
+            b"infix operator .+.: AdditionPrecedence\n"
+            b"func .+. (a: Int, b: Int) -> Int { a }\nstruct Marker {}\n"
+        ),
+    }
+    assert "Lib/Dot.swift" not in _top_level_graph(decls, sources)
+
+
+def test_declaring_a_method_does_not_rescue_a_top_level_function_of_that_name() -> None:
+    decls = {
+        _ROOT: [("Main", "class", None), ("helper", "method", "Main")],
+        "Lib/Helper.swift": [("helper", "function", None)],
+    }
+    sources = {
+        _ROOT: b"struct Main {\n  func helper() {}\n  public static func helper(_ x: Int) {}\n}\n",
+        "Lib/Helper.swift": b"func helper() {}\n",
+    }
+    assert "Lib/Helper.swift" not in _top_level_graph(decls, sources)
