@@ -739,3 +739,48 @@ def test_top_driver_is_the_argmax_of_the_shown_contributions(features) -> None:
     assert risk.top_driver is not None
     assert risk.top_driver.contribution == max(d.contribution for d in shown)
     assert risk.top_driver in shown
+
+
+@pytest.fixture
+def diverged_repo(git_repo: Path) -> Path:
+    """``feature`` forks from main and adds one file, then main moves on."""
+    _git(["branch", "-M", "main"], git_repo)
+    _commit(git_repo, {"app.py": "def run():\n    return 1\n"}, "init app")
+    _git(["switch", "-qc", "feature"], git_repo)
+    _commit(git_repo, {"feature.py": "def feature():\n    return 2\n"}, "add feature")
+    _git(["switch", "-q", "main"], git_repo)
+    _commit(git_repo, {"app.py": "def run():\n    return 1\n\ndef stop():\n    return 0\n"}, "m1")
+    _commit(git_repo, {"billing.py": "def charge():\n    return 3\n"}, "m2")
+    return git_repo
+
+
+def test_branch_change_range_reads_a_moved_base_as_three_dots(diverged_repo: Path) -> None:
+    from repowise.core.git_refs import branch_change_range
+
+    spec, note = branch_change_range(str(diverged_repo), "main..feature")
+    assert spec == "main...feature"
+    assert note is not None and "main" in note and "feature" in note
+
+
+def test_branch_change_range_keeps_an_ancestor_base(diverged_repo: Path) -> None:
+    from repowise.core.git_refs import branch_change_range
+
+    _git(["switch", "-q", "feature"], diverged_repo)
+    _git(["rebase", "-q", "main"], diverged_repo)
+    assert branch_change_range(str(diverged_repo), "main..feature") == ("main..feature", None)
+
+
+@pytest.mark.parametrize("spec", ["main...feature", "feature", "main..nope", "nope..feature"])
+def test_branch_change_range_leaves_other_specs_alone(diverged_repo: Path, spec: str) -> None:
+    from repowise.core.git_refs import branch_change_range
+
+    assert branch_change_range(str(diverged_repo), spec) == (spec, None)
+
+
+def test_the_branchs_own_change_is_scored_once_main_moved(diverged_repo: Path) -> None:
+    from repowise.core.git_refs import branch_change_range
+
+    spec, _ = branch_change_range(str(diverged_repo), "main..feature")
+    features = score_live_change(str(diverged_repo), spec, baseline=0).features
+    assert features.nf == 1
+    assert [p for p, _ in features.file_churn] == ["feature.py"]

@@ -9,6 +9,7 @@ import subprocess
 import time
 from typing import Any
 
+from repowise.core import git_refs
 from repowise.core.analysis.change_risk import (
     normalize_extensions,
 )
@@ -195,8 +196,10 @@ async def get_change_risk(
     ``status: "nothing_to_score"``.
 
     Args:
-        revspec: Commit or ``base..head`` range. Omit to review uncommitted
-            work, or ``HEAD`` when the tree is clean.
+        revspec: Commit or range. ``base...head`` is the branch's own change
+            (from the merge-base); ``base..head`` is read that way when ``base``
+            has moved past the fork point (``scored_repo.range_note`` says so).
+            Omit to review uncommitted work, or ``HEAD`` when the tree is clean.
         repo: Repository alias in workspace mode; omit for the default.
         extensions: File suffixes to count, e.g. ``[".py", ".ts"]``.
         exclude_patterns: Gitignore-style paths to omit, e.g. ``["tests/"]``.
@@ -211,6 +214,13 @@ async def get_change_risk(
         return _unsupported_repo_all("get_change_risk")
     ctx = await _pkg._resolve_repo_context(repo)
     started = time.perf_counter()
+    range_note = None
+    if revspec:
+        # Once, before the revspec fans out, so the score, the changed lines, the
+        # health delta and the evidence all read the same change.
+        revspec, range_note = await asyncio.to_thread(
+            git_refs.branch_change_range, str(ctx.path), revspec
+        )
     includes = _path_patterns(include_paths)
     key = await _cache.cache_key(ctx, revspec, extensions, exclude_patterns, includes, baseline)
     hit = _cache.lookup(key)
@@ -228,6 +238,8 @@ async def get_change_risk(
     include_set = _include_blocks(include, ignored)
     payload, diagnostics = _shape_payload(result, include_set, revspec)
     scored = await asyncio.to_thread(_scored_repo, str(ctx.path), revspec, result.working_tree)
+    if range_note:
+        scored["range_note"] = range_note
     if result.features.nf == 0:
         return await _nothing_to_score(ctx, payload["ref"], scored, started)
     payload = {"ref": payload.pop("ref"), "scored_repo": scored, **payload}

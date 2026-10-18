@@ -21,6 +21,7 @@ __all__ = [
     "PathRemoval",
     "ahead_behind",
     "ahead_behind_many",
+    "branch_change_range",
     "branch_with_path",
     "change_base",
     "changed_files",
@@ -324,6 +325,34 @@ def is_ancestor(repo_path: str, older: str, newer: str) -> bool | None:
     except (subprocess.TimeoutExpired, OSError):
         return None
     return True
+
+
+def branch_change_range(repo_path: str, revspec: str) -> tuple[str, str | None]:
+    """``(revspec to read, note)``: a two-dot range read as the branch's own change.
+
+    ``git diff A..B`` compares the two tips, so once *A* has moved past the point *B*
+    forked from, everything *A* gained reads as reverted by *B*. For ``A..B`` where *A*
+    is not an ancestor of *B* this returns ``A...B`` (the diff from the merge-base) and
+    a note saying so. Everything else comes back unchanged with no note: a range whose
+    base is an ancestor (both meanings agree), ``A...B``, a single commit, and any case
+    git cannot answer (unknown ref, shallow clone, unrelated histories), so the existing
+    error paths still fire.
+    """
+    parts = split_revspec(revspec)
+    if parts is None or parts[1] != "..":
+        return revspec, None
+    base, _, head = parts
+    if is_ancestor(repo_path, base, head) is not False:
+        return revspec, None
+    fork = _read(repo_path, ["merge-base", base, head])
+    if not fork:
+        return revspec, None
+    note = (
+        f"{base!r} has moved past the point {head!r} forked from ({fork[:12]}), so "
+        f"{revspec!r} was read as {base}...{head}: the branch's own change, not a "
+        "comparison of the two tips."
+    )
+    return f"{base}...{head}", note
 
 
 @dataclass(frozen=True)
