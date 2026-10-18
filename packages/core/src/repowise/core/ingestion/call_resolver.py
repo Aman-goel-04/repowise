@@ -25,7 +25,6 @@ per strategy, and it is what the edge carries.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import PurePosixPath
 from typing import Any
