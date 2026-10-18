@@ -232,6 +232,14 @@ def _extract_symbols(
         symbol, def_node = built
         symbols.append(symbol)
         node_types.append(def_node.type)
+
+        if language == "python" and def_node.type == "assignment":
+            for alias_symbol in _python_assignment_alias_symbols(
+                symbol, def_node, file_info.path, src
+            ):
+                symbols.append(alias_symbol)
+                node_types.append(def_node.type)
+
         if language == "objectivec":
             container = _objc_container_node(def_node, config.parent_class_types)
             objc_container_kinds.append(container.type if container else None)
