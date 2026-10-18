@@ -497,7 +497,7 @@ class CallResolver(
         # (alias symbol id, the bare name it aliases) — resolved against
         # ``file_syms`` only once the whole file is indexed, so an alias
         # written above the name it aliases is not missed by source order.
-        aliases: list[tuple[str, str]] = []
+        aliases: list[tuple[str, str, str | None]] = []
 
         for sym in parsed.symbols:
             # An overload set is indexed once, under its representative.
@@ -512,7 +512,7 @@ class CallResolver(
             if sym.alias_of is not None and (
                 binding_counts[sym.name] == 1 or "::alias@" in sym.id
             ):
-                aliases.append((sym.id, sym.alias_of))
+                aliases.append((sym.id, sym.alias_of, sym.parent_name))
 
             # Method index: (class_name, method_name) → symbol_id
             if sym.parent_name:
@@ -530,8 +530,17 @@ class CallResolver(
 
             self._index_globally(path, sym, index_id)
 
-        for alias_id, alias_of_name in aliases:
-            target_id = file_syms.get(alias_of_name)
+        for alias_id, alias_of_name, parent_name in aliases:
+            # Prefer a target in the alias's own scope before falling back
+            # to a file-wide symbol with the same name.
+            target_id = (
+                file_methods.get((parent_name, alias_of_name))
+                if parent_name is not None
+                else None
+            )
+            if target_id is None:
+                target_id = file_syms.get(alias_of_name)
+
             # No self-redirect: ``s = s`` names nothing beyond itself.
             if target_id is not None and target_id != alias_id:
                 self._alias_to_target[alias_id] = target_id

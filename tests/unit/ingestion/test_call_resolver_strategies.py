@@ -2332,6 +2332,60 @@ class TestPythonNameAliasAssignment:
         assert ("mod.py::use_it", "mod.py::s", 0.95, "same_file") in edges
         assert ("attr.py::use_it", "attr.py::s", 0.95, "same_file") in edges
 
+    def test_class_alias_prefers_class_scoped_target_over_module_name(
+        self, tmp_path: Path
+    ) -> None:
+        from dataclasses import replace
+
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "mod.py": (
+                    "python",
+                    "def widget():\n"
+                    "    pass\n"
+                    "\n"
+                    "class C:\n"
+                    "    def widget():\n"
+                    "        pass\n"
+                    "\n"
+                    "    def use_it():\n"
+                    "        s()\n",
+                )
+            },
+        )
+
+        # Python's symbol query intentionally excludes class-body assignments.
+        # Inject the equivalent alias to test resolver indexing in isolation.
+        pf = parsed["mod.py"]
+        class_widget = next(
+            sym for sym in pf.symbols if sym.id == "mod.py::C::widget"
+        )
+        pf.symbols.append(
+            replace(
+                class_widget,
+                id="mod.py::C::s::alias@100",
+                name="s",
+                qualified_name="mod.C.s",
+                alias_of="widget",
+            )
+        )
+
+        edges = _edges(parsed, tmp_path)
+
+        assert (
+            "mod.py::C::use_it",
+            "mod.py::C::widget",
+            0.95,
+            "same_file",
+        ) in edges
+        assert (
+            "mod.py::C::use_it",
+            "mod.py::widget",
+            0.95,
+            "same_file",
+        ) not in edges
+
     def test_chained_alias_does_not_overwrite_real_definition(
         self, tmp_path: Path
     ) -> None:
