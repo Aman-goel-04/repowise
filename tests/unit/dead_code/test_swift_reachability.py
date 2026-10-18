@@ -411,3 +411,44 @@ def test_an_operator_overload_of_a_standard_operator_does_not_rescue_its_file() 
         "Lib/Plus.swift": b"struct Money {\n  static func + (a: Money, b: Money) -> Money { a }\n}\n",
     }
     assert not _top_level_graph(decls, sources)
+
+
+def test_locals_of_a_top_level_closure_and_playground_names_do_not_rescue(tmp_path: Path) -> None:
+    files = {
+        "Package.swift": _spm(("App", ())),
+        "Sources/App/RuntimeWarnings.swift": (
+            "private let rw = (\n"
+            "  dso: { () -> Int in\n"
+            "    let count = 3\n"
+            '    let swiftString = "x"\n'
+            "    return count + swiftString.count\n"
+            "  }(),\n"
+            "  log: 1\n"
+            ")\n\n"
+            "func runtimeWarning() {}\n"
+        ),
+        "Sources/App/Use.swift": (
+            "public func use(_ items: [Int], router: Int) -> Int {\n"
+            "  let n = items.count\n  let k = count\n  return router + n + k\n}\n"
+        ),
+        "Sources/App/main.swift": "print(use([1], router: 2))\n",
+    }
+    report = _analyze(tmp_path, files, "Sources/App/main.swift")
+    assert "RuntimeWarnings.swift" in _unreachable(report), _unreachable(report)
+
+
+def test_a_playground_file_is_not_rescued_by_a_name_it_declares() -> None:
+    playground = "Sources/Router.playground/Contents.swift"
+    decls = {
+        _ROOT: [("Main", "class", None)],
+        playground: [("router", "variable", None)],
+        "Lib/Real.swift": [("router", "variable", None), ("Other", "class", None)],
+    }
+    sources = {
+        _ROOT: b"struct Main {\n  let r = router\n}\n",
+        playground: b"let router = 1\n",
+        "Lib/Real.swift": b"let router = 2\nstruct Other {}\n",
+    }
+    named = _top_level_graph(decls, sources)
+    assert playground not in named
+    assert "Lib/Real.swift" in named

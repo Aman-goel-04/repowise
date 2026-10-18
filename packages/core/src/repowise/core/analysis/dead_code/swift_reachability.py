@@ -56,6 +56,9 @@ _TYPE_KINDS: frozenset[str] = frozenset({"class", "interface"})
 _EXTENSION_KIND = "impl"
 #: A top-level ``func`` is emitted as ``function``, a ``let`` / ``var`` as ``variable``.
 _VALUE_KINDS: frozenset[str] = frozenset({"function", "variable"})
+#: A playground's files are scripts run on their own, never members of a module,
+#: so a name they declare is not one another file can mean.
+_STANDALONE_DIR = ".playground/"
 
 _NAME = r"[^\W\d]\w*"
 #: A name in a type position: the last component of an optionally qualified
@@ -238,8 +241,29 @@ class _SwiftFacts:
                 self.extends.setdefault(path, set()).add(name)
                 self.own.setdefault(path, set()).add(name)
 
+    @staticmethod
+    def _is_top_level_value(data: dict, spans: list[tuple[int, int]], path: str) -> bool:
+        """A ``func`` / ``let`` / ``var`` that really sits at file scope.
+
+        The parser gives a local declared inside a top-level initializer closure
+        (``private let rw = (dso: { let count = ... }())``) no parent, so its name
+        would pass for a global. Its line span lies inside another symbol's, which
+        a file-scope declaration's never does.
+        """
+        if data.get("parent_name") or data.get("kind") not in _VALUE_KINDS:
+            return False
+        if _STANDALONE_DIR in f"/{path}":
+            return False
+        start, end = data.get("start_line") or 0, data.get("end_line") or 0
+        return not any(lo <= start and end <= hi and (lo, hi) != (start, end) for lo, hi in spans)
+
     def _read_declarations(self, graph: Any, path: str) -> None:
         extended = self.extends.get(path, set())
+        spans = [
+            (d.get("start_line") or 0, d.get("end_line") or 0)
+            for _s, d in _defined(graph, path)
+            if d.get("kind") != "module" and (d.get("end_line") or 0) > 0
+        ]
         for _symbol, data in _defined(graph, path):
             name = (data.get("name") or "").strip("`")  # ``func `if`()``
             if not name:
@@ -252,7 +276,7 @@ class _SwiftFacts:
                 self.own.setdefault(path, set()).add(name)
             if (data.get("parent_name") or "").rsplit(".", 1)[-1] in extended:
                 self.members.setdefault(path, set()).add(name)
-            if not data.get("parent_name") and data.get("kind") in _VALUE_KINDS:
+            if self._is_top_level_value(data, spans, path):
                 self.func_declares.setdefault(name, set()).add(path)
                 self.func_declared.setdefault(path, set()).add(name)
 
