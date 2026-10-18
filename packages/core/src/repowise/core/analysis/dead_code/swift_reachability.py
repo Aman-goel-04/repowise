@@ -19,7 +19,14 @@ an entry, has an importer, is a test, or was itself reached) does one of:
 * for an extension of a type the repository declares, is the type's file; for
   an extension of a platform type (``extension Color``), uses one of the
   extension's members, by an edge or by ``.member`` / ``member(`` written
-  elsewhere.
+  elsewhere, when no other file declares that member name;
+* writes a top-level function, ``let`` or ``var`` the file declares as a bare
+  identifier: a call ``score(word)`` or a value ``|> submitGameMiddleware``,
+  ``let f = handler``, never ``.name``. Only a name one file declares at top
+  level counts (a method of the same name does not), and never a common
+  function name such as ``print`` or ``map``;
+* declares a custom operator (``infix operator |>``, ``func |> <A, B>(...)``)
+  that a live file writes. The standard library's operators never count.
 
 Uses are counted from live files only and the answer is a fixpoint, so two dead
 files that name each other stay dead. Comments and string literals are
@@ -47,6 +54,8 @@ SWIFT_SUFFIX = ".swift"
 #: as ``class``, a ``protocol`` as ``interface``, an ``extension`` as ``impl``.
 _TYPE_KINDS: frozenset[str] = frozenset({"class", "interface"})
 _EXTENSION_KIND = "impl"
+#: A top-level ``func`` is emitted as ``function``, a ``let`` / ``var`` as ``variable``.
+_VALUE_KINDS: frozenset[str] = frozenset({"function", "variable"})
 
 _NAME = r"[^\W\d]\w*"
 #: A name in a type position: the last component of an optionally qualified
@@ -54,8 +63,50 @@ _NAME = r"[^\W\d]\w*"
 _TYPE_USE = re.compile(
     rf"(?:[:<\[(,]|->|\bas[?!]?|\bis)\s*(?:{_NAME}\s*\.\s*)*({_NAME})|\b({_NAME})\s*[(.]"
 )
+
 #: A member written as ``.member`` or called as ``member(``, not declared by ``func``/``subscript``.
 _MEMBER_USE = re.compile(rf"\.\s*({_NAME})|(?<!\bfunc\s)\b(?!subscript\b)({_NAME})\s*\(")
+
+#: A bare identifier, never ``.name``: called (``name(``), or a value after an
+#: opening token, a separator, an operator run (``|>``, ``>=>``, ``=``) or
+#: ``return`` / ``in`` (``|> submitGameMiddleware``). A ``name:`` argument
+#: label is not a value.
+_FUNC_USE = re.compile(
+    rf"(?<![\w.`])({_NAME})\s*\("
+    rf"|(?:[,(:\[{{]|[-+*/%<>=!&|^~?]+|\breturn\b|\bin\b)\s*(?!(?:return|in)\b)({_NAME})\b(?!\s*:)"
+)
+_OP_CHARS = r"/=\-+!*%<>&|^~?."
+_OP_TOKEN = rf"[{_OP_CHARS}]+"
+#: ``infix|prefix|postfix operator X`` and ``func X`` where X is an operator.
+_OP_DECL = re.compile(rf"\boperator\s+({_OP_TOKEN})|\bfunc\s+({_OP_TOKEN})(?=\s*[<(])")
+#: A run of operator characters, read as one token.
+_OP_USE = re.compile(rf"[{_OP_CHARS.replace('.', '')}]+")
+_OP_DECL_BEFORE = re.compile(r"\b(?:func|operator)\s*$")
+
+#: Function names too common to say which declaration a text use means.
+_SWIFT_COMMON_FUNCS: frozenset[str] = frozenset(
+    {
+        "print", "debugPrint", "dump", "map", "flatMap", "compactMap", "filter",
+        "reduce", "forEach", "sorted", "sort", "min", "max", "abs", "zip",
+        "stride", "swap", "assert", "assertionFailure", "precondition",
+        "preconditionFailure", "fatalError", "type", "withAnimation",
+        "withTaskGroup", "withCheckedContinuation", "withUnsafePointer",
+        "main", "body", "init", "deinit", "self", "super", "if", "else",
+        "for", "while", "switch", "case", "guard", "return", "in", "is", "as",
+        "let", "var", "func", "try", "catch", "throw", "await", "some", "any",
+    }
+)  # fmt: skip
+
+#: The standard library's operators, and tokens that are syntax: a repository
+#: overload of one of these says nothing about which file a use means.
+_SWIFT_COMMON_OPS: frozenset[str] = frozenset(
+    {
+        "=", "->", "?", "!", "+", "-", "*", "/", "%", "==", "!=", "<", ">",
+        "<=", ">=", "&&", "||", "??", "&", "|", "^", "~", "<<", ">>", "+=",
+        "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "===", "!==",
+        "~=", "...", "..<", "&+", "&-", "&*", "<-", "=>", "?.", "!.",
+    }
+)  # fmt: skip
 
 
 def _line_comment_end(text: str, i: int) -> int:
@@ -168,6 +219,11 @@ class _SwiftFacts:
         self.own: dict[str, set[str]] = {}  # file -> names it declares or extends
         self.type_users: dict[str, set[str]] = {}  # name -> files writing it as a type
         self.member_users: dict[str, set[str]] = {}  # name -> files writing it as a member
+        self.func_declares: dict[str, set[str]] = {}  # top-level func/let/var name -> files
+        self.func_declared: dict[str, set[str]] = {}  # file -> its top-level func/let/var names
+        self.func_users: dict[str, set[str]] = {}  # name -> files writing it as a bare identifier
+        self.op_declared: dict[str, set[str]] = {}  # file -> custom operator tokens it declares
+        self.op_users: dict[str, set[str]] = {}  # operator token -> files writing it
         for path in files:
             self._read_extensions(graph, path)
             self._read_declarations(graph, path)
@@ -196,6 +252,9 @@ class _SwiftFacts:
                 self.own.setdefault(path, set()).add(name)
             if (data.get("parent_name") or "").rsplit(".", 1)[-1] in extended:
                 self.members.setdefault(path, set()).add(name)
+            if not data.get("parent_name") and data.get("kind") in _VALUE_KINDS:
+                self.func_declares.setdefault(name, set()).add(path)
+                self.func_declared.setdefault(path, set()).add(name)
 
     def _read_uses(self, path: str, blob: bytes) -> None:
         text = strip_comments_and_strings(blob.decode("utf-8", "ignore"))
@@ -203,6 +262,23 @@ class _SwiftFacts:
             self.type_users.setdefault(name, set()).add(path)
         for name in _names(_MEMBER_USE, text):
             self.member_users.setdefault(name, set()).add(path)
+        for name in _names(_FUNC_USE, text):
+            self.func_users.setdefault(name, set()).add(path)
+        self._read_operators(path, text)
+
+    def _read_operators(self, path: str, text: str) -> None:
+        """Operators *path* declares, and operators it writes (not declares)."""
+        for match in _OP_DECL.finditer(text):
+            token = match.group(1) or match.group(2)
+            if token not in _SWIFT_COMMON_OPS:
+                self.op_declared.setdefault(path, set()).add(token)
+        for match in _OP_USE.finditer(text):
+            token = match.group()
+            if token in _SWIFT_COMMON_OPS:
+                continue
+            if _OP_DECL_BEFORE.search(text[max(0, match.start() - 16) : match.start()]):
+                continue
+            self.op_users.setdefault(token, set()).add(path)
 
 
 class _Reach:
@@ -219,7 +295,13 @@ class _Reach:
         while changed:
             changed = False
             for path in sorted(self.candidates - self.reached):
-                if self._used(path) or self._named(path) or self._extends_live(path):
+                if (
+                    self._used(path)
+                    or self._named(path)
+                    or self._extends_live(path)
+                    or self._called(path)
+                    or self._operator_used(path)
+                ):
                     self.reached.add(path)
                     changed = True
         return frozenset(self.reached)
@@ -249,6 +331,32 @@ class _Reach:
                     return True
         return False
 
+    def _called(self, path: str) -> bool:
+        """A live file writes a top-level function or value *path* alone declares.
+
+        A function passed as a value (``|> submitGameMiddleware``) lands no
+        ``calls`` edge, and a cross-module free-function call does not always
+        resolve, so the text decides. A method of the same name is not a
+        top-level declaration and does not make the name ambiguous.
+        """
+        facts = self.facts
+        for name in facts.func_declared.get(path, ()):
+            if len(facts.func_declares.get(name, ())) != 1:
+                continue
+            if name in _SWIFT_COMMON_FUNCS or name in _SWIFT_COMMON_TYPES:
+                continue
+            if any(u != path and self._live(u) for u in facts.func_users.get(name, ())):
+                return True
+        return False
+
+    def _operator_used(self, path: str) -> bool:
+        """A live file writes a custom operator *path* declares."""
+        facts = self.facts
+        for token in facts.op_declared.get(path, ()):
+            if any(u != path and self._live(u) for u in facts.op_users.get(token, ())):
+                return True
+        return False
+
     def _extends_live(self, path: str) -> bool:
         """It extends a live in-repo type, or a platform type whose member is used."""
         for name in self.facts.extends.get(path, ()):
@@ -270,7 +378,7 @@ class _Reach:
 
 
 def build_swift_named_files(graph: Any, source_map: Mapping[str, bytes]) -> frozenset[str]:
-    """The Swift files with no importer that a live file uses, names or extends.
+    """The Swift files with no importer that a live file uses, names, calls or extends.
 
     Starts from the files that are live on their own (an entry, an importer, a
     test) and adds a candidate only when a file already live reaches it, until
