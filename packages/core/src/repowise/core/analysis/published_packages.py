@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from repowise.core.fsutils import repo_relative
+
 #: The public-API analyzer's baseline file, beside the project or in a folder
 #: of its own (``.PublicAPI/``).
 API_BASELINE = "PublicAPI.Shipped.txt"
@@ -37,9 +39,8 @@ class BuildFacts:
 
 
 def _relative(path: Path, root: Path) -> str | None:
-    try:
-        rel = path.resolve().relative_to(root.resolve()).as_posix()
-    except (OSError, ValueError):
+    rel = repo_relative(path, root, resolve=True)
+    if rel is None:
         return None
     return "" if rel == "." else rel
 
