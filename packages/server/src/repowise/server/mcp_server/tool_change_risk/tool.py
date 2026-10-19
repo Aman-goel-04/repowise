@@ -179,36 +179,30 @@ async def get_change_risk(
 ) -> dict:
     """Review a commit, ``base..head`` range, or uncommitted work.
 
-    Leads with ``directive`` (what to do) and ``health_delta`` (what this
-    change newly made worse). Findings are reported only when the diff explains
-    them, name their ``attribution`` basis, and sort change-written above
-    pre-existing.
+    Leads with ``directive`` and ``health_delta``. Findings are reported only
+    when explained by the diff, include their ``attribution`` basis, and sort
+    change-written above pre-existing.
 
     ``directive.status`` is the verdict; ``partial`` health means code files
-    were skipped. ``risk_percentile`` and ``diff_shape`` measure diff size
-    only, not danger.
-
-    ``impacted_tests`` is the ``impacted-tests`` selection; read ``status``.
-    ``patch_coverage`` is the share of changed executable lines stored coverage
-    ran; ``hints`` name tests to extend. ``fix_history`` is the changed files'
-    bug-fix record, ``overlap`` the past fixes on these exact lines,
-    ``branch_overlap`` other branches editing them. An empty diff returns
-    ``status: "nothing_to_score"``.
+    were skipped. ``risk_percentile`` and ``diff_shape`` measure diff size,
+    not danger. Read ``impacted_tests.status`` for test selection.
+    ``patch_coverage`` measures changed executable lines covered by stored
+    runs; ``hints`` suggest tests to extend. ``fix_history`` records bug fixes,
+    ``overlap`` past fixes on these lines, and ``branch_overlap`` other
+    branches editing them. An empty diff returns ``nothing_to_score``.
 
     Args:
-        revspec: Commit or range. ``base...head`` is the branch's own change
-            (from the merge-base); ``base..head`` is read that way when ``base``
-            has moved past the fork point (``scored_repo.range_note`` says so).
-            Omit to review uncommitted work, or ``HEAD`` when the tree is clean.
-        repo: Repository alias in workspace mode; omit for the default.
+        revspec: Commit or range. ``base...head`` uses the merge-base;
+            ``base..head`` may be interpreted as the branch's own change
+            when the base moved past the fork point.
+        repo: Workspace repository alias; omit for the default.
         extensions: File suffixes to count, e.g. ``[".py", ".ts"]``.
         exclude_patterns: Gitignore-style paths to omit, e.g. ``["tests/"]``.
-        include_paths: Gitignore-style paths to keep, as a list or one
-            comma-separated string, e.g. ``"src/api/,src/db/"``. Omit for all.
+        include_paths: Paths to keep, as a list or comma-separated string.
         baseline: Recent commits sampled for percentile ranking; 0 disables it.
-        include: ``"findings"``, ``"diagnostics"`` (raw mechanics),
-            ``"scales"``, ``"evidence"`` or ``"tests"`` (why each runs).
-        finding_id: Expand one ``health_delta`` finding by its id.
+        include: Optional blocks: ``findings``, ``diagnostics``, ``scales``,
+            ``evidence``, or ``tests``.
+        finding_id: ID of a ``health_delta`` finding to expand.
     """
     if repo == "all":
         return _unsupported_repo_all("get_change_risk")
