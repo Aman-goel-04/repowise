@@ -5,7 +5,6 @@ from __future__ import annotations
 import posixpath
 
 from ..languages.go_interface_satisfaction import go_embedded_interfaces
-
 from ..models import Symbol
 from ..return_types import declared_return_type, go_first_result
 from ..type_names import bare_type_name
