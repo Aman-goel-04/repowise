@@ -19,6 +19,7 @@ import subprocess
 import threading
 from collections import OrderedDict
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from repowise.core.analysis import git_cli
@@ -40,9 +41,16 @@ _PERSON_TRAILER_RE = re.compile(
 _TEXTS: OrderedDict[tuple[str, str, bool], tuple[str, tuple[str, ...]]] = OrderedDict()
 _TEXTS_MAX = 8192
 _TEXTS_LOCK = threading.Lock()
-#: Keys one call is reading right now. A second call that misses the same key
-#: waits on the event instead of repeating the ``git log`` reads.
-_INFLIGHT: dict[tuple[str, str, bool], threading.Event] = {}
+
+
+#: Results in flight are retained for waiters even if the LRU evicts them.
+@dataclass
+class _InFlightRead:
+    event: threading.Event = field(default_factory=threading.Event)
+    result: tuple[str, tuple[str, ...]] | None = None
+
+
+_INFLIGHT: dict[tuple[str, str, bool], _InFlightRead] = {}
 _WAIT_TIMEOUT_SECONDS = 120.0
 
 
@@ -93,7 +101,7 @@ def read_change_texts(
     keys = {s: (str(repo), s, n <= MAX_DIFF_FILES) for s, n in sizes.items()}
     out: dict[str, tuple[str, tuple[str, ...]]] = {}
     claimed: list[tuple[str, int]] = []
-    waits: dict[str, threading.Event] = {}
+    waits: dict[str, _InFlightRead] = {}
     with _TEXTS_LOCK:
         for sha, key in keys.items():
             if (hit := _TEXTS.get(key)) is not None:
@@ -102,7 +110,7 @@ def read_change_texts(
             elif (inflight := _INFLIGHT.get(key)) is not None:
                 waits[sha] = inflight
             else:
-                _INFLIGHT[key] = threading.Event()
+                _INFLIGHT[key] = _InFlightRead()
                 claimed.append((sha, sizes[sha]))
     if claimed:
         # Every claimed key is released even when the read raises, so a
@@ -113,22 +121,20 @@ def read_change_texts(
         finally:
             _release(keys, [s for s, _ in claimed], read)
         out.update(read)
-    # Another call is already reading these; take its result from the cache.
-    # A sha still missing afterwards was unreadable, as it would be here.
-    # A wait that times out reads the sha directly rather than hang.
+    # Waiters retain the in-flight state, so cache eviction cannot
+    # discard their results. A timeout falls back to a direct read.
     stale: list[tuple[str, int]] = []
-    for sha, event in waits.items():
-        if not event.wait(timeout=_WAIT_TIMEOUT_SECONDS):
+    for sha, inflight in waits.items():
+        if not inflight.event.wait(timeout=_WAIT_TIMEOUT_SECONDS):
             stale.append((sha, sizes[sha]))
-    with _TEXTS_LOCK:
-        for sha in waits:
-            if (hit := _TEXTS.get(keys[sha])) is not None:
-                _TEXTS.move_to_end(keys[sha])
-                out[sha] = hit
+        elif inflight.result is not None:
+            out[sha] = inflight.result
+
     if stale:
         late = _read_change_texts(repo, [(s, n) for s, n in stale if s not in out])
         _store(keys, late)
         out.update(late)
+
     return out
 
 
@@ -149,17 +155,25 @@ def _release(
     shas: list[str],
     texts: dict[str, tuple[str, tuple[str, ...]]],
 ) -> None:
-    """Cache what was read, then wake every call waiting on *shas*."""
+    """Cache results and wake waiters with their completed values."""
     with _TEXTS_LOCK:
+        events = []
         for sha in shas:
+            key = keys[sha]
+            inflight = _INFLIGHT.pop(key, None)
+
+            if inflight is not None:
+                inflight.result = texts.get(sha)
+                events.append(inflight.event)
+
             if sha in texts:
-                _TEXTS[keys[sha]] = texts[sha]
+                _TEXTS[key] = texts[sha]
+
         while len(_TEXTS) > _TEXTS_MAX:
             _TEXTS.popitem(last=False)
-        events = [_INFLIGHT.pop(keys[sha], None) for sha in shas]
+
     for event in events:
-        if event is not None:
-            event.set()
+        event.set()
 
 
 def _read_change_texts(
