@@ -90,7 +90,7 @@ export function extractSources(
           confidence:
             (r.confidence_score as number | undefined) ??
             (typeof r.relevance_score === "number" && topRelevance > 0
-              ? Math.round((r.relevance_score / topRelevance) * 100) / 100
+              ? Number((r.relevance_score / topRelevance).toFixed(2))
               : undefined),
           toolName: tc.name,
         });

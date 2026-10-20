@@ -256,6 +256,20 @@ describe("extractSources", () => {
     expect(sources).toHaveLength(1);
     expect(sources[0]?.targetPath).toBe("packages/server/src/chat.py");
   });
+
+  it("matches Python rounding when rebuilding confidence", () => {
+    const sources = extractSources(
+      [
+        searchCall([
+          { page_id: "file_page:a.py", title: "a.py", relevance_score: 1 },
+          { page_id: "file_page:b.py", title: "b.py", relevance_score: 0.845 },
+        ]),
+      ],
+      "repo1",
+    );
+
+    expect(sources.map((s) => s.confidence)).toEqual([1, 0.84]);
+  });
 });
 
 describe("SourceCitations render", () => {
