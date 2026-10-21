@@ -488,3 +488,60 @@ def test_declaring_a_method_does_not_rescue_a_top_level_function_of_that_name() 
         "Lib/Helper.swift": b"func helper() {}\n",
     }
     assert "Lib/Helper.swift" not in _top_level_graph(decls, sources)
+
+
+def test_a_dead_let_with_a_common_value_name_is_not_rescued_by_a_local_of_that_name() -> None:
+    decls = {
+        _ROOT: [("Main", "class", None)],
+        "Lib/Config.swift": [("config", "variable", None)],
+        "Lib/Result.swift": [("result", "variable", None)],
+        "Lib/Shared.swift": [("shared", "variable", None)],
+    }
+    sources = {
+        _ROOT: (
+            b"struct Main {\n  func run() -> Int {\n    let config = 1\n"
+            b"    let result = config\n    return result + shared\n  }\n}\n"
+        ),
+        "Lib/Config.swift": b"let config = Config()\n",
+        "Lib/Result.swift": b"let result = 0\n",
+        "Lib/Shared.swift": b"let shared = Store()\n",
+    }
+    assert not _top_level_graph(decls, sources), _top_level_graph(decls, sources)
+
+
+def test_a_common_value_name_still_rescues_a_func_and_an_uncommon_let_still_rescues() -> None:
+    decls = {
+        _ROOT: [("Main", "class", None)],
+        "Lib/Config.swift": [("config", "function", None)],
+        "Lib/Gate.swift": [("submitGateFlag", "variable", None)],
+    }
+    sources = {
+        _ROOT: b"struct Main {\n  let a = config()\n  let b = submitGateFlag\n}\n",
+        "Lib/Config.swift": b"func config() -> Int { 1 }\n",
+        "Lib/Gate.swift": b"let submitGateFlag = true\n",
+    }
+    assert _top_level_graph(decls, sources) == {"Lib/Config.swift", "Lib/Gate.swift"}
+
+
+def test_real_source_dead_let_config_stays_unreachable(tmp_path: Path, monkeypatch) -> None:
+    from repowise.core.analysis.dead_code import swift_reachability as swift_mod
+
+    dead_path = "Sources/SiteMiddleware/Settings.swift"
+    dead = Path(dead_path).name
+    files = dict(_POINT_FREE)
+    files[dead_path] = "let config = Config()\n"
+    files["Sources/SiteMiddleware/Api.swift"] = (
+        "public func apiMiddleware(_ words: [String]) -> Int {\n"
+        "  let config = words.count\n"
+        "  return config\n"
+        "}\n"
+    )
+    # Control: without the guard, the live file's local ``config`` rescues the dead
+    # ``let config`` file. If this fails the fixture no longer reproduces the bug.
+    with monkeypatch.context() as patch:
+        patch.setattr(swift_mod, "_SWIFT_COMMON_VALUE_NAMES", frozenset())
+        control = _analyze(tmp_path / "control", files, _POINT_FREE_ENTRY)
+    assert dead not in _unreachable(control), _unreachable(control)
+    # With the guard, the dead file stays unreachable.
+    report = _analyze(tmp_path / "guarded", files, _POINT_FREE_ENTRY)
+    assert dead in _unreachable(report), _unreachable(report)
