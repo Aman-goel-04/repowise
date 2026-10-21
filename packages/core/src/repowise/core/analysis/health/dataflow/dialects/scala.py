@@ -39,9 +39,18 @@ Ceilings, each of which can only make a plan *less* likely, never wrong:
   so every call in a function that has one counts as a use of each: a span
   with a call carries them as parameters. Implicits that come from the
   enclosing class or an import stay in scope for a sibling helper.
-* Not modelled (needs a hook in shared code, see the PR description): a
-  ``breakable { ... break() }`` call, a ``return`` inside a lambda, and a
-  ``Future`` / ``Await`` call are ordinary calls to the CFG.
+* A ``return`` inside a lambda (``xs.foreach(x => return x)``) leaves the
+  enclosing ``def``. ``LanguageNodeMap.lambda_exit_kinds`` names it, so the
+  slicer counts it as a jump and refuses a span holding one; a ``return`` in a
+  ``def`` nested in that lambda is that ``def``'s own and does not count.
+
+Out of scope, because each is an ordinary call to the CFG with no node kind of
+its own to hook on (a span holding one can still be offered):
+
+* ``breakable { ... break() }``: ``break()`` is a library call that throws, not
+  a keyword, so ``break_kinds`` / ``continue_kinds`` stay empty.
+* ``Future`` / ``Await``: Scala has no ``async`` syntax, so a span that
+  suspends is not marked as needing an async helper.
 """
 
 from __future__ import annotations
