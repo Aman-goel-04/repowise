@@ -105,6 +105,20 @@ _SWIFT_COMMON_FUNCS: frozenset[str] = frozenset(
     }
 )  # fmt: skip
 
+#: Value names too common to say which declaration a text use means: a local
+#: ``config`` or ``result`` in a live file is not a use of a dead file's
+#: top-level ``let config``. Applies to ``let`` / ``var`` only; a ``func`` of
+#: the same name is still reached by a call.
+_SWIFT_COMMON_VALUE_NAMES: frozenset[str] = frozenset(
+    {
+        "config", "configuration", "result", "results", "value", "values",
+        "shared", "data", "error", "item", "items", "name", "state",
+        "context", "options", "response", "request", "index", "count",
+        "key", "url", "path", "text", "output", "input", "instance",
+        "manager", "client", "session", "store", "cache", "logger",
+    }
+)  # fmt: skip
+
 #: The standard library's operators, and tokens that are syntax: a repository
 #: overload of one of these says nothing about which file a use means.
 _SWIFT_COMMON_OPS: frozenset[str] = frozenset(
@@ -389,9 +403,20 @@ class _Reach:
                 continue
             if name in _SWIFT_COMMON_FUNCS or name in _SWIFT_COMMON_TYPES:
                 continue
+            if name in _SWIFT_COMMON_VALUE_NAMES and self._is_value_only(path, name):
+                continue
             if any(u != path and self._live(u) for u in facts.func_users.get(name, ())):
                 return True
         return False
+
+    def _is_value_only(self, path: str, name: str) -> bool:
+        """*path* declares *name* at top level only as a ``let`` / ``var``, never a ``func``."""
+        kinds = {
+            data.get("kind")
+            for _symbol, data in _defined(self.graph, path)
+            if (data.get("name") or "").strip("`") == name and not data.get("parent_name")
+        }
+        return kinds == {"variable"}
 
     def _operator_used(self, path: str) -> bool:
         """A live file writes a custom operator *path* declares."""
