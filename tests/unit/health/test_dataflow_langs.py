@@ -3694,6 +3694,138 @@ def test_scala_span_with_return_or_throw_is_refused():
         assert not e.start_line <= ret_line <= e.end_line
 
 
+_SCALA_LAMBDA_LATE = """
+class Demo {
+  def process(records: List[Int], threshold: Int): Int = {
+    var errors = 0
+    val results = scala.collection.mutable.ListBuffer.empty[Int]
+    for (r <- records) {
+      if (r < 0) { errors += 1 } else { results += r }
+    }
+    var total = 0
+    var count = 0
+    for (v <- results) {
+      if (v > threshold) {
+        total += v
+        count += 1
+      } else {
+        total -= v
+      }
+    }
+    records.foreach { x =>
+      if (x > 99) RETURN
+    }
+    var average = 0
+    if (count > 0) {
+      average = total / count
+    }
+    average + errors
+  }
+}
+"""
+# The same method with the lambda first, so the spans after it stay clear of it.
+_SCALA_LAMBDA_EARLY = """
+class Demo {
+  def process(records: List[Int], threshold: Int): Int = {
+    var errors = 0
+    records.foreach { x =>
+      if (x > 99) RETURN
+    }
+    val results = scala.collection.mutable.ListBuffer.empty[Int]
+    for (r <- records) {
+      if (r < 0) { errors += 1 } else { results += r }
+    }
+    var total = 0
+    var count = 0
+    for (v <- results) {
+      if (v > threshold) {
+        total += v
+        count += 1
+      } else {
+        total -= v
+      }
+    }
+    var average = 0
+    if (count > 0) {
+      average = total / count
+    }
+    average + errors
+  }
+}
+"""
+_SCALA_LAMBDA_BODY = _SCALA_LAMBDA_LATE
+_SCALA_LAMBDA_RETURN = _SCALA_LAMBDA_LATE.replace("RETURN", "return x")
+_SCALA_LAMBDA_LOCAL = _SCALA_LAMBDA_LATE.replace("RETURN", "println(x)")
+
+
+def _scala_span_jump(src: str, needle: str) -> bool:
+    """The span walk's jump bit for the one statement holding *needle*."""
+    from repowise.core.analysis.health.dataflow.slice import _scan_for, _span_metrics
+
+    lmap = get_language_map("scala")
+    fn = _first("scala", src).fn_node
+    stmt = next(
+        n for n in _walk_nodes(fn) if needle in n.text.decode() and n.parent is not None
+        and n.parent.type in lmap.block_kinds
+    )
+    return _span_metrics([stmt], _scan_for(lmap, None, fn)).jump
+
+
+def _walk_nodes(node):
+    yield node
+    for c in node.children:
+        yield from _walk_nodes(c)
+
+
+def _scala_spans(src: str):
+    return find_extractions(_first("scala", src), get_language_map("scala"))
+
+
+def test_scala_lambda_exit_kinds_is_set_for_scala_only():
+    assert get_language_map("scala").lambda_exit_kinds == {"return_expression"}
+    # Every other language keeps a lambda ``return`` local: the default is empty.
+    assert not get_language_map("python").lambda_exit_kinds
+    assert not get_language_map("java").lambda_exit_kinds
+
+
+def test_scala_return_inside_a_lambda_in_the_span_is_a_jump():
+    # ``return x`` in the ``foreach`` lambda leaves ``process``, so a helper
+    # holding it would return from itself instead.
+    assert _scala_span_jump(_SCALA_LAMBDA_RETURN, "records.foreach")
+    assert not _scala_span_jump(_SCALA_LAMBDA_LOCAL, "records.foreach")
+
+
+def test_scala_span_holding_a_lambda_return_is_refused():
+    ret_line = _SCALA_LAMBDA_RETURN.splitlines().index("      if (x > 99) return x") + 1
+    local = [e for e in _scala_spans(_SCALA_LAMBDA_LOCAL) if e.start_line <= ret_line <= e.end_line]
+    assert local, "control: without the return, spans over the lambda are offered"
+    assert not [
+        e for e in _scala_spans(_SCALA_LAMBDA_RETURN) if e.start_line <= ret_line <= e.end_line
+    ]
+
+
+def test_scala_return_in_a_lambda_outside_the_span_is_still_extractable():
+    src = _SCALA_LAMBDA_EARLY.replace("RETURN", "return x")
+    ret_line = src.splitlines().index("      if (x > 99) return x") + 1
+    spans = _scala_spans(src)
+    assert spans, "a span clear of the lambda is still offered"
+    assert not [e for e in spans if e.start_line <= ret_line <= e.end_line]
+
+
+def test_scala_return_in_a_nested_def_inside_the_span_is_not_a_jump():
+    # The ``return`` belongs to the local ``def`` inside the lambda, not to
+    # ``process``: the lambda walk stops at a function boundary.
+    src = _SCALA_LAMBDA_LATE.replace(
+        "      if (x > 99) RETURN\n",
+        "      def local(y: Int): Int = { return y }\n      local(x)\n",
+    )
+    assert "def local" in src and "return y" in src
+    assert not _scala_span_jump(src, "records.foreach")
+    # ...while a ``return`` beside that def, in the lambda itself, still counts.
+    both = src.replace("      local(x)\n", "      if (x > 99) return x\n      local(x)\n")
+    assert _scala_span_jump(both, "records.foreach")
+
+
 def test_scala_extractions_are_deterministic():
     lmap = get_language_map("scala")
     fn = _first("scala", _SCALA_PROCESS)

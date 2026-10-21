@@ -257,6 +257,16 @@ class LanguageNodeMap:
     #     segment. The slicer treats them as jumps for the same reason. A user
     #     macro of the same name that does not exit only hides a span.
     yield_kinds: frozenset[str] = frozenset()
+    #   * ``lambda_exit_kinds`` -- exit kinds that, written inside a lambda,
+    #     leave the *enclosing function*, not the lambda (Scala ``return`` in
+    #     ``xs.foreach(x => return x)`` unwinds the surrounding ``def``). A
+    #     lambda's own jumps are otherwise its own, so without this a span
+    #     holding such a lambda looks liftable and the helper would return from
+    #     itself. The slicer counts a hit as a jump, looking through lambda
+    #     bodies only and stopping at ``function_kinds`` (a ``return`` in a
+    #     nested ``def`` is that def's own). Empty for languages whose lambda
+    #     ``return`` is local to the lambda.
+    lambda_exit_kinds: frozenset[str] = frozenset()
     #   * ``await_kinds`` -- tokens that suspend the function (Python ``await`` /
     #     ``async with`` / ``async for``, TS/JS ``await`` / ``for await``, Rust
     #     ``.await``, C++ ``co_await``). Matched on the anonymous keyword token,
@@ -1094,6 +1104,9 @@ _SCALA = LanguageNodeMap(
     # unwrapping inert. Ceiling: any block whose last statement is not a
     # ``val`` / ``var`` is taken to carry a value (a ``Unit`` loop included).
     statement_wrapper_kinds=frozenset({"expression_statement"}),
+    # A ``return`` inside a lambda is a non-local return: it exits the
+    # enclosing ``def``, so it keeps the span from being lifted.
+    lambda_exit_kinds=frozenset({"return_expression"}),
 )
 
 
