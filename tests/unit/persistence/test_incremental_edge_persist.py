@@ -426,11 +426,13 @@ async def test_a_registration_edge_follows_the_decorated_file(async_session, tmp
     edge = ("reg.py::rule", "b.py::_check", "references")
     assert edge not in await _db_edge_set(async_session, repo.id)
 
-    for text, expected in ((plain.replace("def _check", "@rule\ndef _check"), True), (plain, False)):
+    for text, expected in (
+        (plain.replace("def _check", "@rule\ndef _check"), True),
+        (plain, False),
+    ):
         (tmp_path / "b.py").write_text(text)
         gb, parsed = _build_graph(tmp_path)
         await persist_graph_nodes(async_session, repo.id, gb)
         await persist_incremental_edges(async_session, repo.id, gb, parsed, ["b.py"])
         await async_session.commit()
         assert (edge in await _db_edge_set(async_session, repo.id)) is expected
-

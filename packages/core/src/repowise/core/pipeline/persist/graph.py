@@ -640,7 +640,9 @@ async def _prune_vanished_symbol_nodes(
             )
         )
         await session.execute(
-            delete(GraphNode).where(GraphNode.repository_id == repo_id, GraphNode.node_id.in_(batch))
+            delete(GraphNode).where(
+                GraphNode.repository_id == repo_id, GraphNode.node_id.in_(batch)
+            )
         )
     if stale:
         logger.info("graph_nodes_parser_prune", repo_id=repo_id, nodes=len(stale))
