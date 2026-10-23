@@ -330,23 +330,35 @@ def is_ancestor(repo_path: str, older: str, newer: str) -> bool | None:
 def branch_change_range(repo_path: str, revspec: str) -> tuple[str, str | None]:
     """``(revspec to read, note)``: a two-dot range read as the branch's own change.
 
-    ``git diff A..B`` compares the two tips, so once *A* has moved past the point *B*
-    forked from, everything *A* gained reads as reverted by *B*. For ``A..B`` where *A*
-    is not an ancestor of *B* this returns ``A...B`` (the diff from the merge-base) and
-    a note saying so. Everything else comes back unchanged with no note: a range whose
-    base is an ancestor (both meanings agree), ``A...B``, a single commit, and any case
-    git cannot answer (unknown ref, shallow clone, unrelated histories), so the existing
-    error paths still fire.
+    Rewrite ``A..B`` to ``A...B`` only when Git can establish that the
+    repository has complete history and ``A`` is not an ancestor of ``B``.
+    Preserve the original range for shallow clones or when Git cannot answer.
     """
     parts = split_revspec(revspec)
     if parts is None or parts[1] != "..":
         return revspec, None
+
     base, _, head = parts
+
+    try:
+        shallow = _read(repo_path, ["rev-parse", "--is-shallow-repository"])
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return revspec, None
+
+    if shallow.strip() != "false":
+        return revspec, None
+
     if is_ancestor(repo_path, base, head) is not False:
         return revspec, None
-    fork = _read(repo_path, ["merge-base", base, head])
+
+    try:
+        fork = _read(repo_path, ["merge-base", base, head])
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return revspec, None
+
     if not fork:
         return revspec, None
+
     note = (
         f"{base!r} has moved past the point {head!r} forked from ({fork[:12]}), so "
         f"{revspec!r} was read as {base}...{head}: the branch's own change, not a "

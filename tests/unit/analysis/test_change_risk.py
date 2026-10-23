@@ -784,3 +784,71 @@ def test_the_branchs_own_change_is_scored_once_main_moved(diverged_repo: Path) -
     features = score_live_change(str(diverged_repo), spec, baseline=0).features
     assert features.nf == 1
     assert [p for p, _ in features.file_churn] == ["feature.py"]
+
+
+def test_branch_change_range_preserves_two_dot_range_in_shallow_repo(
+    tmp_path: Path,
+) -> None:
+    import subprocess
+
+    from repowise.core.git_refs import branch_change_range
+
+    source = tmp_path / "source"
+    shallow = tmp_path / "shallow"
+    source.mkdir()
+
+    def git(cwd: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git(source, "init", "-q", "-b", "main")
+    git(source, "config", "user.email", "test@example.com")
+    git(source, "config", "user.name", "test")
+
+    (source / "base.txt").write_text("base\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "base")
+
+    git(source, "switch", "-qc", "feature")
+    (source / "feature.txt").write_text("feature\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "feature")
+
+    git(source, "switch", "-q", "main")
+    (source / "main.txt").write_text("main change\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "main moves")
+
+    git(
+        tmp_path,
+        "clone",
+        "-q",
+        "--depth=1",
+        "--no-local",
+        "--branch",
+        "feature",
+        str(source),
+        str(shallow),
+    )
+
+    git(shallow, "fetch", "-q", "--depth=1", "origin", "main:refs/heads/main")
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"],
+            cwd=shallow,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "true"
+    )
+
+    assert (
+        branch_change_range(str(shallow), "main..feature")
+        == ("main..feature", None)
+    )
