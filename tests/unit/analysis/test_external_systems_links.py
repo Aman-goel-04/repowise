@@ -282,3 +282,65 @@ def test_the_sql_link_map_resolves_the_same_nodes_as_the_plain_record_path() -> 
     }
 
     assert sql_linked == plain_linked
+
+
+# --- JVM package -> group:artifact ------------------------------------------
+
+
+def test_java_import_resolves_to_the_declared_maven_coordinate() -> None:
+    declarations = [
+        _Declaration("com.google.guava:guava", ecosystem="maven", declared_in="pom.xml")
+    ]
+    nodes = [_Node("external:com.google.common.collect"), _Node("external:com.google.common")]
+
+    assert _links(declarations, nodes) == [
+        ("external:com.google.common.collect", "maven", "com.google.guava:guava"),
+        ("external:com.google.common", "maven", "com.google.guava:guava"),
+    ]
+
+
+def test_longest_package_prefix_wins() -> None:
+    declarations = [
+        _Declaration("junit:junit", ecosystem="maven", declared_in="pom.xml"),
+        _Declaration(
+            "org.junit.jupiter:junit-jupiter-api", ecosystem="maven", declared_in="pom.xml"
+        ),
+    ]
+    nodes = [_Node("external:org.junit.Test"), _Node("external:org.junit.jupiter.api.Test")]
+
+    assert _links(declarations, nodes) == [
+        ("external:org.junit.Test", "maven", "junit:junit"),
+        ("external:org.junit.jupiter.api.Test", "maven", "org.junit.jupiter:junit-jupiter-api"),
+    ]
+
+
+def test_prefix_match_is_on_whole_segments() -> None:
+    declarations = [_Declaration("junit:junit", ecosystem="maven", declared_in="pom.xml")]
+
+    assert _links(declarations, [_Node("external:org.junitx.Foo")]) == []
+
+
+def test_unknown_java_import_stays_unlinked() -> None:
+    declarations = [
+        _Declaration("com.google.guava:guava", ecosystem="maven", declared_in="pom.xml")
+    ]
+
+    assert _links(declarations, [_Node("external:com.acme.internal.Widget")]) == []
+
+
+def test_known_import_without_a_declaration_stays_unlinked() -> None:
+    # No groupId-prefix guessing: the table only offers a name the manifest declares.
+    declarations = [
+        _Declaration("com.google.other:thing", ecosystem="maven", declared_in="pom.xml")
+    ]
+
+    assert _links(declarations, [_Node("external:com.google.common.collect")]) == []
+
+
+def test_jvm_candidates_do_not_disturb_other_ecosystems() -> None:
+    assert declaration_name_candidates("requests.adapters") == ("requests.adapters", "requests")
+    declarations = [_Declaration("requests", ecosystem="pypi", declared_in="requirements.txt")]
+
+    assert _links(declarations, [_Node("external:requests.adapters")]) == [
+        ("external:requests.adapters", "pypi", "requests")
+    ]
