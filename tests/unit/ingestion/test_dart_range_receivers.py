@@ -423,3 +423,32 @@ class TestCallbackResolution:
     def test_the_loop_variable_after_it_is_unaffected(self, tmp_path: Path) -> None:
         body = "repos.forEach((p) => p.close());\nfor (final p in repos) {\n  p.close();\n}"
         assert CLOSE in _callees(tmp_path, body)
+
+
+class TestChainedCallbackHead:
+    """``p.items.save()`` inside ``(p) => ...`` heads the chain with the closure's ``p``."""
+
+    _CLASSES = (
+        "class Item {\n  void save() {}\n}\n"
+        "class Box {\n  void save() {}\n}\n"
+        "class Holder {\n  final Item items = Item();\n}\n"
+        "class Shelf {\n  final Box items = Box();\n}\n"
+    )
+
+    def test_an_outer_local_of_the_name_does_not_head_the_chain(self, tmp_path: Path) -> None:
+        app = (
+            "import 'repo.dart';\nclass App {\n  void run(Shelf p, List<Holder> hs) {\n"
+            "    hs.forEach((p) => p.items.save());\n  }\n}\n"
+        )
+        callees = _callees_of(tmp_path, app, self._CLASSES)
+        assert "repo.dart::Box::save" not in callees
+        assert "repo.dart::Item::save" in callees
+
+    def test_an_outer_field_of_the_name_does_not_head_the_chain(self, tmp_path: Path) -> None:
+        app = (
+            "import 'repo.dart';\nclass App {\n  final Shelf p = Shelf();\n"
+            "  void run(List<Holder> hs) {\n    hs.forEach((p) => p.items.save());\n  }\n}\n"
+        )
+        callees = _callees_of(tmp_path, app, self._CLASSES)
+        assert "repo.dart::Box::save" not in callees
+        assert "repo.dart::Item::save" in callees

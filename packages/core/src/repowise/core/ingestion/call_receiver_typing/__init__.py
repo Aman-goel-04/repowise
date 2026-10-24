@@ -761,7 +761,7 @@ class ReceiverTypingMixin(
         head, *fields = (call.receiver_name or "").split(".")
         if len(fields) > _MAX_CHAIN_FIELDS or not all(fields):
             return None
-        found = self._chain_head(file_path, caller_id, language, head)
+        found = self._chain_head(file_path, caller_id, language, head, call.line)
         for field in fields:
             if found is None:
                 return None
@@ -778,9 +778,9 @@ class ReceiverTypingMixin(
         return ResolvedCall(caller_id, sym_id, 0.88, call.line, "receiver_chain_import")
 
     def _chain_head(
-        self, file_path: str, caller_id: str, language: str, head: str
+        self, file_path: str, caller_id: str, language: str, head: str, line: int
     ) -> tuple[str, str, str] | None:
-        """``(file, class id, tier)`` for a chain's head name."""
+        """``(file, class id, tier)`` for a chain's head name, as bound on *line*."""
         if head == _CHAIN_SELF[language]:
             class_id = self._caller_class_id(caller_id)
             symbol = self._symbols_by_id.get(class_id)
@@ -788,7 +788,7 @@ class ReceiverTypingMixin(
                 return None
             return file_path, class_id, "same_file"
         type_name, _, typing_file = self._receiver_type_and_scope(
-            file_path, caller_id, language, head
+            file_path, caller_id, language, head, line
         )
         if type_name is not None and language == "python" and "::" in type_name:
             return self._located(file_path, type_name)  # typed from a call
