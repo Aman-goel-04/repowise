@@ -37,6 +37,7 @@ from .call_barrel_forwarding import (  # noqa: F401
     _flattened_wildcard_source,
     _renames_on_the_way,
 )
+from .call_cobol import CobolCallsMixin
 from .call_inheritance import (  # noqa: F401
     _EXTERNAL_PREFIX,
     _MAX_ANCESTOR_EXPAND_DEPTH,
@@ -120,6 +121,13 @@ log = structlog.get_logger(__name__)
 # the caller's instance. Go, Python, PHP and JS/TS spell the receiver out, so a
 # bare call there is a free function and this tier would resolve it wrongly.
 _IMPLICIT_RECEIVER_LANGUAGES = frozenset({"java", "csharp", "cpp", "kotlin", "apex"})
+
+# JS/TS (and the single-file components parsed as TypeScript): a member is only
+# reachable as ``this.foo()`` or ``obj.foo()``, so a bare ``foo()`` inside a
+# class method never means a member of that class, whatever the file declares.
+_BARE_CALL_SKIPS_MEMBERS_LANGUAGES = frozenset(
+    {"javascript", "typescript", "svelte", "vue", "astro"}
+)
 
 # Languages where a call the caller's own class cannot answer is looked for on
 # its ancestors, for an explicit ``self``/``this`` receiver and an implicit one.
@@ -279,6 +287,7 @@ def _same_translation_unit(decl_file: str, def_file: str) -> bool:
 
 
 class CallResolver(
+    CobolCallsMixin,
     LanguageStrategiesMixin,
     ReceiverTypingMixin,
     OverloadSelectionMixin,
@@ -378,6 +387,7 @@ class CallResolver(
         self._known_type_names = frozenset(
             symbol.name for symbol in self._symbols_by_id.values() if symbol.kind in _TYPE_KINDS
         )
+        self._folded_types: frozenset[str] | None = None
         # Narrowed to C# for the extension index: the set above is a bare
         # cross-language name match, so a type of that name in any language
         # would admit an extension on the BCL type it shadows.
@@ -871,6 +881,8 @@ class CallResolver(
         assert caller_id is not None
 
         language = self._language_of(file_path) or ""
+        if language == "cobol":
+            return self._resolve_cobol_call(file_path, call, caller_id)
         receiver_call = call.receiver_call
         if _is_super_call(call, language):
             return self._with_props(self._super_call(call, caller_id), call)
@@ -1489,7 +1501,15 @@ class CallResolver(
         own = self._enclosing_class_method(file_path, call, caller_id)
         if self._is_anonymous_id(own):
             return True, _own_member_call(caller_id, own, call)
-        callee_id = self._file_symbols.get(file_path, {}).get(call.target_name)
+        # ``_file_symbols`` is flat and holds class members, but a JS/TS bare
+        # call can only name a top-level binding: a same-named method must not
+        # shadow an import (or hide a top-level function declared before it).
+        table = (
+            self._file_top_level
+            if self._language_of(file_path) in _BARE_CALL_SKIPS_MEMBERS_LANGUAGES
+            else self._file_symbols
+        )
+        callee_id = table.get(file_path, {}).get(call.target_name)
         if callee_id is None:
             return False, None
         if own is not None and own != callee_id and _rivals_a_class_method(callee_id):
@@ -1962,6 +1982,9 @@ class CallResolver(
         if key in merged_methods:
             return merged_methods[key], "import"
 
+        # An Apex type is one its project reaches (a strategy answers that), never repo-wide.
+        if self._language_of(file_path) == "apex":
+            return None
         return self._repo_wide_method(key, spelled or key[0])
 
     def _repo_wide_method(self, key: tuple[str, str], spelled: str) -> tuple[str, str] | None:

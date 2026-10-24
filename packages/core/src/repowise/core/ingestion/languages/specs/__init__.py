@@ -15,11 +15,13 @@ from .apex import SPEC as _APEX
 from .asciidoc import SPEC as _ASCIIDOC
 from .astro import SPEC as _ASTRO
 from .aura import SPEC as _AURA
+from .bms import SPEC as _BMS
 from .c import SPEC as _C
 from .clojure import SPEC as _CLOJURE
 from .cobol import SPEC as _COBOL
 from .cpp import SPEC as _CPP
 from .crystal import SPEC as _CRYSTAL
+from .csd import SPEC as _CSD
 from .csharp import SPEC as _CSHARP
 from .dart import SPEC as _DART
 from .dlang import SPEC as _DLANG
@@ -36,6 +38,7 @@ from .haskell import SPEC as _HASKELL
 from .html import SPEC as _HTML
 from .java import SPEC as _JAVA
 from .javascript import SPEC as _JAVASCRIPT
+from .jcl import SPEC as _JCL
 from .json import SPEC as _JSON
 from .julia import SPEC as _JULIA
 from .kotlin import SPEC as _KOTLIN
@@ -56,8 +59,11 @@ from .r import SPEC as _R
 from .razor import SPEC as _RAZOR
 from .ruby import SPEC as _RUBY
 from .rust import SPEC as _RUST
+from .salesforce_flow import SPEC as _SALESFORCE_FLOW
+from .salesforce_object import SPEC as _SALESFORCE_OBJECT
 from .scala import SPEC as _SCALA
 from .shell import SPEC as _SHELL
+from .soql import SPEC as _SOQL
 from .sql import SPEC as _SQL
 from .svelte import SPEC as _SVELTE
 from .swift import SPEC as _SWIFT
@@ -150,6 +156,16 @@ ALL_SPECS: tuple[LanguageSpec, ...] = (
     # Salesforce Aura markup, routed by path (aura/<bundle>/). Edges come from
     # framework_edges/aura.py. See the spec's docstring.
     _AURA,
+    # Salesforce flows. See the spec's docstring.
+    _SALESFORCE_FLOW,
+    # Salesforce object/field metadata and saved SOQL queries.
+    _SALESFORCE_OBJECT,
+    _SOQL,
+    # Mainframe job control, CICS screen maps and CSD definitions; edges from
+    # framework_edges/mainframe.py.
+    _JCL,
+    _BMS,
+    _CSD,
     # -----------------------------------------------------------------
     # Extra languages — git blame coverage only (passthrough + is_code)
     # These exist so git_indexer tracks their history even though
