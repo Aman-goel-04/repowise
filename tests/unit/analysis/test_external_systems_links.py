@@ -276,9 +276,7 @@ def test_the_sql_link_map_resolves_the_same_nodes_as_the_plain_record_path() -> 
     }
     plain_linked = {
         link.node_id
-        for link in build_declaration_links(
-            systems, [{"node_id": node_id} for node_id in node_ids]
-        )
+        for link in build_declaration_links(systems, [{"node_id": node_id} for node_id in node_ids])
     }
 
     assert sql_linked == plain_linked
@@ -343,4 +341,48 @@ def test_jvm_candidates_do_not_disturb_other_ecosystems() -> None:
 
     assert _links(declarations, [_Node("external:requests.adapters")]) == [
         ("external:requests.adapters", "pypi", "requests")
+    ]
+
+
+def test_guava_subpackages_shipped_in_other_artifacts_are_not_linked_to_guava() -> None:
+    declarations = [
+        _Declaration("com.google.guava:guava", ecosystem="maven", declared_in="pom.xml"),
+        _Declaration("com.google.guava:guava-testlib", ecosystem="maven", declared_in="pom.xml"),
+        _Declaration("com.google.truth:truth", ecosystem="maven", declared_in="pom.xml"),
+    ]
+    nodes = [
+        _Node("external:com.google.common.base.Splitter"),
+        _Node("external:com.google.common.truth.Truth.assertThat"),
+        _Node("external:com.google.common.testing.EqualsTester"),
+        _Node("external:com.google.common.collect.testing.features.Feature"),
+    ]
+
+    assert _links(declarations, nodes) == [
+        ("external:com.google.common.base.Splitter", "maven", "com.google.guava:guava"),
+        ("external:com.google.common.truth.Truth.assertThat", "maven", "com.google.truth:truth"),
+        (
+            "external:com.google.common.testing.EqualsTester",
+            "maven",
+            "com.google.guava:guava-testlib",
+        ),
+        (
+            "external:com.google.common.collect.testing.features.Feature",
+            "maven",
+            "com.google.guava:guava-testlib",
+        ),
+    ]
+
+
+def test_a_fenced_prefix_stays_unlinked_even_when_a_shorter_prefix_is_declared() -> None:
+    declarations = [
+        _Declaration("com.google.code.gson:gson", ecosystem="maven", declared_in="pom.xml")
+    ]
+    nodes = [
+        _Node("external:com.google.gson.Gson"),
+        _Node("external:com.google.gson.protobuf.ProtoTypeAdapter"),
+        _Node("external:com.google.gson.protobuf2.TestAllTypesProto2"),
+    ]
+
+    assert _links(declarations, nodes) == [
+        ("external:com.google.gson.Gson", "maven", "com.google.code.gson:gson")
     ]

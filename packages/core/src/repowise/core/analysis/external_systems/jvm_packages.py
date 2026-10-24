@@ -23,7 +23,22 @@ _T = tuple[str, ...]
 JVM_PACKAGE_COORDINATES: dict[str, _T] = {
     # Google
     "com.google.common": ("com.google.guava:guava",),
+    # Sub-packages under ``com.google.common`` that ship in *other* artifacts;
+    # without these the guava prefix above would link them wrongly.
+    "com.google.common.truth": ("com.google.truth:truth",),
+    "com.google.common.truth.extensions.proto": (
+        "com.google.truth.extensions:truth-proto-extension",
+    ),
+    "com.google.common.testing": ("com.google.guava:guava-testlib",),
+    "com.google.common.collect.testing": ("com.google.guava:guava-testlib",),
+    "com.google.common.escape.testing": ("com.google.guava:guava-testlib",),
+    "com.google.common.util.concurrent.testing": ("com.google.guava:guava-testlib",),
     "com.google.gson": ("com.google.code.gson:gson",),
+    # Gson's protobuf adapter is a separate artifact (and, in the Gson repo, a
+    # module that generates its own ``generated`` classes); an empty tuple fences
+    # the prefix off so it is not linked to gson.
+    "com.google.gson.protobuf": (),
+    "com.google.gson.protobuf2": (),
     "com.google.protobuf": ("com.google.protobuf:protobuf-java",),
     "com.google.inject": ("com.google.inject:guice",),
     "com.google.errorprone.annotations": ("com.google.errorprone:error_prone_annotations",),
