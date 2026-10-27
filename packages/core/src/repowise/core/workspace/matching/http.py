@@ -528,6 +528,45 @@ def _param_hits(call: list[str], route: list[str]) -> int | None:
     return hits
 
 
+def _matching_param_routes(
+    call: list[str],
+    method: str,
+    routes: list[tuple[str, list[str], Contract]],
+) -> list[tuple[int, Contract]]:
+    """Return compatible provider routes ranked by the number of parameter hits."""
+    fits = []
+    for route_method, segments, provider in routes:
+        hits = _param_hits(call, segments)
+        if hits and _methods_compatible(method, route_method):
+            fits.append((hits, provider))
+    return fits
+
+
+def _link_param_candidates(
+    state: MatchState,
+    consumer: Contract,
+    fits: list[tuple[int, Contract]],
+) -> None:
+    """Link the most-literal candidates or refuse an ambiguous cross-repo match."""
+    if not fits:
+        return
+
+    fewest = min(hits for hits, _ in fits)
+    candidates = [p for hits, p in fits if hits == fewest]
+    servers = [
+        p
+        for p in prefer_target_repo(candidates, consumer)
+        if not internal(p, consumer) and accepts(p, consumer)
+    ]
+
+    if spans_repos(servers):
+        state.refuse(consumer)
+        return
+
+    for provider in servers:
+        state.add(consumer, provider, LinkStrategy.PARAM_SEGMENT)
+
+
 def segment_pass(state: MatchState) -> None:
     """Link a call with a concrete value in a parameter position to the route declaring a ``{param}`` there.
 
@@ -563,24 +602,12 @@ def segment_pass(state: MatchState) -> None:
         if not call:
             continue
 
-        fits: list[tuple[int, Contract]] = []
-        for route_method, segments, provider in routes.get(len(call), []):
-            hits = _param_hits(call, segments)
-            if hits and _methods_compatible(method, route_method):
-                fits.append((hits, provider))
-        if not fits:
-            continue
-        fewest = min(hits for hits, _ in fits)
-        servers = [
-            p
-            for p in prefer_target_repo([p for hits, p in fits if hits == fewest], consumer)
-            if not internal(p, consumer) and accepts(p, consumer)
-        ]
-        if spans_repos(servers):
-            state.refuse(consumer)
-            continue
-        for provider in servers:
-            state.add(consumer, provider, LinkStrategy.PARAM_SEGMENT)
+        fits = _matching_param_routes(
+            call,
+            method,
+            routes.get(len(call), []),
+        )
+        _link_param_candidates(state, consumer, fits)
 
 
 def service_pass(state: MatchState) -> None:
