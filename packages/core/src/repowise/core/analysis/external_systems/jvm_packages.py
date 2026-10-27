@@ -40,6 +40,7 @@ JVM_PACKAGE_COORDINATES: dict[str, _T] = {
     "com.google.gson.protobuf": (),
     "com.google.gson.protobuf2": (),
     "com.google.protobuf": ("com.google.protobuf:protobuf-java",),
+    "com.google.protobuf.util": ("com.google.protobuf:protobuf-java-util",),
     "com.google.inject": ("com.google.inject:guice",),
     "com.google.errorprone.annotations": ("com.google.errorprone:error_prone_annotations",),
     "com.google.auto.value": (
@@ -79,6 +80,7 @@ JVM_PACKAGE_COORDINATES: dict[str, _T] = {
     "ch.qos.logback.core": ("ch.qos.logback:logback-core",),
     # Testing
     "org.junit": ("junit:junit",),
+    "org.junit.platform": (),
     "org.junit.jupiter": (
         "org.junit.jupiter:junit-jupiter-api",
         "org.junit.jupiter:junit-jupiter",

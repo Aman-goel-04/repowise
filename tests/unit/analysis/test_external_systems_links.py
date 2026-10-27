@@ -386,3 +386,42 @@ def test_a_fenced_prefix_stays_unlinked_even_when_a_shorter_prefix_is_declared()
     assert _links(declarations, nodes) == [
         ("external:com.google.gson.Gson", "maven", "com.google.code.gson:gson")
     ]
+
+
+def test_protobuf_util_resolves_to_declared_util_artifact() -> None:
+    declarations = [
+        _Declaration(
+            "com.google.protobuf:protobuf-java",
+            ecosystem="maven",
+            declared_in="pom.xml",
+        ),
+        _Declaration(
+            "com.google.protobuf:protobuf-java-util",
+            ecosystem="maven",
+            declared_in="pom.xml",
+        ),
+    ]
+    nodes = [_Node("external:com.google.protobuf.util.JsonFormat")]
+
+    assert _links(declarations, nodes) == [
+        (
+            "external:com.google.protobuf.util.JsonFormat",
+            "maven",
+            "com.google.protobuf:protobuf-java-util",
+        )
+    ]
+
+
+def test_junit_platform_is_not_linked_to_junit4() -> None:
+    declarations = [
+        _Declaration("junit:junit", ecosystem="maven", declared_in="pom.xml"),
+    ]
+    nodes = [
+        _Node("external:org.junit.Test"),
+        _Node("external:org.junit.platform.launcher.Launcher"),
+        _Node("external:org.junit.platform.commons.util.ReflectionUtils"),
+    ]
+
+    assert _links(declarations, nodes) == [
+        ("external:org.junit.Test", "maven", "junit:junit"),
+    ]
