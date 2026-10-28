@@ -3064,3 +3064,27 @@ class TestKotlinExtensionReceiverMember:
             "U.kt": "fun A.run() = go()\n",
         }
         assert self._targets(tmp_path, files) == []
+
+    def test_a_top_level_extension_of_the_receiver_is_not_its_member(
+        self, tmp_path: Path
+    ) -> None:
+        # ``fun A.go()`` is not a member of ``A``; the call keeps the import edge.
+        files = {
+            "A.kt": "class A\n",
+            "E.kt": "fun A.go() = 3\n",
+            "B.kt": self._B,
+            "U.kt": self._U,
+        }
+        assert self._targets(tmp_path, files) == ["B.kt::B::go"]
+
+    def test_a_member_extension_inside_the_receiver_is_not_its_member(
+        self, tmp_path: Path
+    ) -> None:
+        # ``class A { fun B.go() }`` is indexed under ``A`` but needs a ``B`` as
+        # ``this``, which ``fun A.run()`` does not have: the import edge stays.
+        files = {
+            "A.kt": "class A {\n    fun B.go() = 3\n}\n",
+            "B.kt": self._B,
+            "U.kt": self._U,
+        }
+        assert self._targets(tmp_path, files) == ["B.kt::B::go"]
