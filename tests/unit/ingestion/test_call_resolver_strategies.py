@@ -3045,3 +3045,22 @@ class TestKotlinExtensionReceiverMember:
             "U.kt": "import B\n\nfun run() = go()\n",
         }
         assert self._targets(tmp_path, files) == ["B.kt::B::go"]
+
+    def test_a_call_inside_a_lambda_keeps_the_import_edge(self, tmp_path: Path) -> None:
+        # A lambda may rebind ``this``, which a text scan cannot type, so the
+        # receiver's member is not preferred there.
+        files = {
+            "A.kt": self._A,
+            "B.kt": self._B,
+            "U.kt": "import B\n\nfun A.run() = listOf(1).map { go() }\n",
+        }
+        assert self._targets(tmp_path, files) == ["B.kt::B::go"]
+
+    def test_two_classes_sharing_the_receivers_name_give_no_edge(self, tmp_path: Path) -> None:
+        # ``A`` names two repo classes, so neither is known to be the receiver.
+        files = {
+            "one/A.kt": self._A,
+            "two/A.kt": self._A,
+            "U.kt": "fun A.run() = go()\n",
+        }
+        assert self._targets(tmp_path, files) == []
